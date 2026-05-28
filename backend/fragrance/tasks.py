@@ -1,0 +1,126 @@
+"""
+fragrance/tasks.py
+
+Implements Celery tasks for Fragrance Recommendation Runs
+"""
+
+from celery import shared_task
+from django.core.mail import EmailMessage, get_connection
+from django.db.models import Max
+from django.template.loader import render_to_string
+from django.utils import timezone
+
+from .llm import generate_email_content, generate_preference_profile, select_candidates
+from .models import Fragrance, FragranceConfig, PreferenceProfile, RecommendationRun
+from .search import run_discovery_searches, verify_candidates
+
+
+def render_and_send_email(user_id: int, run_id: int) -> None:
+    """
+    Pipeline step 6. Renders the email HTML from the Django template, stores it on the run,
+    then sends it via the per-user Gmail credentials stored in FragranceConfig.
+
+    A per-request SMTP connection is opened using each user's own gmail_user and
+    gmail_app_password_enc rather than the global EMAIL_HOST_USER setting — each user
+    authenticates with their own Gmail account.
+    """
+    run = (
+        RecommendationRun.objects
+        .select_related('profile')
+        .prefetch_related('picks')
+        .get(id=run_id)
+    )
+    config = FragranceConfig.objects.get(user_id=user_id)
+
+    html = render_to_string(
+        template_name='fragrance/recommendation_email.html',
+        context={'run': run},
+    )
+    run.email_html = html
+    run.save(update_fields=['email_html'])
+
+    connection = get_connection(
+        backend='django.core.mail.backends.smtp.EmailBackend',
+        host='smtp.gmail.com',
+        port=587,
+        use_tls=True,
+        username=config.gmail_user,
+        password=config.gmail_app_password_enc,
+    )
+    email = EmailMessage(
+        subject=f'Fragrance Picks — {run.triggered_at.strftime("%B %Y")}',
+        body=html,
+        from_email=config.gmail_user,
+        to=[config.recipient_email],
+        connection=connection,
+    )
+    email.content_subtype = 'html'
+    email.send()
+
+    run.sent_at = timezone.now()
+    run.save(update_fields=['sent_at'])
+
+
+def _resolve_profile(user_id: int, run_id: int) -> PreferenceProfile:
+    """
+    Return the profile to use for this run. Generates a new one via LLM only when the
+    user's fragrance collection has changed since the last profile was produced; otherwise
+    reuses the latest existing profile to avoid an unnecessary LLM call.
+    """
+    latest_change = (
+        Fragrance.objects
+        .filter(user_id=user_id)
+        .aggregate(Max('updated_at'))['updated_at__max']
+    )
+    latest_profile = (
+        PreferenceProfile.objects
+        .filter(user_id=user_id)
+        .order_by('-generated_at')
+        .first()
+    )
+
+    needs_new_profile = (
+        latest_profile is None
+        or latest_change is None
+        or latest_change > latest_profile.generated_at
+    )
+
+    if needs_new_profile:
+        return generate_preference_profile(user_id=user_id, run_id=run_id)
+
+    # Reuse the existing profile but still link it to this run.
+    RecommendationRun.objects.filter(id=run_id).update(profile=latest_profile)
+    return latest_profile
+
+
+@shared_task(bind=True, max_retries=2)
+def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: int | None = None) -> None:
+    if run_id is None:
+        run = RecommendationRun.objects.create(user_id=user_id, status='running')
+    else:
+        run = RecommendationRun.objects.get(id=run_id)
+        run.status = 'running'
+        run.save(update_fields=['status'])
+    try:
+        profile = _resolve_profile(user_id=user_id, run_id=run.id)
+        results = run_discovery_searches(user_id=user_id, profile_id=profile.id)
+        candidates = select_candidates(
+            user_id=user_id,
+            profile_id=profile.id,
+            search_results=results,
+        )
+        picks = verify_candidates(
+            user_id=user_id,
+            run_id=run.id,
+            candidates=candidates,
+            profile=profile,
+        )
+        generate_email_content(run_id=run.id, verified_picks=picks)
+        render_and_send_email(user_id=user_id, run_id=run.id)
+        run.status = 'done'
+        run.save(update_fields=['status'])
+    except Exception as exc:
+        run.status = 'failed'
+        run.error_message = str(exc)
+        run.save(update_fields=['status', 'error_message'])
+        raise self.retry(exc=exc, countdown=300)

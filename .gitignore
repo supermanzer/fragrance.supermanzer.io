@@ -1,0 +1,91 @@
+# LLM Generated files
+.claude/
+
+# ── Secrets & environment ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Python / Django ───────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.mo
+*.pot
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env.bak
+
+# ── Node.js / Nuxt 4 ──────────────────────────────────────────────────────────
+node_modules/
+.nuxt/
+.output/
+.nitro/
+dist/
+.cache/
+*.local
+
+# Nuxt build artifacts
+frontend/.nuxt/
+frontend/.output/
+frontend/dist/
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+# Don't ignore docker-compose.yaml — it's checked in
+# Ignore override files that hold local secrets or port tweaks
+docker-compose.override.yaml
+docker-compose.override.yml
+
+# ── Certbot / Let's Encrypt ───────────────────────────────────────────────────
+# certbot/ directory holds live TLS certs — never commit
+certbot/
+
+# ── SearXNG ───────────────────────────────────────────────────────────────────
+# settings.yml may contain API keys or tokens
+searxng/settings.yml
+
+# ── Nginx ─────────────────────────────────────────────────────────────────────
+# nginx.conf is checked in; ignore generated dhparam files
+nginx/dhparam.pem
+
+# ── OS & editor noise ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.iml
