@@ -4,6 +4,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     FragranceConfigView,
     FragranceViewSet,
+    ImportCollectionView,
     PreferenceProfileHistoryView,
     PreferenceProfileView,
     RecommendationListView,
@@ -15,6 +16,7 @@ router.register('collection', FragranceViewSet, basename='fragrance')
 router.register('runs', RecommendationRunViewSet, basename='run')
 
 urlpatterns = router.urls + [
+    path('import/', ImportCollectionView.as_view(), name='import-collection'),
     path('config/', FragranceConfigView.as_view(), name='fragrance-config'),
     path('profile/', PreferenceProfileView.as_view(), name='preference-profile'),
     path('profile/history/', PreferenceProfileHistoryView.as_view(), name='preference-profile-history'),

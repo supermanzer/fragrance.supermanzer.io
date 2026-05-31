@@ -23,7 +23,7 @@ from fragrance.views import RegisterView
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/v1/auth/register/', RegisterView.as_view(), name='register'),
-    path('api/v1/auth/login/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
-    path('api/v1/auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
-    path('api/v1/fragrance/', include('fragrance.urls')),
+    path('api/v1/auth/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
+    path('api/v1/auth/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('api/v1/', include('fragrance.urls')),
 ]

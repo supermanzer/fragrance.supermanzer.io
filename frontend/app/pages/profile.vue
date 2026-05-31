@@ -2,7 +2,7 @@
   <div>
     <h1 class="text-h4 mb-6">Preference Profile</h1>
 
-    <v-alert v-if="error" type="error" class="mb-4">{{ error }}</v-alert>
+    <AppAlert v-model="error" class="mb-4" />
 
     <v-skeleton-loader v-if="loading" type="article" />
 

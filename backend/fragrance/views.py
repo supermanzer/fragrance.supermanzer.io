@@ -1,11 +1,15 @@
+import codecs
+
 from django.contrib.auth.models import User
 from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
+from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import FragranceConfig, Fragrance, PreferenceProfile, Recommendation, RecommendationRun
+from .services import import_collection_from_csv
 from .serializers import (
     FragranceConfigSerializer,
     FragranceSerializer,
@@ -99,3 +103,24 @@ class RecommendationRunViewSet(viewsets.ReadOnlyModelViewSet):
         run.celery_task_id = task.id
         run.save(update_fields=['celery_task_id'])
         return Response({'run_id': run.id}, status=status.HTTP_202_ACCEPTED)
+
+
+class ImportCollectionView(generics.GenericAPIView):
+    parser_classes = [MultiPartParser]
+
+    def post(self, request):
+        file = request.FILES.get('file')
+        if not file:
+            return Response({'detail': 'No file provided.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not file.name.lower().endswith('.csv'):
+            return Response({'detail': 'File must be a CSV.'}, status=status.HTTP_400_BAD_REQUEST)
+        if file.size > 2 * 1024 * 1024:
+            return Response({'detail': 'File too large (max 2 MB).'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            reader = codecs.getreader('utf-8')(file)
+            result = import_collection_from_csv(user=request.user, file_obj=reader)
+            return Response(result, status=status.HTTP_200_OK)
+        except (UnicodeDecodeError, LookupError):
+            return Response({'detail': 'File must be UTF-8 encoded.'}, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)

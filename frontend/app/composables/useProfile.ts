@@ -1,4 +1,4 @@
-import { useApi } from '~/composables/useApi'
+import { useApi, isAuthError } from '~/composables/useApi'
 
 export interface PreferenceProfile {
   id: number
@@ -22,11 +22,12 @@ export function useProfile() {
     error.value = null
     try {
       profile.value = await api<PreferenceProfile>('/profile/')
-    } catch (err: any) {
-      if (err?.status === 404) {
+    } catch (err: unknown) {
+      if (isAuthError(err)) return
+      if ((err as any)?.status === 404) {
         profile.value = null
       } else {
-        error.value = err?.data?.detail ?? 'Failed to load profile.'
+        error.value = (err as any)?.data?.detail ?? 'Failed to load profile.'
       }
     } finally {
       loading.value = false

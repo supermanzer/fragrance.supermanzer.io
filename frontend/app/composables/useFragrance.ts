@@ -1,4 +1,4 @@
-import { useApi } from '~/composables/useApi'
+import { useApi, isAuthError } from '~/composables/useApi'
 
 export interface Fragrance {
   id: number
@@ -25,8 +25,9 @@ export function useFragrance() {
     try {
       const query = status ? `?status=${status}` : ''
       fragrances.value = await api<Fragrance[]>(`/collection/${query}`)
-    } catch (err: any) {
-      error.value = err?.data?.detail ?? 'Failed to load fragrances.'
+    } catch (err: unknown) {
+      if (isAuthError(err)) return
+      error.value = (err as any)?.data?.detail ?? 'Failed to load fragrances.'
     } finally {
       loading.value = false
     }

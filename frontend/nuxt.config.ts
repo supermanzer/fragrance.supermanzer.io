@@ -7,7 +7,26 @@ export default defineNuxtConfig({
   vuetify: {
     vuetifyOptions: {
       icons: { defaultSet: 'mdi' },
-      theme: { defaultTheme: 'light' },
+      theme: {
+        defaultTheme: 'fragrance',
+        themes: {
+          fragrance: {
+            dark: false,
+            colors: {
+              primary:              '#5C4A3A',
+              secondary:            '#8C7B6B',
+              surface:              '#FAF8F5',
+              background:           '#F2EFE9',
+              error:                '#8B3A2E',
+              success:              '#4A6741',
+              info:                 '#3A5A6E',
+              warning:              '#7A5C2E',
+              'on-surface':         '#1A1612',
+              'on-surface-variant': '#6E5E50',
+            },
+          },
+        },
+      },
     },
   },
   routeRules: {

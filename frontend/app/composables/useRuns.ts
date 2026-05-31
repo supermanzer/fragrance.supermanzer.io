@@ -1,4 +1,4 @@
-import { useApi } from '~/composables/useApi'
+import { useApi, isAuthError } from '~/composables/useApi'
 
 export interface Recommendation {
   id: number
@@ -35,8 +35,9 @@ export function useRuns() {
     error.value = null
     try {
       runs.value = await api<RecommendationRun[]>('/runs/')
-    } catch (err: any) {
-      error.value = err?.data?.detail ?? 'Failed to load runs.'
+    } catch (err: unknown) {
+      if (isAuthError(err)) return
+      error.value = (err as any)?.data?.detail ?? 'Failed to load runs.'
     } finally {
       loading.value = false
     }

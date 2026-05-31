@@ -23,6 +23,10 @@ export function clearTokens(): void {
   localStorage.removeItem(REFRESH_KEY)
 }
 
+export function isAuthError(err: unknown): boolean {
+  return (err as any)?.status === 401
+}
+
 export function useApi() {
   const config = useRuntimeConfig()
 

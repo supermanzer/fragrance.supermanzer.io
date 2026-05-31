@@ -1,4 +1,4 @@
-import { useApi } from '~/composables/useApi'
+import { useApi, isAuthError } from '~/composables/useApi'
 
 export interface FragranceConfig {
   id: number
@@ -26,8 +26,9 @@ export function useSettings() {
     error.value = null
     try {
       config.value = await api<FragranceConfig>('/config/')
-    } catch (err: any) {
-      error.value = err?.data?.detail ?? 'Failed to load settings.'
+    } catch (err: unknown) {
+      if (isAuthError(err)) return
+      error.value = (err as any)?.data?.detail ?? 'Failed to load settings.'
     } finally {
       loading.value = false
     }

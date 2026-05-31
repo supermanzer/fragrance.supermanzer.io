@@ -8,11 +8,9 @@
       </v-btn>
     </div>
 
-    <v-alert v-if="triggerError" type="error" class="mb-4">{{ triggerError }}</v-alert>
-    <v-alert v-if="triggered" type="success" class="mb-4">
-      Run started (ID {{ lastRunId }}). It will appear in the list below once complete.
-    </v-alert>
-    <v-alert v-if="error" type="error" class="mb-4">{{ error }}</v-alert>
+    <AppAlert v-model="triggerError" class="mb-4" />
+    <AppAlert v-model="triggered" type="success" class="mb-4" />
+    <AppAlert v-model="error" class="mb-4" />
 
     <v-skeleton-loader v-if="loading" type="list-item-three-line@3" />
 
@@ -68,7 +66,7 @@ import { useRuns } from '~/composables/useRuns'
 
 const { runs, loading, triggering, error, fetchRuns, triggerRun } = useRuns()
 const triggerError = ref<string | null>(null)
-const triggered = ref(false)
+const triggered = ref<string | null>(null)
 const lastRunId = ref<number | null>(null)
 
 onMounted(fetchRuns)
@@ -79,11 +77,11 @@ function statusColor(status: string) {
 
 async function trigger() {
   triggerError.value = null
-  triggered.value = false
+  triggered.value = null
   try {
     const { run_id } = await triggerRun()
     lastRunId.value = run_id
-    triggered.value = true
+    triggered.value = `Run started (ID ${run_id}). It will appear in the list below once complete.`
     await fetchRuns()
   } catch (err: any) {
     triggerError.value = err?.data?.detail ?? 'Failed to start run.'
