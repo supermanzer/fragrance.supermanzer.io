@@ -98,6 +98,13 @@ class RecommendationRunViewSet(viewsets.ReadOnlyModelViewSet):
     @action(detail=False, methods=['post'])
     def trigger(self, request):
         from fragrance.tasks import monthly_fragrance_run
+        if RecommendationRun.objects.filter(
+            user=request.user, status__in=['pending', 'running']
+        ).exists():
+            return Response(
+                {'detail': 'A run is already in progress.'},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
         run = RecommendationRun.objects.create(user=request.user, status='pending')
         task = monthly_fragrance_run.delay(user_id=request.user.id, run_id=run.id)
         run.celery_task_id = task.id

@@ -91,15 +91,21 @@ ANTHROPIC_API_KEY = config("ANTHROPIC_API_KEY")
 
 # Celery async task worker(s)
 # https://docs.celeryq.dev/en/latest/django/first-steps-with-django.html
-CELERY_BROKER_URL = config("CELERY_BROKER_URL", default="redis://redis:6379/0")
-CELERY_RESULT_BACK_END = CELERY_BROKER_URL
+_redis_password = config("REDIS_PASSWORD", default="")
+_redis_host = config("REDIS_HOST", default="redis")
+_redis_auth = f":{_redis_password}@" if _redis_password else ""
+CELERY_BROKER_URL = config(
+    "CELERY_BROKER_URL",
+    default=f"redis://{_redis_auth}{_redis_host}:6379/0",
+)
+CELERY_RESULT_BACKEND = CELERY_BROKER_URL
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 
 # Email Configuration
 EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
 EMAIL_HOST = "smtp.gmail.com"
 EMAIL_PORT = 587
-EMAIL_US_TLS = True
+EMAIL_USE_TLS = True
 FIELD_ENCRYPTION_KEY = config("FIELD_ENCRYPTION_KEY")
 
 # SearXNG URL
@@ -115,9 +121,7 @@ REST_FRAMEWORK = {
         "rest_framework.permissions.IsAuthenticated"
     ],
 }
-CORS_ALLOWED_ORIGINS = config(
-    "CORS_ALLOWED_ORIGINS", cast=Csv(), default="http://localhost:3000"
-)
+CORS_ALLOWED_ORIGINS = config("CORS_ALLOWED_ORIGINS", cast=Csv())
 
 # Password validation
 # https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators
@@ -154,3 +158,4 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"

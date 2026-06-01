@@ -1,3 +1,5 @@
+import type { FetchOptions } from 'ofetch'
+
 const TOKEN_KEY = 'auth_access'
 const REFRESH_KEY = 'auth_refresh'
 
@@ -30,9 +32,11 @@ export function isAuthError(err: unknown): boolean {
 export function useApi() {
   const config = useRuntimeConfig()
 
-  const api = $fetch.create({
+  // _fetch injects the current access token on every request. Because onRequest
+  // re-reads localStorage each call, the retry below automatically picks up the
+  // refreshed token without any extra wiring.
+  const _fetch = $fetch.create({
     baseURL: config.public.apiBase,
-
     onRequest({ options }) {
       const token = getToken()
       if (token) {
@@ -41,15 +45,22 @@ export function useApi() {
         options.headers = headers
       }
     },
+  })
 
-    async onResponseError({ response, options }) {
-      if (response.status !== 401) return
+  async function api<T = unknown>(
+    url: string,
+    options?: FetchOptions,
+  ): Promise<T> {
+    try {
+      return await _fetch<T>(url, options)
+    } catch (err) {
+      if (!isAuthError(err)) throw err
 
       const refresh = getRefreshToken()
       if (!refresh) {
         clearTokens()
         await navigateTo('/auth/login')
-        return
+        throw err
       }
 
       try {
@@ -59,15 +70,14 @@ export function useApi() {
           body: { refresh },
         })
         setTokens(data.access, refresh)
-        const headers = new Headers(options.headers as HeadersInit | undefined)
-        headers.set('Authorization', `Bearer ${data.access}`)
-        options.headers = headers
+        return await _fetch<T>(url, options)
       } catch {
         clearTokens()
         await navigateTo('/auth/login')
+        throw err
       }
-    },
-  })
+    }
+  }
 
   return { api }
 }
