@@ -120,7 +120,8 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
         run.status = 'done'
         run.save(update_fields=['status'])
     except Exception as exc:
-        run.status = 'failed'
-        run.error_message = str(exc)
-        run.save(update_fields=['status', 'error_message'])
+        if self.request.retries >= self.max_retries:
+            run.status = 'failed'
+            run.error_message = str(exc)
+            run.save(update_fields=['status', 'error_message'])
         raise self.retry(exc=exc, countdown=300)

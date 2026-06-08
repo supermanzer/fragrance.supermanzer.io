@@ -45,7 +45,7 @@ services:
     environment:
       - SEARXNG_SECRET=${SEARXNG_SECRET}
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/healthz"]
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "--header=X-Real-IP:127.0.0.1", "http://localhost:8080/healthz"]
       interval: 15s
       timeout: 5s
       retries: 5

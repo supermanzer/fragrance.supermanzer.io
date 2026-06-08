@@ -1,0 +1,12 @@
+# SearXNG limiter configuration.
+# server.limiter is currently false in settings.yml — this file exists to suppress
+# the startup warning and to pre-configure trusted IPs should the limiter ever be enabled.
+
+[botdetection.ip_limit]
+link_token = false
+
+[botdetection.ip_lists]
+pass_ip = [
+    "127.0.0.1",
+    "172.16.0.0/12",   # Docker internal bridge networks
+]

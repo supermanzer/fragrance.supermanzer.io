@@ -213,7 +213,15 @@ def generate_preference_profile(user_id: int, run_id: int) -> PreferenceProfile:
         }],
     )
     profile_data = extract_tool_result(response=response)
-    profile = PreferenceProfile.objects.create(user_id=user_id, **profile_data)
+    profile = PreferenceProfile.objects.create(
+        user_id=user_id,
+        loved_notes=profile_data['loved_notes'],
+        liked_notes=profile_data['liked_notes'],
+        disliked_notes=profile_data['disliked_notes'],
+        owns_list=profile_data['owns_list'],
+        search_angle_1=profile_data['search_angle_1'],
+        search_angle_2=profile_data['search_angle_2'],
+    )
     # Link the profile back to the run so render_and_send_email can load it via select_related.
     RecommendationRun.objects.filter(id=run_id).update(profile=profile)
     return profile

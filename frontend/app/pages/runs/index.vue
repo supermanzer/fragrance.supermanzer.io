@@ -49,8 +49,8 @@
                 </v-chip>
               </template>
               <template #default>
-                <v-list-item-title>{{ pick.name }}</v-list-item-title>
-                <v-list-item-subtitle>{{ pick.house }}</v-list-item-subtitle>
+                <!-- <v-list-item-title>{{ pick.name }}</v-list-item-title>
+                <v-list-item-subtitle>{{ pick.house }}</v-list-item-subtitle> -->
                 <p class="text-body-2 mt-1">{{ pick.rationale }}</p>
               </template>
             </v-list-item>
