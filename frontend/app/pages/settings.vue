@@ -5,29 +5,19 @@
     <AppAlert v-model="error" class="mb-4" />
     <AppAlert v-model="saved" type="success" class="mb-4" />
 
-    <v-card v-if="config" max-width="560">
-      <v-card-title>Email Delivery</v-card-title>
-      <v-card-text>
-        <v-text-field v-model="form.recipient_email" label="Recipient email" type="email" class="mb-2" />
-        <v-text-field v-model="form.gmail_user" label="Gmail address (sender)" type="email" class="mb-2" />
-        <v-text-field
-          v-model="form.gmail_app_password_enc"
-          label="Gmail app password"
-          type="password"
-          placeholder="Leave blank to keep existing password"
-          class="mb-2"
-        />
-      </v-card-text>
+    <v-skeleton-loader v-if="loading" type="card" max-width="560" />
 
-      <v-divider />
-
-      <v-card-title class="mt-2">Schedule</v-card-title>
-      <v-card-text>
+    <v-card v-else max-width="560" elevation="1" rounded="lg">
+      <v-card-title class="pt-6 px-6 pb-2">Schedule</v-card-title>
+      <v-card-text class="px-6 pb-2">
         <v-select
           v-model="form.frequency"
           label="Frequency"
           :items="frequencyOptions"
-          class="mb-2"
+          variant="outlined"
+          rounded="lg"
+          hide-details="auto"
+          class="mb-4"
         />
         <v-text-field
           v-model.number="form.run_hour"
@@ -35,7 +25,10 @@
           type="number"
           :min="0"
           :max="23"
-          class="mb-2"
+          variant="outlined"
+          rounded="lg"
+          hide-details="auto"
+          class="mb-4"
         />
         <v-text-field
           v-if="form.frequency === 'weekly'"
@@ -44,7 +37,10 @@
           type="number"
           :min="0"
           :max="6"
-          class="mb-2"
+          variant="outlined"
+          rounded="lg"
+          hide-details="auto"
+          class="mb-4"
         />
         <v-text-field
           v-if="form.frequency === 'monthly' || form.frequency === 'yearly'"
@@ -53,7 +49,10 @@
           type="number"
           :min="1"
           :max="31"
-          class="mb-2"
+          variant="outlined"
+          rounded="lg"
+          hide-details="auto"
+          class="mb-4"
         />
         <v-text-field
           v-if="form.frequency === 'yearly'"
@@ -62,20 +61,22 @@
           type="number"
           :min="1"
           :max="12"
-          class="mb-2"
+          variant="outlined"
+          rounded="lg"
+          hide-details="auto"
+          class="mb-4"
         />
       </v-card-text>
-
-      <v-card-actions>
+      <v-card-actions class="px-6 pb-6 pt-2">
         <v-spacer />
-        <v-btn color="primary" :loading="saving" @click="submit">Save Settings</v-btn>
+        <v-btn color="primary" variant="flat" rounded="lg" :loading="saving" @click="submit">
+          Save Settings
+        </v-btn>
       </v-card-actions>
     </v-card>
 
-    <v-skeleton-loader v-else-if="loading" type="card" />
-
     <!-- Import collection -->
-    <v-card class="mt-6" max-width="560">
+    <v-card class="mt-6" max-width="560" elevation="1" rounded="lg">
       <v-card-title class="pt-6 px-6 pb-1">Import Collection</v-card-title>
       <v-card-subtitle class="px-6 pb-4">
         Upload a CSV to add or update fragrances in bulk.<br>
@@ -146,9 +147,6 @@ const frequencyOptions = [
 ]
 
 const form = reactive<Partial<FragranceConfigInput>>({
-  recipient_email: '',
-  gmail_user: '',
-  gmail_app_password_enc: '',
   frequency: 'monthly',
   run_hour: 9,
   run_day_of_week: 1,
@@ -160,8 +158,6 @@ onMounted(async () => {
   await fetchConfig()
   if (config.value) {
     Object.assign(form, {
-      recipient_email: config.value.recipient_email,
-      gmail_user: config.value.gmail_user,
       frequency: config.value.frequency,
       run_hour: config.value.run_hour,
       run_day_of_week: config.value.run_day_of_week,
@@ -175,9 +171,7 @@ async function submit() {
   saving.value = true
   saved.value = null
   try {
-    const payload: Partial<FragranceConfigInput> = { ...form }
-    if (!payload.gmail_app_password_enc) delete payload.gmail_app_password_enc
-    await updateConfig(payload)
+    await updateConfig({ ...form })
     saved.value = 'Settings saved.'
   } finally {
     saving.value = false

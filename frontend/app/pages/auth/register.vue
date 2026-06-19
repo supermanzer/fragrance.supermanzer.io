@@ -1,53 +1,65 @@
 <template>
-  <v-container class="fill-height" max-width="400">
-    <v-card class="pa-6 w-100">
-      <v-card-title class="mb-4">Create Account</v-card-title>
+  <v-card class="pa-6 w-100" elevation="1" rounded="lg">
+    <p class="text-h6 font-weight-regular mb-6">Create your account</p>
 
-      <v-form @submit.prevent="submit">
-        <v-text-field
-          v-model="form.username"
-          label="Username"
-          autocomplete="username"
-          :error-messages="errors.username"
-          required
-        />
-        <v-text-field
-          v-model="form.email"
-          label="Email"
-          type="email"
-          autocomplete="email"
-          :error-messages="errors.email"
-          required
-        />
-        <v-text-field
-          v-model="form.password"
-          label="Password"
-          type="password"
-          autocomplete="new-password"
-          :error-messages="errors.password"
-          required
-        />
+    <v-form @submit.prevent="submit">
+      <v-text-field
+        v-model="form.username"
+        label="Username"
+        variant="outlined"
+        rounded="lg"
+        autocomplete="username"
+        :error-messages="errors.username"
+        hide-details="auto"
+        class="mb-4"
+        required
+      />
+      <v-text-field
+        v-model="form.email"
+        label="Email"
+        type="email"
+        variant="outlined"
+        rounded="lg"
+        autocomplete="email"
+        :error-messages="errors.email"
+        hide-details="auto"
+        class="mb-4"
+        required
+      />
+      <v-text-field
+        v-model="form.password"
+        label="Password"
+        type="password"
+        variant="outlined"
+        rounded="lg"
+        autocomplete="new-password"
+        :error-messages="errors.password"
+        hide-details="auto"
+        class="mb-6"
+        required
+      />
 
-        <v-alert v-if="errors.general" type="error" class="mb-4">
-          {{ errors.general }}
-        </v-alert>
+      <v-alert v-if="errors.general" type="error" variant="tonal" class="mb-4">
+        {{ errors.general }}
+      </v-alert>
 
-        <v-btn type="submit" color="primary" block :loading="loading">
-          Create Account
-        </v-btn>
-      </v-form>
+      <v-btn type="submit" color="primary" variant="flat" rounded="lg" block :loading="loading">
+        Create Account
+      </v-btn>
+    </v-form>
 
-      <v-card-text class="text-center mt-4">
-        <NuxtLink to="/auth/login">Already have an account?</NuxtLink>
-      </v-card-text>
-    </v-card>
-  </v-container>
+    <div class="text-center mt-4">
+      <v-btn variant="text" size="small" :to="'/auth/login'">
+        Already have an account?
+      </v-btn>
+    </div>
+  </v-card>
 </template>
 
 <script setup lang="ts">
 import { setTokens } from '~/composables/useApi'
 
-definePageMeta({ layout: false })
+definePageMeta({ layout: 'auth' })
 
 const config = useRuntimeConfig()
 

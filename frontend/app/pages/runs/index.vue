@@ -3,58 +3,67 @@
     <div class="d-flex align-center mb-6">
       <h1 class="text-h4">Recommendation Runs</h1>
       <v-spacer />
-      <v-btn color="primary" prepend-icon="mdi-play" :loading="triggering" @click="trigger">
+      <v-btn color="primary" variant="flat" rounded="lg" prepend-icon="mdi-play" :loading="triggering" @click="trigger">
         Run Now
       </v-btn>
     </div>
 
-    <AppAlert v-model="triggerError" class="mb-4" />
-    <AppAlert v-model="triggered" type="success" class="mb-4" />
-    <AppAlert v-model="error" class="mb-4" />
+    <AppAlert v-if="triggerError" v-model="triggerError" class="mb-4" />
+    <AppAlert v-else-if="triggered" v-model="triggered" type="success" class="mb-4" />
+    <AppAlert v-if="error" v-model="error" class="mb-4" />
 
-    <v-skeleton-loader v-if="loading" type="list-item-three-line@3" />
+    <v-skeleton-loader v-if="loading" type="card@3" />
 
-    <v-alert v-else-if="!runs.length" type="info" variant="tonal">
-      No runs yet. Click "Run Now" to generate your first recommendations.
-    </v-alert>
+    <div v-else-if="!runs.length" class="text-center py-12">
+      <v-icon size="56" class="text-medium-emphasis mb-4">mdi-flask-outline</v-icon>
+      <p class="text-body-1 text-medium-emphasis">No runs yet.</p>
+      <p class="text-body-2 text-medium-emphasis mt-1">Click "Run Now" to generate your first recommendations.</p>
+    </div>
 
-    <v-expansion-panels v-else>
+    <v-expansion-panels v-else variant="accordion">
       <v-expansion-panel v-for="run in runs" :key="run.id">
         <v-expansion-panel-title>
-          <div class="d-flex align-center gap-4 w-100">
-            <span>{{ new Date(run.triggered_at).toLocaleString() }}</span>
+          <div class="d-flex align-center w-100 mr-4">
+            <span class="text-body-2">{{ new Date(run.triggered_at).toLocaleString() }}</span>
             <v-chip :color="statusColor(run.status)" size="small" class="ml-4">{{ run.status }}</v-chip>
             <v-spacer />
-            <span class="text-caption text-medium-emphasis mr-4">{{ run.picks.length }} pick(s)</span>
+            <span class="text-caption text-medium-emphasis">{{ run.picks.length }} pick(s)</span>
           </div>
         </v-expansion-panel-title>
 
         <v-expansion-panel-text>
-          <p v-if="run.intro" class="mb-4 font-italic">{{ run.intro }}</p>
+          <p v-if="run.intro" class="text-body-2 font-italic mb-6" style="max-width: 680px">{{ run.intro }}</p>
 
           <v-alert v-if="run.error_message" type="error" variant="tonal" class="mb-4">
             {{ run.error_message }}
           </v-alert>
 
-          <v-list v-if="run.picks.length">
-            <v-list-item
+          <div v-if="run.picks.length" class="d-flex flex-column ga-3">
+            <v-card
               v-for="pick in run.picks"
               :key="pick.id"
-              :title="pick.name"
-              :subtitle="pick.house"
+              elevation="1"
+              rounded="lg"
             >
-              <template #append>
-                <v-chip size="small" :color="pick.status === 'confirmed' ? 'success' : 'warning'">
-                  {{ pick.status }}
-                </v-chip>
-              </template>
-              <template #default>
-                <!-- <v-list-item-title>{{ pick.name }}</v-list-item-title>
-                <v-list-item-subtitle>{{ pick.house }}</v-list-item-subtitle> -->
-                <p class="text-body-2 mt-1">{{ pick.rationale }}</p>
-              </template>
-            </v-list-item>
-          </v-list>
+              <v-card-text class="pa-4">
+                <div class="d-flex align-start justify-space-between mb-2">
+                  <div>
+                    <p class="text-h6 font-weight-medium">{{ pick.name }}</p>
+                    <p class="text-body-2 text-medium-emphasis">{{ pick.house }}</p>
+                  </div>
+                  <v-chip
+                    size="small"
+                    :color="pick.status === 'confirmed' ? 'success' : 'warning'"
+                    variant="tonal"
+                    class="ml-4 mt-1"
+                  >
+                    {{ pick.status }}
+                  </v-chip>
+                </div>
+                <p class="text-body-2 mt-2" style="max-width: 680px">{{ pick.rationale }}</p>
+              </v-card-text>
+            </v-card>
+          </div>
         </v-expansion-panel-text>
       </v-expansion-panel>
     </v-expansion-panels>
@@ -67,7 +76,6 @@ import { useRuns } from '~/composables/useRuns'
 const { runs, loading, triggering, error, fetchRuns, triggerRun } = useRuns()
 const triggerError = ref<string | null>(null)
 const triggered = ref<string | null>(null)
-const lastRunId = ref<number | null>(null)
 
 onMounted(fetchRuns)
 
@@ -80,7 +88,6 @@ async function trigger() {
   triggered.value = null
   try {
     const { run_id } = await triggerRun()
-    lastRunId.value = run_id
     triggered.value = `Run started (ID ${run_id}). It will appear in the list below once complete.`
     await fetchRuns()
   } catch (err: any) {
