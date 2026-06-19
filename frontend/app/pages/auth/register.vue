@@ -61,6 +61,9 @@ import { setTokens } from '~/composables/useApi'
 
 definePageMeta({ layout: 'auth' })
 
+// Registration is currently closed. Remove this redirect to re-enable sign-ups.
+await navigateTo('/auth/login', { replace: true })
+
 const config = useRuntimeConfig()
 
 const form = reactive({ username: '', email: '', password: '' })

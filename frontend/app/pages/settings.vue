@@ -10,6 +10,15 @@
     <v-card v-else max-width="560" elevation="1" rounded="lg">
       <v-card-title class="pt-6 px-6 pb-2">Schedule</v-card-title>
       <v-card-text class="px-6 pb-2">
+        <v-text-field
+          v-model="form.recipient_email"
+          label="Recipient email"
+          type="email"
+          variant="outlined"
+          rounded="lg"
+          hide-details="auto"
+          class="mb-4"
+        />
         <v-select
           v-model="form.frequency"
           label="Frequency"
@@ -147,6 +156,7 @@ const frequencyOptions = [
 ]
 
 const form = reactive<Partial<FragranceConfigInput>>({
+  recipient_email: '',
   frequency: 'monthly',
   run_hour: 9,
   run_day_of_week: 1,
@@ -158,6 +168,7 @@ onMounted(async () => {
   await fetchConfig()
   if (config.value) {
     Object.assign(form, {
+      recipient_email: config.value.recipient_email,
       frequency: config.value.frequency,
       run_hour: config.value.run_hour,
       run_day_of_week: config.value.run_day_of_week,

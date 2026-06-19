@@ -36,11 +36,6 @@
       </v-btn>
     </v-form>
 
-    <div class="text-center mt-4">
-      <v-btn variant="text" size="small" :to="'/auth/register'">
-        Create an account
-      </v-btn>
-    </div>
   </v-card>
 </template>
 
