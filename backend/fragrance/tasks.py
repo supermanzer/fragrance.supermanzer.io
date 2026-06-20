@@ -5,7 +5,8 @@ Implements Celery tasks for Fragrance Recommendation Runs
 """
 
 from celery import shared_task
-from django.core.mail import EmailMessage, get_connection
+from django.conf import settings
+from django.core.mail import EmailMessage
 from django.db.models import Max
 from django.template.loader import render_to_string
 from django.utils import timezone
@@ -16,14 +17,7 @@ from .search import run_discovery_searches, verify_candidates
 
 
 def render_and_send_email(user_id: int, run_id: int) -> None:
-    """
-    Pipeline step 6. Renders the email HTML from the Django template, stores it on the run,
-    then sends it via the per-user Gmail credentials stored in FragranceConfig.
-
-    A per-request SMTP connection is opened using each user's own gmail_user and
-    gmail_app_password_enc rather than the global EMAIL_HOST_USER setting — each user
-    authenticates with their own Gmail account.
-    """
+    """Pipeline step 6. Renders the email HTML and sends via the centralized sender."""
     run = (
         RecommendationRun.objects
         .select_related('profile')
@@ -39,20 +33,11 @@ def render_and_send_email(user_id: int, run_id: int) -> None:
     run.email_html = html
     run.save(update_fields=['email_html'])
 
-    connection = get_connection(
-        backend='django.core.mail.backends.smtp.EmailBackend',
-        host='smtp.gmail.com',
-        port=587,
-        use_tls=True,
-        username=config.gmail_user,
-        password=config.gmail_app_password_enc,
-    )
     email = EmailMessage(
         subject=f'Fragrance Picks — {run.triggered_at.strftime("%B %Y")}',
         body=html,
-        from_email=config.gmail_user,
+        from_email=settings.DEFAULT_FROM_EMAIL,
         to=[config.recipient_email],
-        connection=connection,
     )
     email.content_subtype = 'html'
     email.send()

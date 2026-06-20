@@ -1,6 +1,5 @@
 from django.contrib.auth.models import User
 from django.db import models
-from encrypted_model_fields.fields import EncryptedTextField
 
 # Constants
 FREQUENCIES = [
@@ -32,8 +31,6 @@ class FragranceConfig(models.Model):
     recipient_email = models.EmailField(
         help_text="The email we will deliver fragrance recommendations to"
     )
-    gmail_user = models.EmailField()
-    gmail_app_password_enc = EncryptedTextField()  # encrypted at rest
     # Fragrance Recommendation Schedule
     frequency = models.CharField(
         max_length=10, choices=FREQUENCIES, default="monthly"

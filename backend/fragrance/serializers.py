@@ -19,9 +19,6 @@ class FragranceConfigSerializer(serializers.ModelSerializer):
     class Meta:
         model = FragranceConfig
         exclude = ['user']
-        extra_kwargs = {
-            'gmail_app_password_enc': {'write_only': True},
-        }
 
 
 class FragranceSerializer(serializers.ModelSerializer):
