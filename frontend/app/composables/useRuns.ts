@@ -23,18 +23,38 @@ export interface RecommendationRun {
   picks: Recommendation[]
 }
 
+const POLL_INTERVAL_MS = 20_000
+
 export function useRuns() {
   const { api } = useApi()
   const runs = ref<RecommendationRun[]>([])
   const loading = ref(false)
   const triggering = ref(false)
   const error = ref<string | null>(null)
+  const polling = ref<ReturnType<typeof setInterval> | null>(null)
 
-  async function fetchRuns() {
+  function stopPolling(): void {
+    if (polling.value !== null) {
+      clearInterval(polling.value)
+      polling.value = null
+    }
+  }
+
+  function startPolling(): void {
+    if (polling.value !== null) return
+    polling.value = setInterval(fetchRuns, POLL_INTERVAL_MS)
+  }
+
+  async function fetchRuns(): Promise<void> {
     loading.value = true
     error.value = null
     try {
       runs.value = await api<RecommendationRun[]>('/runs/')
+      if (runs.value.some(r => r.status === 'running')) {
+        startPolling()
+      } else {
+        stopPolling()
+      }
     } catch (err: unknown) {
       if (isAuthError(err)) return
       error.value = (err as any)?.data?.detail ?? 'Failed to load runs.'
@@ -51,6 +71,8 @@ export function useRuns() {
       triggering.value = false
     }
   }
+
+  onUnmounted(stopPolling)
 
   return { runs, loading, triggering, error, fetchRuns, triggerRun }
 }

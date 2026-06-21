@@ -48,10 +48,10 @@ def import_collection_from_csv(user: User, file_obj: IO[str]) -> dict:
 
     for row in reader:
         row = {k.lower(): v for k, v in row.items()}
-        name = row["fragrance"].strip()
+        name = row["fragrance"].strip().removeprefix("'")
         status = STATUS_ALIASES.get(row["status"].strip().lower())
-        house = row.get("house", "").strip()
-        notes = row.get("notes", "").strip()
+        house = row.get("house", "").strip().removeprefix("'")
+        notes = row.get("notes", "").strip().removeprefix("'")
 
         if not name or status is None:
             skipped += 1

@@ -108,7 +108,10 @@ EMAIL_PORT = 587
 EMAIL_USE_TLS = True
 EMAIL_HOST_USER = config("EMAIL_HOST_USER")
 EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD")
-DEFAULT_FROM_EMAIL = config("DEFAULT_FROM_EMAIL", default="noreply@supermanzer.io")
+DEFAULT_FROM_EMAIL = config(
+    "DEFAULT_FROM_EMAIL", default="noreply@supermanzer.io"
+)
+SERVER_EMAIL = config("DEFAULT_FROM_EMAIL", default="noreply@supermanzer.io")
 
 # SearXNG URL
 SEARXNG_URL = config("SEARXNG_URL", default="http://searxng:8080")

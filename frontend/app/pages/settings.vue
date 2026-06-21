@@ -84,15 +84,42 @@
       </v-card-actions>
     </v-card>
 
-    <!-- Import collection -->
+    <!-- Collection data: export + import -->
     <v-card class="mt-6" max-width="560" elevation="1" rounded="lg">
-      <v-card-title class="pt-6 px-6 pb-1">Import Collection</v-card-title>
-      <v-card-subtitle class="px-6 pb-4">
-        Upload a CSV to add or update fragrances in bulk.<br>
-        Required columns: <code>fragrance, status, house, notes</code> —
-        status must be <code>own</code>, <code>like</code>, or <code>dislike</code>.
-      </v-card-subtitle>
+      <v-card-title class="pt-6 px-6 pb-1">Collection Data</v-card-title>
       <v-card-text class="px-6 pb-2">
+
+        <!-- Export row — always available, so it sits above the file-gated import -->
+        <div class="d-flex align-center justify-space-between mb-6">
+          <div>
+            <div class="text-body-2">Export Collection</div>
+            <div class="text-caption text-medium-emphasis">
+              Download your full collection as a CSV file.
+            </div>
+          </div>
+          <v-btn
+            color="primary"
+            variant="outlined"
+            rounded="lg"
+            prepend-icon="mdi-download"
+            :loading="exportLoading"
+            @click="runExport"
+          >
+            Download
+          </v-btn>
+        </div>
+
+        <AppAlert v-model="exportError" class="mb-4" />
+
+        <v-divider class="mb-6" />
+
+        <!-- Import section -->
+        <div class="text-body-2 mb-1">Import Collection</div>
+        <div class="text-caption text-medium-emphasis mb-4">
+          Upload a CSV to add or update fragrances in bulk.<br>
+          Required columns: <code>fragrance, status, house, notes</code> —
+          status must be <code>own</code>, <code>like</code>, or <code>dislike</code>.
+        </div>
         <v-file-input
           v-model="importFile"
           label="CSV file"
@@ -134,6 +161,7 @@
 <script setup lang="ts">
 import { useSettings, type FragranceConfigInput } from '~/composables/useSettings'
 import { useImport } from '~/composables/useImport'
+import { useExport } from '~/composables/useExport'
 
 const { config, loading, error, fetchConfig, updateConfig } = useSettings()
 const saving = ref(false)
@@ -141,6 +169,13 @@ const saved = ref<string | null>(null)
 
 const { loading: importLoading, error: importError, result: importResult, importCollection, reset: importReset } = useImport()
 const importFile = ref<File | null>(null)
+
+const { loading: exportLoading, error: exportError, exportCollection, reset: exportReset } = useExport()
+
+async function runExport(): Promise<void> {
+  exportReset()
+  await exportCollection()
+}
 
 async function runImport(): Promise<void> {
   const file = importFile.value

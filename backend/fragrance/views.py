@@ -1,6 +1,9 @@
 import codecs
+import csv
+import io
 
 from django.db.models import Prefetch
+from django.http import HttpResponse
 from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
@@ -24,6 +27,16 @@ from .serializers import (
     UserRegistrationSerializer,
 )
 from .services import import_collection_from_csv
+
+# Characters that spreadsheet apps interpret as formula triggers.
+_FORMULA_PREFIXES = ('=', '+', '-', '@', '\t', '\r')
+
+
+def _safe_cell(value: str) -> str:
+    """Prefix formula-trigger chars to prevent CSV injection in spreadsheet apps."""
+    if value and value[0] in _FORMULA_PREFIXES:
+        return "'" + value
+    return value
 
 
 class RegisterView(generics.CreateAPIView):
@@ -127,6 +140,27 @@ class RecommendationRunViewSet(viewsets.ReadOnlyModelViewSet):
         run.celery_task_id = task.id
         run.save(update_fields=["celery_task_id"])
         return Response({"run_id": run.id}, status=status.HTTP_202_ACCEPTED)
+
+
+class ExportCollectionView(generics.GenericAPIView):
+    def get(self, request) -> HttpResponse:
+        fragrances = Fragrance.objects.filter(user=request.user).order_by('name')
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['fragrance', 'status', 'house', 'notes'])
+        for f in fragrances:
+            writer.writerow([
+                _safe_cell(f.name),
+                f.status,  # enum — never a formula trigger
+                _safe_cell(f.house),
+                _safe_cell(f.notes),
+            ])
+
+        response = HttpResponse(output.getvalue(), content_type='text/csv')
+        response['Content-Disposition'] = 'attachment; filename="fragrances.csv"'
+        response['X-Content-Type-Options'] = 'nosniff'
+        return response
 
 
 class ImportCollectionView(generics.GenericAPIView):
