@@ -34,6 +34,10 @@
       <v-btn type="submit" color="primary" variant="flat" rounded="lg" block :loading="loading">
         Sign In
       </v-btn>
+
+      <div class="text-center mt-4">
+        <NuxtLink to="/auth/forgot-password" class="text-body-2 text-primary">Forgot your password?</NuxtLink>
+      </div>
     </v-form>
 
   </v-card>

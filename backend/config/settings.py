@@ -38,6 +38,7 @@ INSTALLED_APPS = [
     "corsheaders",
     "rest_framework",
     "rest_framework_simplejwt",
+    "rest_framework_simplejwt.token_blacklist",
     "django_celery_beat",
     "fragrance",
 ]
@@ -127,6 +128,16 @@ REST_FRAMEWORK = {
     ],
 }
 CORS_ALLOWED_ORIGINS = config("CORS_ALLOWED_ORIGINS", cast=Csv())
+FRONTEND_URL = config("FRONTEND_URL", default="https://fragrances.supermanzer.io")
+
+# Tokens expire in 1 hour; shorter than Django's 3-day default to limit
+# the window in which a reset link captured from email can be replayed.
+PASSWORD_RESET_TIMEOUT = 3600
+
+SIMPLE_JWT = {
+    "ROTATE_REFRESH_TOKENS": True,
+    "BLACKLIST_AFTER_ROTATION": True,
+}
 
 # Password validation
 # https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators

@@ -18,12 +18,20 @@ from django.contrib import admin
 from django.urls import include, path
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
-from fragrance.views import RegisterView
+from fragrance.views import (
+    ChangePasswordView,
+    PasswordResetConfirmView,
+    PasswordResetRequestView,
+    RegisterView,
+)
 
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/v1/auth/register/', RegisterView.as_view(), name='register'),
     path('api/v1/auth/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('api/v1/auth/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('api/v1/auth/password/change/', ChangePasswordView.as_view(), name='password_change'),
+    path('api/v1/auth/password/reset/', PasswordResetRequestView.as_view(), name='password_reset'),
+    path('api/v1/auth/password/reset/confirm/', PasswordResetConfirmView.as_view(), name='password_reset_confirm'),
     path('api/v1/', include('fragrance.urls')),
 ]

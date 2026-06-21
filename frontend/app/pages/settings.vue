@@ -84,6 +84,54 @@
       </v-card-actions>
     </v-card>
 
+    <!-- Change password -->
+    <v-card class="mt-6" max-width="560" elevation="1" rounded="lg">
+      <v-card-title class="pt-6 px-6 pb-2">Change Password</v-card-title>
+      <v-card-text class="px-6 pb-2">
+        <v-text-field
+          v-model="passwordForm.current_password"
+          label="Current password"
+          type="password"
+          variant="outlined"
+          rounded="lg"
+          autocomplete="current-password"
+          :error-messages="passwordErrors.current_password"
+          hide-details="auto"
+          class="mb-4"
+        />
+        <v-text-field
+          v-model="passwordForm.new_password"
+          label="New password"
+          type="password"
+          variant="outlined"
+          rounded="lg"
+          autocomplete="new-password"
+          :error-messages="passwordErrors.new_password"
+          hide-details="auto"
+          class="mb-4"
+        />
+        <v-text-field
+          v-model="passwordForm.new_password_confirm"
+          label="Confirm new password"
+          type="password"
+          variant="outlined"
+          rounded="lg"
+          autocomplete="new-password"
+          :error-messages="passwordErrors.new_password_confirm"
+          hide-details="auto"
+          class="mb-2"
+        />
+        <AppAlert v-model="passwordError" class="mt-4" />
+        <AppAlert v-model="passwordSaved" type="success" class="mt-4" />
+      </v-card-text>
+      <v-card-actions class="px-6 pb-6 pt-2">
+        <v-spacer />
+        <v-btn color="primary" variant="flat" rounded="lg" :loading="passwordSaving" @click="changePassword">
+          Update Password
+        </v-btn>
+      </v-card-actions>
+    </v-card>
+
     <!-- Collection data: export + import -->
     <v-card class="mt-6" max-width="560" elevation="1" rounded="lg">
       <v-card-title class="pt-6 px-6 pb-1">Collection Data</v-card-title>
@@ -162,8 +210,10 @@
 import { useSettings, type FragranceConfigInput } from '~/composables/useSettings'
 import { useImport } from '~/composables/useImport'
 import { useExport } from '~/composables/useExport'
+import { useApi, clearTokens } from '~/composables/useApi'
 
 const { config, loading, error, fetchConfig, updateConfig } = useSettings()
+const { api } = useApi()
 const saving = ref(false)
 const saved = ref<string | null>(null)
 
@@ -221,6 +271,38 @@ async function submit() {
     saved.value = 'Settings saved.'
   } finally {
     saving.value = false
+  }
+}
+
+const passwordForm = reactive({ current_password: '', new_password: '', new_password_confirm: '' })
+const passwordErrors = reactive<Record<string, string | string[]>>({})
+const passwordError = ref<string | null>(null)
+const passwordSaved = ref<string | null>(null)
+const passwordSaving = ref(false)
+
+async function changePassword() {
+  Object.keys(passwordErrors).forEach(k => delete passwordErrors[k])
+  passwordError.value = null
+  passwordSaved.value = null
+  passwordSaving.value = true
+  try {
+    const refresh = localStorage.getItem('auth_refresh') ?? ''
+    await api('/auth/password/change/', {
+      method: 'POST',
+      body: { ...passwordForm, refresh },
+    })
+    passwordSaved.value = 'Password updated. Please sign in again.'
+    Object.keys(passwordForm).forEach(k => (passwordForm as any)[k] = '')
+    clearTokens()
+    setTimeout(() => navigateTo('/auth/login'), 1500)
+  } catch (err: any) {
+    const data = err?.data
+    if (data?.current_password) passwordErrors.current_password = data.current_password
+    else if (data?.new_password) passwordErrors.new_password = data.new_password
+    else if (data?.new_password_confirm) passwordErrors.new_password_confirm = data.new_password_confirm
+    else passwordError.value = data?.detail ?? 'Something went wrong. Please try again.'
+  } finally {
+    passwordSaving.value = false
   }
 }
 </script>

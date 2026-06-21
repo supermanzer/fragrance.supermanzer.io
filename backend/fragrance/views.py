@@ -2,8 +2,15 @@ import codecs
 import csv
 import io
 
+from django.conf import settings
+from django.contrib.auth.models import User
+from django.contrib.auth.tokens import default_token_generator
+from django.core.mail import send_mail
 from django.db.models import Prefetch
 from django.http import HttpResponse
+from django.template.loader import render_to_string
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode
 from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
@@ -19,8 +26,11 @@ from .models import (
     RecommendationRun,
 )
 from .serializers import (
+    ChangePasswordSerializer,
     FragranceConfigSerializer,
     FragranceSerializer,
+    PasswordResetConfirmSerializer,
+    PasswordResetRequestSerializer,
     PreferenceProfileSerializer,
     RecommendationRunSerializer,
     RecommendationSerializer,
@@ -55,6 +65,67 @@ class RegisterView(generics.CreateAPIView):
             },
             status=status.HTTP_201_CREATED,
         )
+
+
+class ChangePasswordView(generics.GenericAPIView):
+    serializer_class = ChangePasswordSerializer
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = request.user
+        user.set_password(serializer.validated_data['new_password'])
+        user.save()
+        refresh_token = serializer.validated_data.get('refresh', '')
+        if refresh_token:
+            try:
+                RefreshToken(token=refresh_token).blacklist()
+            except Exception:
+                pass
+        return Response({'detail': 'Password changed successfully.'})
+
+
+_RESET_RESPONSE = {'detail': 'If an account with that email exists, a reset link has been sent.'}
+
+
+class PasswordResetRequestView(generics.GenericAPIView):
+    permission_classes = [permissions.AllowAny]
+    serializer_class = PasswordResetRequestSerializer
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            user = User.objects.get(email=serializer.validated_data['email'])
+        except User.DoesNotExist:
+            return Response(_RESET_RESPONSE)
+        uid = urlsafe_base64_encode(force_bytes(user.pk))
+        token = default_token_generator.make_token(user=user)
+        reset_url = f"{settings.FRONTEND_URL}/auth/reset-password?uid={uid}&token={token}"
+        send_mail(
+            subject='Reset your password',
+            message=render_to_string(
+                template_name='fragrance/password_reset_email.txt',
+                context={'username': user.username, 'reset_url': reset_url},
+            ),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[user.email],
+            fail_silently=False,
+        )
+        return Response(_RESET_RESPONSE)
+
+
+class PasswordResetConfirmView(generics.GenericAPIView):
+    permission_classes = [permissions.AllowAny]
+    serializer_class = PasswordResetConfirmSerializer
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        user = serializer.validated_data['user']
+        user.set_password(serializer.validated_data['new_password'])
+        user.save()
+        return Response({'detail': 'Password has been reset successfully.'})
 
 
 class FragranceConfigView(generics.RetrieveUpdateAPIView):
