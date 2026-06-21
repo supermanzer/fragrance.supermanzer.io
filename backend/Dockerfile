@@ -6,4 +6,5 @@ COPY pyproject.toml uv.lock* ./
 RUN uv sync --frozen --no-dev
 ENV PATH="/app/.venv/bin:$PATH"
 COPY --chown=app:app . .
+RUN mkdir -p /app/staticfiles && chown app:app /app/staticfiles
 USER app
