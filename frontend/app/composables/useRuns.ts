@@ -24,6 +24,7 @@ export interface RecommendationRun {
 }
 
 const POLL_INTERVAL_MS = 20_000
+const MAX_POLLS = 15  // ~5 minutes before giving up on a stuck run
 
 export function useRuns() {
   const { api } = useApi()
@@ -32,34 +33,44 @@ export function useRuns() {
   const triggering = ref(false)
   const error = ref<string | null>(null)
   const polling = ref<ReturnType<typeof setInterval> | null>(null)
+  const pollCount = ref(0)
 
   function stopPolling(): void {
     if (polling.value !== null) {
       clearInterval(polling.value)
       polling.value = null
+      pollCount.value = 0
     }
   }
 
   function startPolling(): void {
     if (polling.value !== null) return
-    polling.value = setInterval(fetchRuns, POLL_INTERVAL_MS)
+    polling.value = setInterval(async () => {
+      pollCount.value++
+      if (pollCount.value >= MAX_POLLS) {
+        stopPolling()
+        return
+      }
+      await fetchRuns(true)
+    }, POLL_INTERVAL_MS)
   }
 
-  async function fetchRuns(): Promise<void> {
-    loading.value = true
-    error.value = null
+  async function fetchRuns(silent = false): Promise<void> {
+    if (!silent) loading.value = true
+    if (!silent) error.value = null
     try {
       runs.value = await api<RecommendationRun[]>('/runs/')
-      if (runs.value.some(r => r.status === 'running')) {
+      const hasActiveRun = runs.value.some(r => r.status === 'pending' || r.status === 'running')
+      if (hasActiveRun) {
         startPolling()
       } else {
         stopPolling()
       }
     } catch (err: unknown) {
       if (isAuthError(err)) return
-      error.value = (err as any)?.data?.detail ?? 'Failed to load runs.'
+      if (!silent) error.value = (err as any)?.data?.detail ?? 'Failed to load runs.'
     } finally {
-      loading.value = false
+      if (!silent) loading.value = false
     }
   }
 
@@ -74,5 +85,5 @@ export function useRuns() {
 
   onUnmounted(stopPolling)
 
-  return { runs, loading, triggering, error, fetchRuns, triggerRun }
+  return { runs, loading, triggering, error, fetchRuns, triggerRun, stopPolling }
 }

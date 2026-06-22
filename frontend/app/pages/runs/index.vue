@@ -73,7 +73,7 @@
 <script setup lang="ts">
 import { useRuns } from '~/composables/useRuns'
 
-const { runs, loading, triggering, error, fetchRuns, triggerRun } = useRuns()
+const { runs, loading, triggering, error, fetchRuns, triggerRun, stopPolling } = useRuns()
 const triggerError = ref<string | null>(null)
 const triggered = ref<string | null>(null)
 
@@ -89,6 +89,7 @@ async function trigger() {
   try {
     const { run_id } = await triggerRun()
     triggered.value = `Run started (ID ${run_id}). It will appear in the list below once complete.`
+    stopPolling()
     await fetchRuns()
   } catch (err: any) {
     triggerError.value = err?.data?.detail ?? 'Failed to start run.'
