@@ -80,12 +80,16 @@ def _resolve_profile(user_id: int, run_id: int) -> PreferenceProfile:
 
 @shared_task(bind=True, max_retries=2)
 def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: int | None = None) -> None:
+    from .models import Recommendation
     if run_id is None:
         run = RecommendationRun.objects.create(user_id=user_id, status='running')
     else:
         run = RecommendationRun.objects.get(id=run_id)
         run.status = 'running'
-        run.save(update_fields=['status'])
+        run.error_message = ''
+        run.save(update_fields=['status', 'error_message'])
+        # Wipe any picks from a previous attempt so retries start clean.
+        Recommendation.objects.filter(run=run).delete()
     try:
         profile = _resolve_profile(user_id=user_id, run_id=run.id)
         results = run_discovery_searches(user_id=user_id, profile_id=profile.id)
@@ -109,4 +113,5 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
             run.status = 'failed'
             run.error_message = str(exc)
             run.save(update_fields=['status', 'error_message'])
+            raise
         raise self.retry(exc=exc, countdown=300)
