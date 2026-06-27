@@ -7,7 +7,12 @@ Each function corresponds to one of the four structured Anthropic SDK calls in t
 
 import anthropic
 
-from .models import Fragrance, PreferenceProfile, Recommendation, RecommendationRun
+from .models import (
+    Fragrance,
+    PreferenceProfile,
+    Recommendation,
+    RecommendationRun,
+)
 
 client = anthropic.Anthropic()
 
@@ -18,84 +23,105 @@ client = anthropic.Anthropic()
 # response is always parseable as JSON without any fallback string parsing.
 # ---------------------------------------------------------------------------
 
+MODEL = "claude-haiku-4-5-20251001"
+
 PROFILE_TOOL_SCHEMA = {
-    'name': 'create_profile',
-    'description': 'Create a fragrance preference profile from the user collection.',
-    'input_schema': {
-        'type': 'object',
-        'properties': {
-            'loved_notes': {'type': 'string'},
-            'liked_notes': {'type': 'string'},
-            'disliked_notes': {'type': 'string'},
-            'owns_list': {
-                'type': 'array',
-                'items': {'type': 'string'},
-                'description': 'Names of fragrances the user currently owns',
+    "name": "create_profile",
+    "description": "Create a fragrance preference profile from the user collection.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "loved_notes": {"type": "string"},
+            "liked_notes": {"type": "string"},
+            "disliked_notes": {"type": "string"},
+            "owns_list": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Names of fragrances the user currently owns",
             },
-            'search_angle_1': {'type': 'string', 'description': 'First targeted search query for discovery'},
-            'search_angle_2': {'type': 'string', 'description': 'Second targeted search query for discovery'},
+            "search_angle_1": {
+                "type": "string",
+                "description": "First targeted search query for discovery",
+            },
+            "search_angle_2": {
+                "type": "string",
+                "description": "Second targeted search query for discovery",
+            },
         },
-        'required': ['loved_notes', 'liked_notes', 'disliked_notes', 'owns_list', 'search_angle_1', 'search_angle_2'],
+        "required": [
+            "loved_notes",
+            "liked_notes",
+            "disliked_notes",
+            "owns_list",
+            "search_angle_1",
+            "search_angle_2",
+        ],
     },
 }
 
 CANDIDATES_TOOL_SCHEMA = {
-    'name': 'select_candidates',
-    'description': 'Select exactly 5 fragrances to recommend, one per fragrance house.',
-    'input_schema': {
-        'type': 'object',
-        'properties': {
-            'candidates': {
-                'type': 'array',
-                'items': {
-                    'type': 'object',
-                    'properties': {
-                        'name': {'type': 'string'},
-                        'house': {'type': 'string'},
+    "name": "select_candidates",
+    "description": "Select exactly 5 fragrances to recommend, one per fragrance house.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "candidates": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "house": {"type": "string"},
                     },
-                    'required': ['name', 'house'],
+                    "required": ["name", "house"],
                 },
-                'minItems': 5,
-                'maxItems': 5,
+                "minItems": 5,
+                "maxItems": 5,
             },
         },
-        'required': ['candidates'],
+        "required": ["candidates"],
     },
 }
 
 REPLACEMENT_TOOL_SCHEMA = {
-    'name': 'select_replacement',
-    'description': 'Select one replacement fragrance for a candidate that failed verification.',
-    'input_schema': {
-        'type': 'object',
-        'properties': {
-            'name': {'type': 'string'},
-            'house': {'type': 'string'},
+    "name": "select_replacement",
+    "description": "Select one replacement fragrance for a candidate that failed verification.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "house": {"type": "string"},
         },
-        'required': ['name', 'house'],
+        "required": ["name", "house"],
     },
 }
 
 EMAIL_CONTENT_TOOL_SCHEMA = {
-    'name': 'generate_email_content',
-    'description': 'Generate a personalized intro and per-fragrance rationale for the recommendation email.',
-    'input_schema': {
-        'type': 'object',
-        'properties': {
-            'intro': {'type': 'string', 'description': 'Personalized 2-3 sentence introduction paragraph'},
-            'rationales': {
-                'type': 'array',
-                'items': {
-                    'type': 'object',
-                    'properties': {
-                        'name': {'type': 'string'},
-                        'rationale': {'type': 'string', 'description': 'One sentence explaining why this suits the user'},
+    "name": "generate_email_content",
+    "description": "Generate a personalized intro and per-fragrance rationale for the recommendation email.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "intro": {
+                "type": "string",
+                "description": "Personalized 2-3 sentence introduction paragraph",
+            },
+            "rationales": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "rationale": {
+                            "type": "string",
+                            "description": "One sentence explaining why this suits the user",
+                        },
                     },
-                    'required': ['name', 'rationale'],
+                    "required": ["name", "rationale"],
                 },
             },
         },
-        'required': ['intro', 'rationales'],
+        "required": ["intro", "rationales"],
     },
 }
 
@@ -176,83 +202,98 @@ Use the generate_email_content tool to return your response."""
 # Helper
 # ---------------------------------------------------------------------------
 
+
 def extract_tool_result(response: anthropic.types.Message) -> dict:
     # tool_choice forces exactly one tool_use block; this is always the first content item.
     for block in response.content:
-        if block.type == 'tool_use':
+        if block.type == "tool_use":
             return block.input
-    raise ValueError(f'No tool_use block in LLM response. Stop reason: {response.stop_reason}')
+    raise ValueError(
+        f"No tool_use block in LLM response. Stop reason: {response.stop_reason}"
+    )
 
 
 # ---------------------------------------------------------------------------
 # LLM pipeline functions — called in order by fragrance/tasks.py
 # ---------------------------------------------------------------------------
 
+
 def generate_preference_profile(user_id: int, run_id: int) -> PreferenceProfile:
     """LLM call #1. Reads the fragrance collection and writes a PreferenceProfile row."""
     fragrances = Fragrance.objects.filter(user_id=user_id)
-    collection_text = '\n'.join(
-        f'{f.name} by {f.house} [{f.status}]' + (f' - {f.notes}' if f.notes else '')
+    collection_text = "\n".join(
+        f"{f.name} by {f.house} [{f.status}]"
+        + (f" - {f.notes}" if f.notes else "")
         for f in fragrances
     )
     past_recommendations = list(
-        Recommendation.objects.filter(user_id=user_id).values_list('name', flat=True)
+        Recommendation.objects.filter(user_id=user_id).values_list(
+            "name", flat=True
+        )
     )
 
     response = client.messages.create(
-        model='claude-haiku-4-5-20251001',
+        model=MODEL,
         max_tokens=1024,
         tools=[PROFILE_TOOL_SCHEMA],
-        tool_choice={'type': 'tool', 'name': 'create_profile'},
-        messages=[{
-            'role': 'user',
-            'content': PROFILE_PROMPT.format(
-                collection=collection_text,
-                past_recommendations=', '.join(past_recommendations),
-            ),
-        }],
+        tool_choice={"type": "tool", "name": "create_profile"},
+        messages=[
+            {
+                "role": "user",
+                "content": PROFILE_PROMPT.format(
+                    collection=collection_text,
+                    past_recommendations=", ".join(past_recommendations),
+                ),
+            }
+        ],
     )
     profile_data = extract_tool_result(response=response)
     profile = PreferenceProfile.objects.create(
         user_id=user_id,
-        loved_notes=profile_data['loved_notes'],
-        liked_notes=profile_data['liked_notes'],
-        disliked_notes=profile_data['disliked_notes'],
-        owns_list=profile_data['owns_list'],
-        search_angle_1=profile_data['search_angle_1'],
-        search_angle_2=profile_data['search_angle_2'],
+        loved_notes=profile_data["loved_notes"],
+        liked_notes=profile_data["liked_notes"],
+        disliked_notes=profile_data["disliked_notes"],
+        owns_list=profile_data["owns_list"],
+        search_angle_1=profile_data["search_angle_1"],
+        search_angle_2=profile_data["search_angle_2"],
     )
     # Link the profile back to the run so render_and_send_email can load it via select_related.
     RecommendationRun.objects.filter(id=run_id).update(profile=profile)
     return profile
 
 
-def select_candidates(user_id: int, profile_id: int, search_results: str) -> list[dict]:
+def select_candidates(
+    user_id: int, profile_id: int, search_results: str
+) -> list[dict]:
     """LLM call #2. Picks 5 fragrances from discovery search results."""
     profile = PreferenceProfile.objects.get(id=profile_id)
     past_recommendations = list(
-        Recommendation.objects.filter(user_id=user_id).values_list('name', flat=True)
+        Recommendation.objects.filter(user_id=user_id).values_list(
+            "name", flat=True
+        )
     )
 
     response = client.messages.create(
-        model='claude-haiku-4-5-20251001',
+        model=MODEL,
         max_tokens=1024,
         tools=[CANDIDATES_TOOL_SCHEMA],
-        tool_choice={'type': 'tool', 'name': 'select_candidates'},
-        messages=[{
-            'role': 'user',
-            'content': CANDIDATES_PROMPT.format(
-                loved_notes=profile.loved_notes,
-                liked_notes=profile.liked_notes,
-                disliked_notes=profile.disliked_notes,
-                owns_list=', '.join(profile.owns_list),
-                past_recommendations=', '.join(past_recommendations),
-                search_results=search_results,
-            ),
-        }],
+        tool_choice={"type": "tool", "name": "select_candidates"},
+        messages=[
+            {
+                "role": "user",
+                "content": CANDIDATES_PROMPT.format(
+                    loved_notes=profile.loved_notes,
+                    liked_notes=profile.liked_notes,
+                    disliked_notes=profile.disliked_notes,
+                    owns_list=", ".join(profile.owns_list),
+                    past_recommendations=", ".join(past_recommendations),
+                    search_results=search_results,
+                ),
+            }
+        ],
     )
     result = extract_tool_result(response=response)
-    return result['candidates']
+    return result["candidates"]
 
 
 def select_replacement(
@@ -263,25 +304,29 @@ def select_replacement(
 ) -> dict:
     """LLM call #3. Called by verify_candidates in search.py when a candidate fails title-match."""
     past_recommendations = list(
-        Recommendation.objects.filter(user_id=user_id).values_list('name', flat=True)
+        Recommendation.objects.filter(user_id=user_id).values_list(
+            "name", flat=True
+        )
     )
 
     response = client.messages.create(
-        model='claude-haiku-4-5-20251001',
+        model=MODEL,
         max_tokens=512,
         tools=[REPLACEMENT_TOOL_SCHEMA],
-        tool_choice={'type': 'tool', 'name': 'select_replacement'},
-        messages=[{
-            'role': 'user',
-            'content': REPLACEMENT_PROMPT.format(
-                failed_name=failed_candidate['name'],
-                loved_notes=profile.loved_notes,
-                liked_notes=profile.liked_notes,
-                disliked_notes=profile.disliked_notes,
-                past_recommendations=', '.join(past_recommendations),
-                search_results=search_results,
-            ),
-        }],
+        tool_choice={"type": "tool", "name": "select_replacement"},
+        messages=[
+            {
+                "role": "user",
+                "content": REPLACEMENT_PROMPT.format(
+                    failed_name=failed_candidate["name"],
+                    loved_notes=profile.loved_notes,
+                    liked_notes=profile.liked_notes,
+                    disliked_notes=profile.disliked_notes,
+                    past_recommendations=", ".join(past_recommendations),
+                    search_results=search_results,
+                ),
+            }
+        ],
     )
     return extract_tool_result(response=response)
 
@@ -292,33 +337,37 @@ def generate_email_content(run_id: int, verified_picks: list[dict]) -> None:
     verified_picks contains both 'confirmed' and 'replaced' entries; only confirmed picks
     receive rationale and appear in the email.
     """
-    run = RecommendationRun.objects.select_related('profile').get(id=run_id)
+    run = RecommendationRun.objects.select_related("profile").get(id=run_id)
     profile = run.profile
 
-    confirmed = [p for p in verified_picks if p['status'] == 'confirmed']
-    picks_text = '\n'.join(f'- {p["name"]} by {p["house"]}' for p in confirmed)
+    confirmed = [p for p in verified_picks if p["status"] == "confirmed"]
+    picks_text = "\n".join(f"- {p['name']} by {p['house']}" for p in confirmed)
 
     response = client.messages.create(
-        model='claude-haiku-4-5-20251001',
+        model=MODEL,
         max_tokens=2048,
         tools=[EMAIL_CONTENT_TOOL_SCHEMA],
-        tool_choice={'type': 'tool', 'name': 'generate_email_content'},
-        messages=[{
-            'role': 'user',
-            'content': EMAIL_CONTENT_PROMPT.format(
-                loved_notes=profile.loved_notes,
-                liked_notes=profile.liked_notes,
-                picks=picks_text,
-            ),
-        }],
+        tool_choice={"type": "tool", "name": "generate_email_content"},
+        messages=[
+            {
+                "role": "user",
+                "content": EMAIL_CONTENT_PROMPT.format(
+                    loved_notes=profile.loved_notes,
+                    liked_notes=profile.liked_notes,
+                    picks=picks_text,
+                ),
+            }
+        ],
     )
     result = extract_tool_result(response=response)
 
-    rationale_map = {r['name']: r['rationale'] for r in result['rationales']}
-    recs = list(Recommendation.objects.filter(run_id=run_id, status='confirmed'))
+    rationale_map = {r["name"]: r["rationale"] for r in result["rationales"]}
+    recs = list(
+        Recommendation.objects.filter(run_id=run_id, status="confirmed")
+    )
     for rec in recs:
-        rec.rationale = rationale_map.get(rec.name, '')
-    Recommendation.objects.bulk_update(objs=recs, fields=['rationale'])
+        rec.rationale = rationale_map.get(rec.name, "")
+    Recommendation.objects.bulk_update(objs=recs, fields=["rationale"])
 
-    run.intro = result['intro']
-    run.save(update_fields=['intro'])
+    run.intro = result["intro"]
+    run.save(update_fields=["intro"])

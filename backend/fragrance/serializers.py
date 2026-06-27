@@ -100,4 +100,4 @@ class RecommendationRunSerializer(serializers.ModelSerializer):
     class Meta:
         model = RecommendationRun
         exclude = ['user']
-        read_only_fields = ['triggered_at', 'status', 'celery_task_id', 'error_message', 'sent_at']
+        read_only_fields = ['triggered_at', 'status', 'email_status', 'celery_task_id', 'error_message', 'sent_at']

@@ -43,7 +43,8 @@ def render_and_send_email(user_id: int, run_id: int) -> None:
     email.send()
 
     run.sent_at = timezone.now()
-    run.save(update_fields=['sent_at'])
+    run.email_status = 'sent'
+    run.save(update_fields=['sent_at', 'email_status'])
 
 
 def _resolve_profile(user_id: int, run_id: int) -> PreferenceProfile:
@@ -86,6 +87,7 @@ def send_recommendation_email(self: 'send_recommendation_email', user_id: int, r
     except Exception as exc:
         if self.request.retries >= self.max_retries:
             RecommendationRun.objects.filter(id=run_id).update(
+                email_status='failed',
                 error_message=f"Email delivery failed after {self.max_retries} retries: {exc}",
             )
             raise
@@ -120,7 +122,8 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
         )
         generate_email_content(run_id=run.id, verified_picks=picks)
         run.status = 'done'
-        run.save(update_fields=['status'])
+        run.email_status = 'pending'
+        run.save(update_fields=['status', 'email_status'])
         send_recommendation_email.delay(user_id=user_id, run_id=run.id)
     except Exception as exc:
         if self.request.retries >= self.max_retries:

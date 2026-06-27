@@ -191,6 +191,27 @@ class RecommendationRunViewSet(viewsets.ReadOnlyModelViewSet):
             Prefetch("picks", queryset=Recommendation.objects.filter(status="confirmed"))
         ).order_by("-triggered_at")
 
+    @action(detail=True, methods=["post"])
+    def resend_email(self, request, pk=None):
+        from fragrance.tasks import send_recommendation_email
+
+        run = self.get_object()
+        if run.status != 'done':
+            return Response(
+                {"detail": "Email can only be sent for completed runs."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if run.email_status in ('pending', 'sent'):
+            return Response(
+                {"detail": "Email is already sent or delivery is in progress."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        run.email_status = 'pending'
+        run.error_message = ''
+        run.save(update_fields=['email_status', 'error_message'])
+        send_recommendation_email.delay(user_id=request.user.id, run_id=run.id)
+        return Response({"detail": "Email resend queued."}, status=status.HTTP_202_ACCEPTED)
+
     @action(detail=False, methods=["post"])
     def trigger(self, request):
         from fragrance.tasks import monthly_fragrance_run

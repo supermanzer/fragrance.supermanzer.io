@@ -19,6 +19,11 @@ RUN_STATUSES = [
     ("done", "Done"),
     ("failed", "Failed"),
 ]
+EMAIL_STATUSES = [
+    ("pending", "Pending"),
+    ("sent", "Sent"),
+    ("failed", "Failed"),
+]
 
 
 # Create your models here.
@@ -108,6 +113,9 @@ class RecommendationRun(models.Model):
     celery_task_id = models.CharField(max_length=255, blank=True)
     error_message = models.TextField(blank=True)
     intro = models.TextField(blank=True)  # LLM-generated personalized intro for the email
+    email_status = models.CharField(
+        max_length=10, choices=EMAIL_STATUSES, null=True, blank=True, default=None
+    )
 
 
 class Recommendation(models.Model):
