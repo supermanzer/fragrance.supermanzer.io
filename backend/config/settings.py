@@ -103,16 +103,14 @@ CELERY_RESULT_BACKEND = CELERY_BROKER_URL
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 
 # Email Configuration
-EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
-EMAIL_HOST = "smtp.gmail.com"
-EMAIL_PORT = 587
-EMAIL_USE_TLS = True
-EMAIL_HOST_USER = config("EMAIL_HOST_USER")
-EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD")
+EMAIL_BACKEND = "anymail.backends.postmark.EmailBackend"
 DEFAULT_FROM_EMAIL = config(
     "DEFAULT_FROM_EMAIL", default="noreply@supermanzer.io"
 )
 SERVER_EMAIL = config("DEFAULT_FROM_EMAIL", default="noreply@supermanzer.io")
+ANYMAIL = {
+    "POSTMARK_SERVER_TOKEN": config("POSTMARK_SERVER_TOKEN"),
+}
 
 # SearXNG URL
 SEARXNG_URL = config("SEARXNG_URL", default="http://searxng:8080")
