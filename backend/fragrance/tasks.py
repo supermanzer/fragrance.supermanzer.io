@@ -78,6 +78,20 @@ def _resolve_profile(user_id: int, run_id: int) -> PreferenceProfile:
     return latest_profile
 
 
+@shared_task(bind=True, max_retries=5)
+def send_recommendation_email(self: 'send_recommendation_email', user_id: int, run_id: int) -> None:
+    """Sends the recommendation email for a completed run. Retried independently of generation."""
+    try:
+        render_and_send_email(user_id=user_id, run_id=run_id)
+    except Exception as exc:
+        if self.request.retries >= self.max_retries:
+            RecommendationRun.objects.filter(id=run_id).update(
+                error_message=f"Email delivery failed after {self.max_retries} retries: {exc}",
+            )
+            raise
+        raise self.retry(exc=exc, countdown=300)
+
+
 @shared_task(bind=True, max_retries=2)
 def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: int | None = None) -> None:
     from .models import Recommendation
@@ -105,9 +119,9 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
             profile=profile,
         )
         generate_email_content(run_id=run.id, verified_picks=picks)
-        render_and_send_email(user_id=user_id, run_id=run.id)
         run.status = 'done'
         run.save(update_fields=['status'])
+        send_recommendation_email.delay(user_id=user_id, run_id=run.id)
     except Exception as exc:
         if self.request.retries >= self.max_retries:
             run.status = 'failed'
