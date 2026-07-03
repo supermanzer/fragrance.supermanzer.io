@@ -6,6 +6,7 @@
     <v-btn :to="{ path: '/runs' }" variant="text" active-color="primary">Runs</v-btn>
     <v-btn :to="{ path: '/profile' }" variant="text" active-color="primary">Profile</v-btn>
     <v-btn :to="{ path: '/settings' }" variant="text" active-color="primary">Settings</v-btn>
+    <v-btn :to="{ path: '/about' }" variant="text" active-color="primary">About</v-btn>
 
     <template #append>
       <v-btn icon @click="logout">

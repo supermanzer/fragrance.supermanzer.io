@@ -17,6 +17,7 @@ export interface RecommendationRun {
   email_html: string
   sent_at: string | null
   status: 'pending' | 'running' | 'done' | 'failed'
+  email_status: 'pending' | 'sent' | 'failed' | null
   celery_task_id: string
   error_message: string
   intro: string
@@ -34,6 +35,13 @@ export function useRuns() {
   const error = ref<string | null>(null)
   const polling = ref<ReturnType<typeof setInterval> | null>(null)
   const pollCount = ref(0)
+  const resending = ref<Set<number>>(new Set())
+
+  const hasActiveRun = computed(() =>
+    runs.value.some(
+      r => r.status === 'pending' || r.status === 'running' || r.email_status === 'pending'
+    )
+  )
 
   function stopPolling(): void {
     if (polling.value !== null) {
@@ -60,8 +68,10 @@ export function useRuns() {
     if (!silent) error.value = null
     try {
       runs.value = await api<RecommendationRun[]>('/runs/')
-      const hasActiveRun = runs.value.some(r => r.status === 'pending' || r.status === 'running')
-      if (hasActiveRun) {
+      const shouldPoll = runs.value.some(
+        r => r.status === 'pending' || r.status === 'running' || r.email_status === 'pending'
+      )
+      if (shouldPoll) {
         startPolling()
       } else {
         stopPolling()
@@ -83,7 +93,31 @@ export function useRuns() {
     }
   }
 
+  // resendEmail re-throws on failure so the caller (handleResend in the page)
+  // can distinguish success from failure to choose the correct snackbar color.
+  async function resendEmail(runId: number): Promise<void> {
+    resending.value.add(runId)
+    try {
+      await api(`/runs/${runId}/resend_email/`, { method: 'POST' })
+      // Silent fetch: avoids collapsing the panel list to a skeleton mid-interaction.
+      await fetchRuns(true)
+    } finally {
+      resending.value.delete(runId)
+    }
+  }
+
   onUnmounted(stopPolling)
 
-  return { runs, loading, triggering, error, fetchRuns, triggerRun, stopPolling }
+  return {
+    runs,
+    loading,
+    triggering,
+    error,
+    hasActiveRun,
+    resending,
+    fetchRuns,
+    triggerRun,
+    resendEmail,
+    stopPolling,
+  }
 }
