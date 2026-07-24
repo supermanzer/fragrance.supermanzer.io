@@ -5,6 +5,8 @@ Implements LLM components of fragrance recommendation generation.
 Each function corresponds to one of the four structured Anthropic SDK calls in the pipeline.
 """
 
+import logging
+
 import anthropic
 
 from .models import (
@@ -15,6 +17,7 @@ from .models import (
 )
 
 client = anthropic.Anthropic()
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -96,34 +99,53 @@ REPLACEMENT_TOOL_SCHEMA = {
     },
 }
 
-EMAIL_CONTENT_TOOL_SCHEMA = {
-    "name": "generate_email_content",
-    "description": "Generate a personalized intro and per-fragrance rationale for the recommendation email.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "intro": {
-                "type": "string",
-                "description": "Personalized 2-3 sentence introduction paragraph",
-            },
-            "rationales": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "rationale": {
-                            "type": "string",
-                            "description": "One sentence explaining why this suits the user",
+
+def build_email_content_tool_schema(confirmed_names: list[str]) -> dict:
+    """
+    Builds the generate_email_content tool schema for one call, constraining each
+    rationale's "name" to the exact confirmed Recommendation names for this run via
+    JSON Schema enum. "strict" is set so the enum is grammar-enforced by the API rather
+    than advisory guidance the model can still paraphrase away from (bare enum without
+    strict is not sampling-constrained) — see Anthropic's strict tool use docs.
+    """
+    name_schema: dict = {
+        "type": "string",
+        "description": "Must be exactly one of the confirmed fragrance names given in the prompt.",
+    }
+    if confirmed_names:
+        name_schema["enum"] = confirmed_names
+
+    return {
+        "name": "generate_email_content",
+        "description": "Generate a personalized intro and per-fragrance rationale for the recommendation email.",
+        "strict": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "intro": {
+                    "type": "string",
+                    "description": "Personalized 2-3 sentence introduction paragraph",
+                },
+                "rationales": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": name_schema,
+                            "rationale": {
+                                "type": "string",
+                                "description": "One sentence explaining why this suits the user",
+                            },
                         },
+                        "required": ["name", "rationale"],
+                        "additionalProperties": False,
                     },
-                    "required": ["name", "rationale"],
                 },
             },
+            "required": ["intro", "rationales"],
+            "additionalProperties": False,
         },
-        "required": ["intro", "rationales"],
-    },
-}
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -340,13 +362,21 @@ def generate_email_content(run_id: int, verified_picks: list[dict]) -> None:
     run = RecommendationRun.objects.select_related("profile").get(id=run_id)
     profile = run.profile
 
+    # id order matches creation order — recs are inserted sequentially in search.py.
+    recs = list(
+        Recommendation.objects.filter(run_id=run_id, status="confirmed").order_by(
+            "id"
+        )
+    )
+    confirmed_names = [rec.name for rec in recs]
+
     confirmed = [p for p in verified_picks if p["status"] == "confirmed"]
     picks_text = "\n".join(f"- {p['name']} by {p['house']}" for p in confirmed)
 
     response = client.messages.create(
         model=MODEL,
         max_tokens=2048,
-        tools=[EMAIL_CONTENT_TOOL_SCHEMA],
+        tools=[build_email_content_tool_schema(confirmed_names=confirmed_names)],
         tool_choice={"type": "tool", "name": "generate_email_content"},
         messages=[
             {
@@ -362,12 +392,17 @@ def generate_email_content(run_id: int, verified_picks: list[dict]) -> None:
     result = extract_tool_result(response=response)
 
     rationale_map = {r["name"]: r["rationale"] for r in result["rationales"]}
-    recs = list(
-        Recommendation.objects.filter(run_id=run_id, status="confirmed")
-    )
     for rec in recs:
         rec.rationale = rationale_map.get(rec.name, "")
     Recommendation.objects.bulk_update(objs=recs, fields=["rationale"])
+
+    missing_names = [rec.name for rec in recs if not rec.rationale]
+    if missing_names:
+        logger.warning(
+            "generate_email_content: run_id=%s missing rationale for pick(s): %s",
+            run_id,
+            ", ".join(missing_names),
+        )
 
     run.intro = result["intro"]
     run.save(update_fields=["intro"])
