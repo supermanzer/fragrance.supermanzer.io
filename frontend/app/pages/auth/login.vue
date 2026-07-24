@@ -46,7 +46,7 @@
 <script setup lang="ts">
 import { setTokens } from '~/composables/useApi'
 
-definePageMeta({ layout: 'auth' })
+definePageMeta({ layout: 'auth', auth: false })
 
 const config = useRuntimeConfig()
 

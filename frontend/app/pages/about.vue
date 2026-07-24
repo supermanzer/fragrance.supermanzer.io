@@ -1,6 +1,5 @@
 <template>
   <div class="pt-8">
-
     <!-- ─── HERO ─────────────────────────────────────────────────────────── -->
     <section class="mb-16">
       <VRow align="center">
@@ -41,10 +40,11 @@
           class="mb-8 mb-md-0"
         >
           <VImg
-            src="https://images.pexels.com/photos/30970927/pexels-photo-30970927.jpeg"
+            src="https://images.pexels.com/photos/8361538/pexels-photo-8361538.jpeg?auto=compress&cs=tinysrgb&w=960"
             :aspect-ratio="0.8"
             rounded="lg"
             cover
+            referrerpolicy="no-referrer"
             alt="A single amber glass perfume bottle on a pale neutral surface, warm directional light"
           >
             <template #placeholder>
@@ -201,10 +201,11 @@
           class="mb-8 mb-md-0"
         >
           <VImg
-            src="https://images.pexels.com/photos/954405/pexels-photo-954405.jpeg"
+            src="https://images.pexels.com/photos/954405/pexels-photo-954405.jpeg?auto=compress&cs=tinysrgb&w=960"
             :aspect-ratio="1"
             rounded="lg"
             cover
+            referrerpolicy="no-referrer"
             alt="A curated arrangement of glass perfume bottles on a table, warm natural side light"
           >
             <template #placeholder>
@@ -222,7 +223,7 @@
 </template>
 
 <script setup lang="ts">
-definePageMeta({ title: 'About' })
+definePageMeta({ title: 'About', layout: 'public', auth: false })
 
 interface Step {
   readonly number: string

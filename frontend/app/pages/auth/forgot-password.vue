@@ -43,7 +43,7 @@
 </template>
 
 <script setup lang="ts">
-definePageMeta({ layout: 'auth' })
+definePageMeta({ layout: 'auth', auth: false })
 
 const config = useRuntimeConfig()
 const email = ref('')

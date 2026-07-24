@@ -9,7 +9,7 @@
     <v-btn :to="{ path: '/about' }" variant="text" active-color="primary">About</v-btn>
 
     <template #append>
-      <v-btn icon @click="logout">
+      <v-btn v-tooltip:start="'Log out'" icon @click="logout">
         <v-icon>mdi-logout</v-icon>
       </v-btn>
     </template>

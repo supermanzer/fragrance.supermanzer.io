@@ -59,7 +59,7 @@
 <script setup lang="ts">
 import { setTokens } from '~/composables/useApi'
 
-definePageMeta({ layout: 'auth' })
+definePageMeta({ layout: 'auth', auth: false })
 
 // Registration is currently closed. Remove this redirect to re-enable sign-ups.
 await navigateTo('/auth/login', { replace: true })
