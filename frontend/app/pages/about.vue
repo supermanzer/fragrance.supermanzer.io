@@ -85,7 +85,7 @@
             class="text-body-1 text-medium-emphasis"
             style="max-width: 560px; line-height: 1.8"
           >
-            Six automated steps run in the background each month. What lands in your inbox is simpler than
+            Four automated steps run in the background each month. What lands in your inbox is simpler than
             that: something considered, chosen from your own history.
           </p>
         </VCol>
