@@ -89,3 +89,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.iml
+
+# ------------- Debugging Files ----------------------------------------------
+debugging/
