@@ -26,9 +26,9 @@
             class="text-body-1"
             style="max-width: 520px; line-height: 1.8"
           >
-            Each month, this tool reads your entire fragrance collection — what you own, what you like,
-            what hasn't been right — and returns five picks that follow your taste's own logic forward.
-            No crowd signals. No trending lists. Your collection, extended.
+            Each month, this tool reads your entire fragrance collection. What you own. What you like. What
+            hasn't been right. Then it returns five picks that follow your taste's own logic forward,
+            further into the territory your collection is already exploring.
           </p>
         </VCol>
 
@@ -79,14 +79,14 @@
             class="text-h5 mb-4"
             style="font-weight: 400; line-height: 1.35"
           >
-            A curatorial process, not a search engine.
+            A curatorial process, built one collection at a time.
           </h2>
           <p
             class="text-body-1 text-medium-emphasis"
             style="max-width: 560px; line-height: 1.8"
           >
-            Six automated steps run in the background each month. What arrives in your inbox is simpler
-            than that: something considered, chosen from your own history.
+            Six automated steps run in the background each month. What lands in your inbox is simpler than
+            that: something considered, chosen from your own history.
           </p>
         </VCol>
 
@@ -173,23 +173,22 @@
             class="text-h5 mb-6"
             style="font-weight: 400; line-height: 1.35"
           >
-            The best recommendation is the one that knows the question.
+            Good taste is specific. So is a good recommendation.
           </h2>
           <p
             class="text-body-1"
             style="max-width: 560px; line-height: 1.8"
           >
-            Most discovery tools are built for audiences. They optimize for what most people like —
-            which means they optimize away from what makes your taste specific. This one works in
-            the opposite direction.
+            Most discovery tools are built for audiences. They optimize for what most people like, which
+            means they drift away from what makes your taste specific. This one runs the other way.
           </p>
           <p
             class="text-body-1 text-medium-emphasis mt-4"
             style="max-width: 560px; line-height: 1.8"
           >
-            The longer your collection grows, the more precisely it knows what to look for — which
-            woods you return to in autumn, which green things you keep setting aside. A tool that earns
-            its usefulness over time, one rated fragrance at a time.
+            The longer your collection grows, the more precisely it knows what to look for: which woods you
+            return to every autumn, which green things you keep setting aside. It gets better at this the
+            same way you did, one rated fragrance at a time.
           </p>
         </VCol>
 
@@ -240,28 +239,28 @@ const steps: readonly Step[] = [
   {
     number: '01',
     title: 'Learning what you love',
-    body: "The full shape of your taste — what you own, what you like, what you've decided isn't for you — is read and synthesized into a profile. Not a list of keywords. A point of view.",
+    body: "The full shape of your taste, what you own, what you like, what you've decided isn't for you, gets read and folded into a single, opinionated profile.",
   },
   {
     number: '02',
     title: 'Searching with direction',
-    body: 'Two search angles, derived from that profile, go looking. Not for popular fragrances or bestsellers. For the specific character your collection keeps reaching toward.',
+    body: 'Two search angles, derived from that profile, go looking for the specific character your collection keeps reaching toward, the kind of thing that never makes a bestseller list.',
   },
   {
     number: '03',
     title: 'Curating the shortlist',
-    body: 'Five candidates are selected and each one verified: real, currently available, and genuinely new to you. The system checks against everything it has ever recommended before, and does not repeat itself.',
+    body: 'Five candidates are selected, then each one verified: real, currently available, genuinely new to you. The system checks against everything it has recommended before and never repeats itself.',
   },
   {
     number: '04',
     title: 'Arriving in your inbox',
-    body: 'A personal email: five picks, each with its own rationale written around your actual collection. Not a newsletter. A letter.',
+    body: 'A personal letter arrives by email. Five picks, each with its own reasoning, written around your actual collection.',
   },
 ]
 
 const stats: readonly Stat[] = [
   { figure: '5', caption: 'picks, delivered every month, never the same fragrance twice' },
-  { figure: '0', caption: "strangers' preferences in the model — only your collection shapes the output" },
-  { figure: '1', caption: 'owner. This tool was built for one collection, and optimizes for nothing else.' },
+  { figure: '0', caption: "strangers' preferences in the model. Only your collection decides what shows up in your inbox." },
+  { figure: '1', caption: 'owner. This tool was built for one collection and tuned for nothing else.' },
 ]
 </script>

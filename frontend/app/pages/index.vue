@@ -26,9 +26,9 @@
             class="text-body-1 mb-6"
             style="max-width: 520px; line-height: 1.8"
           >
-            Sign in, tell it what's in your collection — what you own, what you like,
-            what missed the mark — and once a month it searches, verifies, and emails five new
-            fragrances chosen to extend your taste, not replace it.
+            Sign in and tell it what's in your collection: what you own, what you like, what missed the
+            mark. Once a month it searches, verifies, and sends five fragrances chosen to push your
+            taste further in the direction it's already heading.
           </p>
 
           <div class="d-flex flex-column flex-sm-row ga-3 ga-sm-4">
@@ -118,13 +118,13 @@
             class="text-h5 mb-4"
             style="font-weight: 400; line-height: 1.35"
           >
-            Personal, not popular.
+            One collection. One point of view.
           </h2>
           <p
             class="text-body-1 text-medium-emphasis"
             style="max-width: 460px; line-height: 1.8"
           >
-            No crowd data, no trending lists, no bestseller shelf. Three things this does instead.
+            It stays that way for three reasons, each one running quietly in the background every month.
           </p>
         </VCol>
 
@@ -187,8 +187,8 @@
         class="text-body-1 mb-6"
         style="max-width: 480px; line-height: 1.8; margin: 0 auto"
       >
-        Two minutes to sign in and start rating. The first recommendation letter follows your
-        first month of rated fragrances.
+        Two minutes to sign in and start rating fragrances. Your first recommendation letter follows a
+        month later.
       </p>
 
       <div class="d-flex flex-column flex-sm-row justify-sm-center ga-3 ga-sm-4">
@@ -232,12 +232,12 @@
 definePageMeta({ layout: 'public', auth: false })
 
 useSeoMeta({
-  title: 'Fragrances — recommendations built from what you own',
+  title: 'Fragrance recommendations, built from what you already own',
   description:
-    'Tell it what you own, like, and what missed the mark — once a month it searches, verifies, and emails five new fragrances chosen to extend your taste, not replace it.',
-  ogTitle: 'Fragrances — recommendations built from what you own',
+    "Tell it what you own, like, and what missed the mark. Once a month it searches, verifies, and emails five fragrances chosen to push your taste further in the direction it's already heading.",
+  ogTitle: 'Fragrance recommendations, built from what you already own',
   ogDescription:
-    'A personal fragrance recommendation letter, built from your own collection. No crowd data, no trending lists.',
+    'A personal fragrance recommendation letter, built entirely from your own collection.',
   ogImage:
     'https://images.pexels.com/photos/30970929/pexels-photo-30970929.jpeg?auto=compress&cs=tinysrgb&w=960',
   twitterCard: 'summary_large_image',
@@ -255,19 +255,19 @@ const benefitBlocks: readonly BenefitBlock[] = [
     icon: 'mdi-bottle-tonic-outline',
     label: 'Your collection',
     headline: "Every pick starts with what you've already rated.",
-    body: "The system reads what you own, what you like, and what you've decided isn't for you, and builds a taste profile from that alone — no crowd data, no popularity signal.",
+    body: "The system reads what you own, what you like, and what you've decided isn't for you, then builds a taste profile from exactly that. Nothing borrowed from anyone else's collection.",
   },
   {
     icon: 'mdi-check-decagram-outline',
     label: 'The process',
     headline: 'Verified before it ever reaches your inbox.',
-    body: 'Five candidates are found, checked against everything recommended before, and confirmed real and currently available — so nothing arrives twice, and nothing arrives broken.',
+    body: 'Five candidates are found, checked against everything recommended before, and confirmed real and currently available. Each one is new to you and still on the shelf.',
   },
   {
     icon: 'mdi-email-outline',
     label: 'The delivery',
     headline: 'One email a month, written around your taste.',
-    body: 'Not a digest. A short letter: five fragrances, each with a reason it was chosen for you specifically.',
+    body: 'A short letter arrives, once a month. Five fragrances, each with the reason it was picked for you.',
   },
 ]
 
