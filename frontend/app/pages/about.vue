@@ -117,36 +117,6 @@
       </VRow>
     </section>
 
-    <!-- ─── DIVIDER ───────────────────────────────────────────────────────── -->
-    <VDivider class="mb-16" />
-
-    <!-- ─── STARTING WITH NOTHING ─────────────────────────────────────────── -->
-    <section
-      class="mb-16"
-      style="max-width: 560px"
-    >
-      <p
-        class="text-overline text-medium-emphasis mb-3"
-        style="letter-spacing: 0.12em"
-      >
-        Starting with nothing
-      </p>
-      <h2
-        class="text-h5 mb-4"
-        style="font-weight: 400; line-height: 1.35"
-      >
-        Go smell something first.
-      </h2>
-      <p
-        class="text-body-1"
-        style="line-height: 1.8"
-      >
-        A checklist of words like woody or fresh only goes so far. Walk up to a counter, put a
-        strip under your nose, and see what happens on your skin. Even disliking everything you
-        tried is useful. It tells the system exactly where to steer next.
-      </p>
-    </section>
-
     <!-- ─── STATS / CLAIMS ────────────────────────────────────────────────── -->
     <VSheet
       color="surface"
@@ -184,7 +154,7 @@
     </VSheet>
 
     <!-- ─── CLOSING ───────────────────────────────────────────────────────── -->
-    <section class="mb-8">
+    <section class="mb-16">
       <VRow align="center">
         <VCol
           cols="12"
@@ -244,6 +214,47 @@
               />
             </template>
           </VImg>
+        </VCol>
+      </VRow>
+    </section>
+
+    <!-- ─── DIVIDER ───────────────────────────────────────────────────────── -->
+    <VDivider class="mb-16" />
+
+    <!-- ─── STARTING WITH NOTHING ─────────────────────────────────────────── -->
+    <section class="mb-8">
+      <VRow
+        no-gutters
+        justify="end"
+      >
+        <VCol
+          cols="10"
+          sm="8"
+          md="6"
+          class="text-right"
+          style="max-width: 420px"
+        >
+          <p
+            class="text-overline text-medium-emphasis mb-3"
+            style="letter-spacing: 0.12em; margin-right: -0.12em"
+          >
+            Starting with nothing
+          </p>
+          <h2
+            class="text-h5 mb-4"
+            style="font-weight: 400; line-height: 1.35"
+          >
+            Go smell something first.
+          </h2>
+          <p
+            class="text-body-1"
+            style="line-height: 1.8"
+          >
+            A checklist of words like woody or fresh only goes so far. Walk up to a counter, put
+            a strip under your nose, and see what happens on your skin. Even disliking everything
+            you tried still counts. It points the system in a direction and starts you on your
+            own journey.
+          </p>
         </VCol>
       </VRow>
     </section>
