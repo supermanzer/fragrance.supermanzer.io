@@ -14,6 +14,9 @@ from django.utils import timezone
 from .llm import generate_email_content, generate_preference_profile, select_candidates
 from .models import Fragrance, FragranceConfig, PreferenceProfile, RecommendationRun
 from .search import run_discovery_searches, verify_candidates
+from .services import generate_recommendation_token
+
+RATING_ACTIONS = ('own', 'like', 'dislike')
 
 
 def render_and_send_email(user_id: int, run_id: int) -> None:
@@ -25,6 +28,21 @@ def render_and_send_email(user_id: int, run_id: int) -> None:
         .get(id=run_id)
     )
     config = FragranceConfig.objects.get(user_id=user_id)
+
+    # Attach ad-hoc confirm_url_* attributes directly onto the prefetched pick instances
+    # so the template can reference pick.confirm_url_own/_like/_dislike without a second
+    # query or a parallel context structure. Only 'confirmed' picks are rated from the
+    # email — 'replaced' picks are never shown, so they get no tokens.
+    for pick in run.picks.all():
+        if pick.status != 'confirmed':
+            continue
+        for rating_action in RATING_ACTIONS:
+            token = generate_recommendation_token(recommendation=pick, action=rating_action)
+            setattr(
+                pick,
+                f'confirm_url_{rating_action}',
+                f'{settings.FRONTEND_URL}/recommendations/confirm?t={token}',
+            )
 
     html = render_to_string(
         template_name='fragrance/recommendation_email.html',

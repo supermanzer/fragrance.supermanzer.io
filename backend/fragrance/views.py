@@ -8,6 +8,7 @@ from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
 from django.db.models import Prefetch
 from django.http import HttpResponse
+from django.shortcuts import get_object_or_404
 from django.template.loader import render_to_string
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
@@ -16,6 +17,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
 from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import (
@@ -32,11 +34,17 @@ from .serializers import (
     PasswordResetConfirmSerializer,
     PasswordResetRequestSerializer,
     PreferenceProfileSerializer,
+    RecommendationRatingSerializer,
     RecommendationRunSerializer,
     RecommendationSerializer,
     UserRegistrationSerializer,
 )
-from .services import import_collection_from_csv
+from .services import (
+    RatingConflict,
+    apply_recommendation_rating,
+    import_collection_from_csv,
+    verify_recommendation_token,
+)
 
 # Characters that spreadsheet apps interpret as formula triggers.
 _FORMULA_PREFIXES = ('=', '+', '-', '@', '\t', '\r')
@@ -175,7 +183,9 @@ class RecommendationListView(generics.ListAPIView):
     serializer_class = RecommendationSerializer
 
     def get_queryset(self):
-        qs = Recommendation.objects.filter(user=self.request.user)
+        qs = Recommendation.objects.filter(
+            user=self.request.user
+        ).select_related("promoted_fragrance")
         if self.request.query_params.get("include_replaced") != "true":
             qs = qs.filter(status="confirmed")
         return qs.order_by("-run__triggered_at")
@@ -188,7 +198,12 @@ class RecommendationRunViewSet(viewsets.ReadOnlyModelViewSet):
         return RecommendationRun.objects.filter(
             user=self.request.user
         ).prefetch_related(
-            Prefetch("picks", queryset=Recommendation.objects.filter(status="confirmed"))
+            Prefetch(
+                "picks",
+                queryset=Recommendation.objects.filter(
+                    status="confirmed"
+                ).select_related("promoted_fragrance"),
+            )
         ).order_by("-triggered_at")
 
     @action(detail=True, methods=["post"])
@@ -290,3 +305,123 @@ class ImportCollectionView(generics.GenericAPIView):
             return Response(
                 {"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST
             )
+
+
+class RecommendationRateView(APIView):
+    """Authenticated rating endpoint for the runs page UI."""
+
+    def post(self, request, pk: int | None = None) -> Response:
+        recommendation = get_object_or_404(
+            Recommendation, pk=pk, user=request.user
+        )
+        serializer = RecommendationRatingSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        action_value = serializer.validated_data["action"]
+
+        if recommendation.status != "confirmed":
+            return Response(
+                {"detail": "This pick can no longer be rated."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            fragrance, is_new = apply_recommendation_rating(
+                recommendation=recommendation, action=action_value
+            )
+        except RatingConflict as exc:
+            return Response(
+                {
+                    "detail": "This pick was already rated.",
+                    "reason": "already_rated",
+                    "existing_action": exc.existing_action,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        payload = {
+            "id": fragrance.id,
+            "action": fragrance.status,
+            "name": fragrance.name,
+            "house": fragrance.house,
+        }
+        if is_new:
+            return Response(payload, status=status.HTTP_201_CREATED)
+        payload["already_rated"] = True
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+_CONFIRM_NOT_FOUND = {"detail": "Not found."}
+
+
+class RecommendationConfirmView(APIView):
+    """
+    Unauthenticated token-based rating surface reached from recommendation emails.
+
+    GET is a read-only preview (no side effects) so mail clients/scanners that
+    prefetch links can never silently record a rating; POST performs the write,
+    only ever triggered by an explicit user tap on the confirm page.
+    """
+
+    permission_classes = [permissions.AllowAny]
+
+    def _resolve(self, request) -> tuple[Recommendation, dict] | None:
+        token = request.query_params.get("t", "")
+        payload = verify_recommendation_token(token=token)
+        if payload is None:
+            return None
+        try:
+            recommendation = Recommendation.objects.select_related(
+                "promoted_fragrance"
+            ).get(id=payload["rid"], user_id=payload["uid"], status="confirmed")
+        except Recommendation.DoesNotExist:
+            return None
+        return recommendation, payload
+
+    def get(self, request) -> Response:
+        resolved = self._resolve(request)
+        if resolved is None:
+            return Response(_CONFIRM_NOT_FOUND, status=status.HTTP_404_NOT_FOUND)
+        recommendation, payload = resolved
+        existing = getattr(recommendation, "promoted_fragrance", None)
+        return Response(
+            {
+                "name": recommendation.name,
+                "house": recommendation.house,
+                "action": payload["action"],
+                "already_rated": existing is not None,
+                "rated_as": existing.status if existing else None,
+            }
+        )
+
+    def post(self, request) -> Response:
+        resolved = self._resolve(request)
+        if resolved is None:
+            return Response(_CONFIRM_NOT_FOUND, status=status.HTTP_404_NOT_FOUND)
+        recommendation, payload = resolved
+
+        try:
+            fragrance, is_new = apply_recommendation_rating(
+                recommendation=recommendation, action=payload["action"]
+            )
+        except RatingConflict as exc:
+            return Response(
+                {"detail": "This pick was already rated.", "rated_as": exc.existing_action},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        if not is_new:
+            # Same action already recorded via this or another surface — unlike the
+            # authenticated /rate/ endpoint, a token resubmission is never treated as
+            # success: the confirm page always shows the "already rated" state instead.
+            return Response(
+                {"detail": "This pick was already rated.", "rated_as": fragrance.status},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        return Response(
+            {
+                "name": fragrance.name,
+                "house": fragrance.house,
+                "action": fragrance.status,
+            }
+        )

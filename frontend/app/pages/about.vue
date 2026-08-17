@@ -253,7 +253,8 @@
             A checklist of words like woody or fresh only goes so far. Walk up to a counter, put
             a strip under your nose, and see what happens on your skin. Even disliking everything
             you tried still counts. It points the system in a direction and starts you on your
-            own journey.
+            own journey. So go try some scents and begin shaping your personal fragrance profile. 
+            We'll be here.
           </p>
         </VCol>
       </VRow>

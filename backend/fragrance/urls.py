@@ -8,7 +8,9 @@ from .views import (
     ImportCollectionView,
     PreferenceProfileHistoryView,
     PreferenceProfileView,
+    RecommendationConfirmView,
     RecommendationListView,
+    RecommendationRateView,
     RecommendationRunViewSet,
 )
 
@@ -23,4 +25,6 @@ urlpatterns = router.urls + [
     path('profile/', PreferenceProfileView.as_view(), name='preference-profile'),
     path('profile/history/', PreferenceProfileHistoryView.as_view(), name='preference-profile-history'),
     path('recommendations/', RecommendationListView.as_view(), name='recommendations'),
+    path('recommendations/confirm/', RecommendationConfirmView.as_view(), name='recommendation-confirm'),
+    path('recommendations/<int:pk>/rate/', RecommendationRateView.as_view(), name='recommendation-rate'),
 ]

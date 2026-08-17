@@ -6,7 +6,7 @@ from django.utils.encoding import force_str
 from django.utils.http import urlsafe_base64_decode
 from rest_framework import serializers
 
-from .models import FragranceConfig, Fragrance, PreferenceProfile, Recommendation, RecommendationRun
+from .models import FRAGRANCE_STATUSES, FragranceConfig, Fragrance, PreferenceProfile, Recommendation, RecommendationRun
 
 
 class UserRegistrationSerializer(serializers.ModelSerializer):
@@ -41,10 +41,23 @@ class PreferenceProfileSerializer(serializers.ModelSerializer):
 
 
 class RecommendationSerializer(serializers.ModelSerializer):
+    rating = serializers.SerializerMethodField()
+
     class Meta:
         model = Recommendation
         fields = '__all__'
         read_only_fields = ['user', 'run']
+
+    def get_rating(self, obj: Recommendation) -> str | None:
+        # promoted_fragrance is a reverse OneToOneField accessor; it raises
+        # RelatedObjectDoesNotExist (an AttributeError subclass) on no match,
+        # so getattr(..., None) is the correct idiom here, not try/except.
+        fragrance = getattr(obj, 'promoted_fragrance', None)
+        return fragrance.status if fragrance else None
+
+
+class RecommendationRatingSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(choices=FRAGRANCE_STATUSES)
 
 
 class ChangePasswordSerializer(serializers.Serializer):

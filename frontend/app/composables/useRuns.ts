@@ -1,4 +1,5 @@
 import { useApi, isAuthError } from '~/composables/useApi'
+import type { RatingAction } from '~/utils/rating'
 
 export interface Recommendation {
   id: number
@@ -8,6 +9,12 @@ export interface Recommendation {
   status: 'confirmed' | 'replaced'
   rationale: string
   search_source_url: string
+  rating: RatingAction | null
+}
+
+export interface RateOutcome {
+  outcome: 'created' | 'already_rated'
+  action: RatingAction
 }
 
 export interface RecommendationRun {
@@ -36,6 +43,7 @@ export function useRuns() {
   const polling = ref<ReturnType<typeof setInterval> | null>(null)
   const pollCount = ref(0)
   const resending = ref<Set<number>>(new Set())
+  const ratingInFlight = ref<Map<number, RatingAction>>(new Map())
 
   const hasActiveRun = computed(() =>
     runs.value.some(
@@ -106,6 +114,48 @@ export function useRuns() {
     }
   }
 
+  // Patches a single pick's rating in local state directly rather than refetching —
+  // a full fetchRuns() would collapse the expansion panels the user has open, same
+  // reasoning documented above resendEmail's silent refetch.
+  function patchRating(pickId: number, action: RatingAction): void {
+    for (const run of runs.value) {
+      const pick = run.picks.find(p => p.id === pickId)
+      if (pick) {
+        pick.rating = action
+        return
+      }
+    }
+  }
+
+  // rateRecommendation re-throws on genuine failure (network, 400, 404) so the caller
+  // can show the generic-error snackbar; a 409 conflict is not re-thrown because it is
+  // not a failure from the user's perspective — the pick already has a rating, so local
+  // state is patched to reflect the server's existing_action and the caller shows an
+  // info snackbar instead.
+  async function rateRecommendation(pickId: number, action: RatingAction): Promise<RateOutcome> {
+    ratingInFlight.value.set(pickId, action)
+    try {
+      const data = await api<{
+        id: number
+        action: RatingAction
+        name: string
+        house: string
+        already_rated?: boolean
+      }>(`/recommendations/${pickId}/rate/`, { method: 'POST', body: { action } })
+      patchRating(pickId, data.action)
+      return { outcome: data.already_rated ? 'already_rated' : 'created', action: data.action }
+    } catch (err: unknown) {
+      const existingAction = (err as any)?.data?.existing_action as RatingAction | undefined
+      if (existingAction) {
+        patchRating(pickId, existingAction)
+        return { outcome: 'already_rated', action: existingAction }
+      }
+      throw err
+    } finally {
+      ratingInFlight.value.delete(pickId)
+    }
+  }
+
   onUnmounted(stopPolling)
 
   return {
@@ -115,9 +165,11 @@ export function useRuns() {
     error,
     hasActiveRun,
     resending,
+    ratingInFlight,
     fetchRuns,
     triggerRun,
     resendEmail,
+    rateRecommendation,
     stopPolling,
   }
 }

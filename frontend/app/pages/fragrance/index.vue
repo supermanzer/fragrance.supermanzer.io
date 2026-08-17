@@ -287,6 +287,7 @@
 <script setup lang="ts">
 import { useFragrance, type Fragrance, type FragranceInput } from '~/composables/useFragrance'
 import { useImport } from '~/composables/useImport'
+import { statusColor } from '~/utils/rating'
 
 const { fragrances, loading, error, fetchFragrances, createFragrance, updateFragrance, deleteFragrance } = useFragrance()
 const { loading: importLoading, error: importError, result: importResult, importCollection, reset: importReset } = useImport()
@@ -330,11 +331,6 @@ const activeTab = ref('')
 
 watch(activeTab, (val) => fetchFragrances(val || undefined))
 onMounted(() => fetchFragrances())
-
-function statusColor(status: string): string {
-  const map: Record<string, string> = { own: 'success', like: 'info', dislike: 'error' }
-  return map[status] ?? 'default'
-}
 
 // --- Add / Edit ---
 const dialog = ref(false)

@@ -279,6 +279,56 @@
                         {{ pick.rationale }}
                       </p>
                     </VExpandTransition>
+
+                    <VFadeTransition mode="out-in">
+                      <VChip
+                        v-if="pick.rating"
+                        key="rated"
+                        size="small"
+                        variant="tonal"
+                        :color="statusColor(pick.rating)"
+                        :prepend-icon="ratingIcon(pick.rating)"
+                        class="mt-3"
+                      >
+                        Marked as {{ ratingLabel(pick.rating) }}
+                      </VChip>
+                      <div
+                        v-else
+                        key="unrated"
+                        class="d-flex ga-2 flex-wrap mt-3"
+                      >
+                        <VBtn
+                          size="small"
+                          variant="text"
+                          prepend-icon="mdi-cash"
+                          :loading="ratingInFlight.get(pick.id) === 'own'"
+                          :disabled="ratingInFlight.has(pick.id) && ratingInFlight.get(pick.id) !== 'own'"
+                          @click="handleRate(pick, 'own')"
+                        >
+                          Bought it
+                        </VBtn>
+                        <VBtn
+                          size="small"
+                          variant="text"
+                          prepend-icon="mdi-thumb-up"
+                          :loading="ratingInFlight.get(pick.id) === 'like'"
+                          :disabled="ratingInFlight.has(pick.id) && ratingInFlight.get(pick.id) !== 'like'"
+                          @click="handleRate(pick, 'like')"
+                        >
+                          Liked it
+                        </VBtn>
+                        <VBtn
+                          size="small"
+                          variant="text"
+                          prepend-icon="mdi-thumb-down"
+                          :loading="ratingInFlight.get(pick.id) === 'dislike'"
+                          :disabled="ratingInFlight.has(pick.id) && ratingInFlight.get(pick.id) !== 'dislike'"
+                          @click="handleRate(pick, 'dislike')"
+                        >
+                          Didn't like it
+                        </VBtn>
+                      </div>
+                    </VFadeTransition>
                   </div>
                 </template>
               </div>
@@ -305,7 +355,8 @@
 </template>
 
 <script setup lang="ts">
-import { useRuns } from '~/composables/useRuns'
+import { useRuns, type Recommendation } from '~/composables/useRuns'
+import { ratingLabel, ratingIcon, statusColor, type RatingAction } from '~/utils/rating'
 
 const {
   runs,
@@ -314,14 +365,16 @@ const {
   error,
   hasActiveRun,
   resending,
+  ratingInFlight,
   fetchRuns,
   triggerRun,
   resendEmail,
+  rateRecommendation,
 } = useRuns()
 
 const openPanels = ref<number[]>([0])
 const openRationales = ref<Set<number>>(new Set())
-const snackbar = ref<{ message: string; color: 'success' | 'error' } | null>(null)
+const snackbar = ref<{ message: string; color: 'success' | 'error' | 'info' } | null>(null)
 
 onMounted(fetchRuns)
 
@@ -357,6 +410,22 @@ async function handleResend(runId: number): Promise<void> {
     snackbar.value = { message: 'Email resend queued', color: 'success' }
   } catch {
     snackbar.value = { message: 'Failed to resend email', color: 'error' }
+  }
+}
+
+async function handleRate(pick: Recommendation, action: RatingAction): Promise<void> {
+  try {
+    const result = await rateRecommendation(pick.id, action)
+    if (result.outcome === 'already_rated') {
+      snackbar.value = { message: 'That pick was already rated.', color: 'info' }
+    } else {
+      snackbar.value = {
+        message: `${pick.name} added to your collection as ${ratingLabel(result.action)}.`,
+        color: 'success',
+      }
+    }
+  } catch {
+    snackbar.value = { message: "Couldn't save your rating. Please try again.", color: 'error' }
   }
 }
 </script>
