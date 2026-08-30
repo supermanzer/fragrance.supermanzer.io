@@ -16,12 +16,9 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import include, path
-from rest_framework_simplejwt.views import (
-    TokenObtainPairView,
-    TokenRefreshView,
-    TokenVerifyView,
-)
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenVerifyView
 
+from fragrance.auth import AtomicTokenRefreshView
 from fragrance.views import (
     ChangePasswordView,
     PasswordResetConfirmView,
@@ -33,7 +30,7 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/v1/auth/register/', RegisterView.as_view(), name='register'),
     path('api/v1/auth/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
-    path('api/v1/auth/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('api/v1/auth/token/refresh/', AtomicTokenRefreshView.as_view(), name='token_refresh'),
     path('api/v1/auth/token/verify/', TokenVerifyView.as_view(), name='token_verify'),
     path('api/v1/auth/password/change/', ChangePasswordView.as_view(), name='password_change'),
     path('api/v1/auth/password/reset/', PasswordResetRequestView.as_view(), name='password_reset'),
