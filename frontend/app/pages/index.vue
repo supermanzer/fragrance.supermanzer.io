@@ -63,12 +63,12 @@
         >
           <VImg
             class="d-md-none"
-            src="https://images.pexels.com/photos/30970929/pexels-photo-30970929.jpeg?auto=compress&cs=tinysrgb&w=640"
+            src="https://images.pexels.com/photos/3059609/pexels-photo-3059609.jpeg?auto=compress&cs=tinysrgb&w=640"
             :aspect-ratio="1.1"
             rounded="lg"
             cover
             referrerpolicy="no-referrer"
-            alt="A minimalist glass perfume bottle centered against a neutral background, soft natural light casting a gentle shadow"
+            alt="A stylish perfume bottle casting shadows on a reflective surface, creating a moody ambiance."
           >
             <template #placeholder>
               <VSkeletonLoader
@@ -79,12 +79,12 @@
           </VImg>
           <VImg
             class="d-none d-md-block"
-            src="https://images.pexels.com/photos/30970929/pexels-photo-30970929.jpeg?auto=compress&cs=tinysrgb&w=960"
+            src="https://images.pexels.com/photos/3059609/pexels-photo-3059609.jpeg?auto=compress&cs=tinysrgb&w=960"
             :aspect-ratio="0.85"
             rounded="lg"
             cover
             referrerpolicy="no-referrer"
-            alt="A minimalist glass perfume bottle centered against a neutral background, soft natural light casting a gentle shadow"
+            alt="A stylish perfume bottle casting shadows on a reflective surface, creating a moody ambiance."
           >
             <template #placeholder>
               <VSkeletonLoader

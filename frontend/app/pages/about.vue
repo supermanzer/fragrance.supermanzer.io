@@ -20,7 +20,7 @@
             class="text-h3 mb-6"
             style="font-weight: 400; line-height: 1.2"
           >
-            Five scents, chosen from what you already love.
+            Five scents, chosen from your lived experience.
           </h1>
           <p
             class="text-body-1"
@@ -188,7 +188,7 @@
           >
             The longer your collection grows, the more precisely it knows what to look for: which woods you
             return to every autumn, which green things you keep setting aside. It gets better at this the
-            same way you did, one rated fragrance at a time.
+            same way you do, one rated fragrance at a time.
           </p>
         </VCol>
 
@@ -246,14 +246,22 @@
           >
             Go smell something first.
           </h2>
-          <p
+           <p
             class="text-body-1"
-            style="line-height: 1.8"
+            style="max-width: 560px; line-height: 1.8"
           >
-            A checklist of words like woody or fresh only goes so far. Walk up to a counter, put
+             A checklist of words like woody or fresh only goes so far. Rather than starting with some generic quiz, we invite you to indulge your interest in person. 
+          </p>
+          <p
+            class="text-body-1 text-medium-emphasis mt-4"
+            style="max-width: 560px; line-height: 1.8"
+          >
+           
+            
+            Walk up to a counter, put
             a strip under your nose, and see what happens on your skin. Even disliking everything
-            you tried still counts. It points the system in a direction and starts you on your
-            own journey. So go try some scents and begin shaping your personal fragrance profile. 
+            you try still counts. It points the system in a direction and starts you on your
+            own journey. So go get your nose on some scents and begin shaping your personal fragrance profile. 
             We'll be here.
           </p>
         </VCol>
