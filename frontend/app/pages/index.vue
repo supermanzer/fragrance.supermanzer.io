@@ -37,7 +37,7 @@
               variant="flat"
               rounded="lg"
               size="large"
-              to="/auth/login"
+              :to="authStatus === 'authenticated' ? '/fragrance' : '/auth/login'"
               class="w-100 w-sm-auto"
             >
               Get started
@@ -46,7 +46,7 @@
               variant="outlined"
               rounded="lg"
               size="large"
-              to="/auth/login"
+              :to="authStatus === 'authenticated' ? '/fragrance' : '/auth/login'"
               class="w-100 w-sm-auto"
             >
               Sign in
@@ -197,7 +197,7 @@
           variant="flat"
           rounded="lg"
           size="large"
-          to="/auth/login"
+          :to="authStatus === 'authenticated' ? '/fragrance' : '/auth/login'"
           class="w-100 w-sm-auto"
         >
           Get started
@@ -206,7 +206,7 @@
           variant="outlined"
           rounded="lg"
           size="large"
-          to="/auth/login"
+          :to="authStatus === 'authenticated' ? '/fragrance' : '/auth/login'"
           class="w-100 w-sm-auto"
         >
           Sign in
@@ -271,9 +271,9 @@ const benefitBlocks: readonly BenefitBlock[] = [
   },
 ]
 
-onMounted(async () => {
-  if (localStorage.getItem('auth_access')) {
-    await navigateTo('/fragrance', { replace: true })
-  }
+const { authStatus, checkAuth } = useAuthStatus()
+
+onMounted(() => {
+  void checkAuth()
 })
 </script>

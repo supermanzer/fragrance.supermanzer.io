@@ -1,5 +1,9 @@
 <template>
-  <v-card class="pa-6 w-100" elevation="1" rounded="lg">
+  <div v-if="checking || authStatus === 'authenticated'" class="d-flex justify-center pa-8">
+    <v-progress-circular indeterminate color="primary" />
+  </div>
+
+  <v-card v-else class="pa-6 w-100" elevation="1" rounded="lg">
     <p class="text-h6 font-weight-regular mb-6">Sign in to your account</p>
 
     <v-form @submit.prevent="submit">
@@ -53,6 +57,25 @@ const config = useRuntimeConfig()
 const form = reactive({ username: '', password: '' })
 const errors = reactive<Record<string, string>>({})
 const loading = ref(false)
+
+const { authStatus, checkAuth } = useAuthStatus()
+// This page's own render gate, distinct from authStatus: 'unknown' can mean
+// either "haven't checked yet" or "checked, but the result was indeterminate"
+// (see useAuthStatus.ts). This page's job is letting people sign in, so an
+// indeterminate result must fall through to the form, not hang on a spinner
+// forever waiting for a resolution that a 429 or network blip may never
+// deliver. Only suppress the form while a check is actually in flight, or
+// once we've affirmatively confirmed 'authenticated' (mid-redirect).
+const checking = ref(true)
+
+onMounted(async () => {
+  await checkAuth()
+  if (authStatus.value === 'authenticated') {
+    await navigateTo('/fragrance', { replace: true })
+    return
+  }
+  checking.value = false
+})
 
 async function submit() {
   Object.keys(errors).forEach(k => delete errors[k])

@@ -13,7 +13,14 @@
 
     <template #append>
       <v-btn variant="text" size="default" to="/about">About</v-btn>
-      <v-btn variant="text" size="default" to="/auth/login" class="ml-2">Sign in</v-btn>
+      <v-btn
+        variant="text"
+        size="default"
+        :to="authStatus === 'authenticated' ? '/fragrance' : '/auth/login'"
+        class="ml-2"
+      >
+        Sign in
+      </v-btn>
     </template>
   </v-app-bar>
 
@@ -49,7 +56,7 @@
           <v-btn
             variant="text"
             size="small"
-            to="/auth/login"
+            :to="authStatus === 'authenticated' ? '/fragrance' : '/auth/login'"
             class="text-decoration-underline"
           >
             Sign in
@@ -82,7 +89,7 @@
           <v-btn
             variant="text"
             size="small"
-            to="/auth/login"
+            :to="authStatus === 'authenticated' ? '/fragrance' : '/auth/login'"
             class="text-decoration-underline"
           >
             Sign in
@@ -92,3 +99,11 @@
     </v-container>
   </v-footer>
 </template>
+
+<script setup lang="ts">
+const { authStatus, checkAuth } = useAuthStatus()
+
+onMounted(() => {
+  void checkAuth()
+})
+</script>
