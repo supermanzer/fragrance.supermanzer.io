@@ -87,8 +87,19 @@ DATABASES = {
         "PORT": 5432,
     }
 }
-# Anthropic connection
-ANTHROPIC_API_KEY = config("ANTHROPIC_API_KEY")
+# AI provider credentials — resolution of *which* provider is active happens
+# in fragrance.ai_providers.registry via the AIModelConfig table; these three
+# are read with default="" (not the bare `config("X")` ANTHROPIC_API_KEY used
+# before this table existed) so Django can boot for anyone who hasn't
+# provisioned every family yet. A missing key surfaces as the registry's own
+# "missing credential" error at resolution time, not a startup crash.
+ANTHROPIC_API_KEY = config("ANTHROPIC_API_KEY", default="")
+OPENAI_API_KEY = config("OPENAI_API_KEY", default="")
+DASHSCOPE_API_KEY = config("DASHSCOPE_API_KEY", default="")
+DASHSCOPE_BASE_URL = config(
+    "DASHSCOPE_BASE_URL",
+    default="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+)
 
 # Celery async task worker(s)
 # https://docs.celeryq.dev/en/latest/django/first-steps-with-django.html

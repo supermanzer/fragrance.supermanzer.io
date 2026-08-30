@@ -1,6 +1,7 @@
 from django.contrib import admin
 
 from .models import (
+    AIModelConfig,
     Fragrance,
     FragranceConfig,
     PreferenceProfile,
@@ -9,6 +10,19 @@ from .models import (
 )
 
 # Register your models here.
+
+
+@admin.register(AIModelConfig)
+class AIModelConfigAdmin(admin.ModelAdmin):
+    list_display = (
+        "family",
+        "model_id",
+        "is_active",
+        "supports_strict_schema",
+        "supports_enum_enforcement",
+        "verified_at",
+    )
+    list_filter = ("family", "is_active")
 
 
 @admin.register(FragranceConfig)
