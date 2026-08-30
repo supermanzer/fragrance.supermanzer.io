@@ -16,20 +16,29 @@ export type FragranceInput = Pick<Fragrance, 'name' | 'house' | 'status' | 'note
 export function useFragrance() {
   const { api } = useApi()
   const fragrances = ref<Fragrance[]>([])
-  const loading = ref(false)
+  const loading = ref(true)
+  const hasLoaded = ref(false)
   const error = ref<string | null>(null)
+  let requestSeq = 0
 
-  async function fetchFragrances(status?: string) {
+  async function fetchFragrances(status?: Fragrance['status']) {
+    const seq = ++requestSeq
     loading.value = true
     error.value = null
     try {
-      const query = status ? `?status=${status}` : ''
-      fragrances.value = await api<Fragrance[]>(`/collection/${query}`)
+      const query = status ? `?status=${encodeURIComponent(status)}` : ''
+      const result = await api<Fragrance[]>(`/collection/${query}`)
+      if (seq !== requestSeq) return
+      fragrances.value = result
     } catch (err: unknown) {
+      if (seq !== requestSeq) return
       if (isAuthError(err)) return
       error.value = (err as any)?.data?.detail ?? 'Failed to load fragrances.'
     } finally {
-      loading.value = false
+      if (seq === requestSeq) {
+        loading.value = false
+        hasLoaded.value = true
+      }
     }
   }
 
@@ -45,5 +54,9 @@ export function useFragrance() {
     await api(`/collection/${id}/`, { method: 'DELETE' })
   }
 
-  return { fragrances, loading, error, fetchFragrances, createFragrance, updateFragrance, deleteFragrance }
+  function invalidatePending(): void {
+    requestSeq++
+  }
+
+  return { fragrances, loading, hasLoaded, error, fetchFragrances, createFragrance, updateFragrance, deleteFragrance, invalidatePending }
 }

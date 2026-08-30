@@ -14,7 +14,7 @@
         variant="flat"
         prepend-icon="mdi-plus"
         rounded="lg"
-        @click="openCreate"
+        @click="openCreate()"
       >
         Add fragrance
       </v-btn>
@@ -25,7 +25,6 @@
       v-model="activeTab"
       color="primary"
       density="compact"
-      class="mb-6"
     >
       <v-tab value="">All</v-tab>
       <v-tab value="own">Own</v-tab>
@@ -33,107 +32,45 @@
       <v-tab value="dislike">Dislike</v-tab>
     </v-tabs>
 
+    <!-- Refetch progress bar: space always reserved, bar itself gated -->
+    <div style="height: 2px; margin-bottom: 24px;">
+      <v-progress-linear
+        v-if="hasLoaded && loading"
+        indeterminate
+        color="primary"
+        height="2"
+        rounded
+      />
+    </div>
+
     <AppAlert v-model="error" class="mb-6" />
 
-    <!-- Loading state: grid of card skeletons mirroring populated layout -->
-    <v-row v-if="loading" class="ga-4">
-      <v-col
-        v-for="n in 6"
-        :key="n"
-        cols="12"
-        sm="6"
-        lg="4"
-      >
-        <v-skeleton-loader type="card" rounded="lg" elevation="1" />
-      </v-col>
-    </v-row>
-
-    <!-- Empty state -->
-    <v-fade-transition>
+    <v-fade-transition mode="out-in">
+      <!-- First load: SSR paint through first fetch resolving, unknown shape -->
       <div
-        v-if="!loading && !fragrances.length && !error"
+        v-if="!hasLoaded"
+        key="loading-first"
         class="d-flex flex-column align-center justify-center text-center py-16"
       >
-        <v-icon
-          icon="mdi-spray"
-          size="64"
-          class="text-medium-emphasis mb-4"
+        <v-progress-circular
+          indeterminate
+          color="primary"
+          size="48"
+          width="3"
+          class="mb-4"
         />
-        <p class="text-body-1 text-medium-emphasis mb-6">
-          Your collection is empty.
+        <p class="text-body-1 text-medium-emphasis">
+          Loading your collection…
         </p>
-        <div class="d-flex ga-3">
-          <v-btn
-            color="primary"
-            variant="flat"
-            prepend-icon="mdi-plus"
-            rounded="lg"
-            @click="openCreate"
-          >
-            Add fragrance
-          </v-btn>
-          <v-btn
-            variant="outlined"
-            prepend-icon="mdi-upload"
-            rounded="lg"
-            @click="importDialog = true"
-          >
-            Import from CSV
-          </v-btn>
-        </div>
       </div>
-    </v-fade-transition>
 
-    <!-- Import dialog -->
-    <v-dialog v-model="importDialog" max-width="440">
-      <v-card rounded="xl">
-        <v-card-title class="pt-6 px-6 pb-1 text-h5 font-weight-regular">
-          Import from CSV
-        </v-card-title>
-        <v-card-subtitle class="px-6 pb-4">
-          Required columns: <code>fragrance, status, house, notes</code><br>
-          Status values: <code>own</code>, <code>like</code>, <code>dislike</code>
-        </v-card-subtitle>
-        <v-card-text class="px-6 pb-2">
-          <v-file-input
-            v-model="importFile"
-            label="CSV file"
-            accept=".csv"
-            variant="outlined"
-            rounded="lg"
-            show-size
-            prepend-icon=""
-            prepend-inner-icon="mdi-file-delimited-outline"
-            hide-details="auto"
-            @update:model-value="importReset()"
-          />
-          <AppAlert v-model="importError" class="mt-4" />
-        </v-card-text>
-        <v-card-actions class="px-6 pb-6 pt-4">
-          <v-spacer />
-          <v-btn variant="text" @click="closeImportDialog">Cancel</v-btn>
-          <v-btn
-            color="primary"
-            variant="flat"
-            rounded="lg"
-            :loading="importLoading"
-            :disabled="!importFile"
-            @click="runImport"
-          >
-            Upload
-          </v-btn>
-        </v-card-actions>
-      </v-card>
-    </v-dialog>
-
-    <!-- Import result snackbar -->
-    <v-snackbar v-model="snackbar" :timeout="4000" location="bottom">
-      {{ snackbarText }}
-    </v-snackbar>
-
-    <!-- Populated state: card grid -->
-    <v-fade-transition>
-      <v-row v-if="!loading && fragrances.length" class="ga-4">
+      <!-- Populated state: card grid, dimmed during a tab-switch refetch -->
+      <v-row
+        v-else-if="fragrances.length"
+        key="populated"
+        class="ga-4"
+        :style="{ opacity: loading ? 0.45 : 1, pointerEvents: loading ? 'none' : 'auto', transition: 'opacity 150ms' }"
+      >
         <v-col
           v-for="item in fragrances"
           :key="item.id"
@@ -187,7 +124,119 @@
           </v-card>
         </v-col>
       </v-row>
+
+      <!-- Empty state: unfiltered vs. filtered copy/CTAs -->
+      <div
+        v-else-if="!loading && !error"
+        key="empty"
+        class="d-flex flex-column align-center justify-center text-center py-16"
+      >
+        <template v-if="!activeTab">
+          <v-icon
+            icon="mdi-spray"
+            size="64"
+            class="text-medium-emphasis mb-4"
+          />
+          <p class="text-body-1 text-medium-emphasis mb-6">
+            Your collection is empty.
+          </p>
+          <div class="d-flex ga-3">
+            <v-btn
+              color="primary"
+              variant="flat"
+              prepend-icon="mdi-plus"
+              rounded="lg"
+              @click="openCreate()"
+            >
+              Add fragrance
+            </v-btn>
+            <v-btn
+              variant="outlined"
+              prepend-icon="mdi-upload"
+              rounded="lg"
+              @click="importDialog = true"
+            >
+              Import from CSV
+            </v-btn>
+          </div>
+        </template>
+        <template v-else>
+          <v-icon
+            icon="mdi-filter-off-outline"
+            size="64"
+            class="text-medium-emphasis mb-4"
+          />
+          <p class="text-body-1 text-medium-emphasis mb-6">
+            {{ filteredEmptyMessage }}
+          </p>
+          <div class="d-flex ga-3">
+            <v-btn
+              color="primary"
+              variant="flat"
+              prepend-icon="mdi-plus"
+              rounded="lg"
+              @click="openCreate(activeTabStatus)"
+            >
+              Add fragrance
+            </v-btn>
+            <v-btn
+              variant="text"
+              rounded="lg"
+              @click="activeTab = ''"
+            >
+              View all fragrances
+            </v-btn>
+          </div>
+        </template>
+      </div>
     </v-fade-transition>
+
+    <!-- Import dialog -->
+    <v-dialog v-model="importDialog" max-width="440">
+      <v-card rounded="xl">
+        <v-card-title class="pt-6 px-6 pb-1 text-h5 font-weight-regular">
+          Import from CSV
+        </v-card-title>
+        <v-card-subtitle class="px-6 pb-4">
+          Required columns: <code>fragrance, status, house, notes</code><br>
+          Status values: <code>own</code>, <code>like</code>, <code>dislike</code>
+        </v-card-subtitle>
+        <v-card-text class="px-6 pb-2">
+          <v-file-input
+            v-model="importFile"
+            label="CSV file"
+            accept=".csv"
+            variant="outlined"
+            rounded="lg"
+            show-size
+            prepend-icon=""
+            prepend-inner-icon="mdi-file-delimited-outline"
+            hide-details="auto"
+            @update:model-value="importReset()"
+          />
+          <AppAlert v-model="importError" class="mt-4" />
+        </v-card-text>
+        <v-card-actions class="px-6 pb-6 pt-4">
+          <v-spacer />
+          <v-btn variant="text" @click="closeImportDialog">Cancel</v-btn>
+          <v-btn
+            color="primary"
+            variant="flat"
+            rounded="lg"
+            :loading="importLoading"
+            :disabled="!importFile"
+            @click="runImport"
+          >
+            Upload
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
+
+    <!-- Shared feedback snackbar: import results and saved-but-filtered-out notices -->
+    <v-snackbar v-model="snackbar" :timeout="4000" location="bottom">
+      {{ snackbarText }}
+    </v-snackbar>
 
     <!-- Add / Edit dialog -->
     <v-dialog v-model="dialog" max-width="480">
@@ -289,7 +338,7 @@ import { useFragrance, type Fragrance, type FragranceInput } from '~/composables
 import { useImport } from '~/composables/useImport'
 import { statusColor } from '~/utils/rating'
 
-const { fragrances, loading, error, fetchFragrances, createFragrance, updateFragrance, deleteFragrance } = useFragrance()
+const { fragrances, loading, hasLoaded, error, fetchFragrances, createFragrance, updateFragrance, deleteFragrance, invalidatePending } = useFragrance()
 const { loading: importLoading, error: importError, result: importResult, importCollection, reset: importReset } = useImport()
 
 // --- Import ---
@@ -317,7 +366,7 @@ async function runImport(): Promise<void> {
     ].filter(Boolean).join(', ')
     snackbar.value = true
     closeImportDialog()
-    await fetchFragrances()
+    await fetchFragrances(activeTabStatus.value)
   }
 }
 
@@ -329,7 +378,26 @@ const statusOptions = [
 
 const activeTab = ref('')
 
-watch(activeTab, (val) => fetchFragrances(val || undefined))
+const activeTabStatus = computed<FragranceInput['status'] | undefined>(() => {
+  return activeTab.value === 'own' || activeTab.value === 'like' || activeTab.value === 'dislike'
+    ? activeTab.value
+    : undefined
+})
+
+const filteredEmptyMessage = computed(() => {
+  switch (activeTabStatus.value) {
+    case 'own':
+      return 'Nothing marked as owned yet.'
+    case 'like':
+      return 'Nothing marked as liked yet.'
+    case 'dislike':
+      return 'Nothing marked as disliked yet.'
+    default:
+      return ''
+  }
+})
+
+watch(activeTab, () => fetchFragrances(activeTabStatus.value))
 onMounted(() => fetchFragrances())
 
 // --- Add / Edit ---
@@ -341,9 +409,9 @@ const draft = reactive<FragranceInput>({ name: '', house: '', status: 'own', not
 
 const required = (v: string) => !!v || 'Required'
 
-function openCreate(): void {
+function openCreate(status?: 'own' | 'like' | 'dislike'): void {
   editTarget.value = null
-  Object.assign(draft, { name: '', house: '', status: 'own', notes: '' })
+  Object.assign(draft, { name: '', house: '', status: status ?? 'own', notes: '' })
   dialog.value = true
 }
 
@@ -353,20 +421,46 @@ function openEdit(item: Fragrance): void {
   dialog.value = true
 }
 
+function matchesActiveFilter(item: Fragrance): boolean {
+  return !activeTabStatus.value || item.status === activeTabStatus.value
+}
+
 async function save(): Promise<void> {
   const { valid } = await form.value.validate()
   if (!valid) return
   saving.value = true
   try {
+    let strandedFetch = false
     if (editTarget.value) {
       const updated = await updateFragrance(editTarget.value.id, { ...draft })
+      strandedFetch = loading.value
+      invalidatePending()
       const idx = fragrances.value.findIndex((f) => f.id === updated.id)
-      if (idx !== -1) fragrances.value[idx] = updated
+      if (matchesActiveFilter(updated)) {
+        if (idx !== -1) fragrances.value[idx] = updated
+        else fragrances.value.unshift(updated)
+      } else {
+        if (idx !== -1) fragrances.value.splice(idx, 1)
+        snackbarText.value = 'Saved — not shown under this filter'
+        snackbar.value = true
+      }
     } else {
       const created = await createFragrance({ ...draft })
-      fragrances.value.unshift(created)
+      strandedFetch = loading.value
+      invalidatePending()
+      if (matchesActiveFilter(created)) {
+        fragrances.value.unshift(created)
+      } else {
+        snackbarText.value = 'Saved — not shown under this filter'
+        snackbar.value = true
+      }
     }
     dialog.value = false
+    // invalidatePending() strands any fetch that was in flight at the moment of
+    // the optimistic mutation above — its finally-block cleanup (loading/hasLoaded)
+    // never runs once superseded. If one was stranded, re-fetch the active tab so
+    // the grid settles on genuinely correct data instead of freezing mid-dim.
+    if (strandedFetch) await fetchFragrances(activeTabStatus.value)
   } finally {
     saving.value = false
   }
@@ -387,8 +481,13 @@ async function doDelete(): Promise<void> {
   deleting.value = true
   try {
     await deleteFragrance(deleteTarget.value.id)
+    const strandedFetch = loading.value
+    invalidatePending()
     fragrances.value = fragrances.value.filter((f) => f.id !== deleteTarget.value!.id)
     deleteDialog.value = false
+    // See save()'s comment: a fetch stranded by invalidatePending() never clears
+    // loading/hasLoaded on its own, so re-fetch the active tab to resettle the grid.
+    if (strandedFetch) await fetchFragrances(activeTabStatus.value)
   } finally {
     deleting.value = false
   }
