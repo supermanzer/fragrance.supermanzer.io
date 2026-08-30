@@ -69,12 +69,15 @@ const { authStatus, checkAuth } = useAuthStatus()
 const checking = ref(true)
 
 onMounted(async () => {
-  await checkAuth()
-  if (authStatus.value === 'authenticated') {
-    await navigateTo('/fragrance', { replace: true })
-    return
+  try {
+    await checkAuth()
+    if (authStatus.value === 'authenticated') {
+      await navigateTo('/fragrance', { replace: true })
+      return
+    }
+  } finally {
+    checking.value = false
   }
-  checking.value = false
 })
 
 async function submit() {
