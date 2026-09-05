@@ -18,6 +18,43 @@ http {
     # otherwise sits under the unthrottled /api/ block.
     limit_req_zone $binary_remote_addr zone=confirm:10m rate=10r/m;
 
+    # Django's session-based admin login is an independent brute-force surface from the
+    # JWT /api/v1/auth/ endpoints — same rate as those, mirrored for the admin location below.
+    limit_req_zone $binary_remote_addr zone=admin:10m rate=10r/m;
+
+    # This site is proxied through Cloudflare (see the Cloudflare Origin CA cert below) —
+    # without this, $remote_addr is always a Cloudflare edge IP, never the visitor's real
+    # IP, which would break both the admin IP allowlist below and the $binary_remote_addr
+    # rate-limit zones above (every visitor sharing a PoP would share a rate-limit bucket).
+    # Ranges from https://www.cloudflare.com/ips/ — Cloudflare updates these infrequently
+    # but does update them; re-check this list periodically.
+    set_real_ip_from 173.245.48.0/20;
+    set_real_ip_from 103.21.244.0/22;
+    set_real_ip_from 103.22.200.0/22;
+    set_real_ip_from 103.31.4.0/22;
+    set_real_ip_from 141.101.64.0/18;
+    set_real_ip_from 108.162.192.0/18;
+    set_real_ip_from 190.93.240.0/20;
+    set_real_ip_from 188.114.96.0/20;
+    set_real_ip_from 197.234.240.0/22;
+    set_real_ip_from 198.41.128.0/17;
+    set_real_ip_from 162.158.0.0/15;
+    set_real_ip_from 104.16.0.0/13;
+    set_real_ip_from 104.24.0.0/14;
+    set_real_ip_from 172.64.0.0/13;
+    set_real_ip_from 131.0.72.0/22;
+    set_real_ip_from 2400:cb00::/32;
+    set_real_ip_from 2606:4700::/32;
+    set_real_ip_from 2803:f800::/32;
+    set_real_ip_from 2405:b500::/32;
+    set_real_ip_from 2405:8100::/32;
+    set_real_ip_from 2a06:98c0::/29;
+    set_real_ip_from 2c0f:f248::/32;
+    # CF-Connecting-IP is single-value (Cloudflare sets it, never a client), so
+    # real_ip_recursive is deliberately omitted — it only matters for a multi-value,
+    # appendable header like X-Forwarded-For.
+    real_ip_header CF-Connecting-IP;
+
     # $request includes the full query string, which would put the confirm endpoint's
     # signed token (and any future sensitive query param) into cleartext access logs.
     # Log the path only, never the query string.
@@ -80,6 +117,27 @@ http {
 
         location /api/v1/recommendations/confirm/ {
             limit_req zone=confirm burst=5 nodelay;
+            proxy_hide_header  X-Content-Type-Options;
+            proxy_hide_header  Referrer-Policy;
+            set $backend_upstream http://backend:8000;
+            proxy_pass         $backend_upstream;
+            proxy_set_header   Host              $host;
+            proxy_set_header   X-Real-IP         $remote_addr;
+            proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto $scheme;
+        }
+
+        location /${ADMIN_URL_PATH}/ {
+            include /etc/nginx/admin_allowlist.d/*.conf;   # gitignored; operator adds `allow <ip>;` lines here
+            # deny/allow here only works because this location uses proxy_pass (content phase);
+            # adding a "return" directive to this location would run in the rewrite phase, which
+            # executes before deny/allow's access phase, and would silently bypass this check.
+            deny all;                                        # fail closed if nothing above matched
+            # limit_req runs in the preaccess phase, before deny/allow's access phase — a
+            # correctly-guessed-but-unallowlisted path gets 403/429 (rate-limited, then denied)
+            # instead of the frontend catch-all's 404. A path-existence oracle, not a bypass;
+            # not practically exploitable at this path's length, but worth knowing.
+            limit_req zone=admin burst=5 nodelay;
             proxy_hide_header  X-Content-Type-Options;
             proxy_hide_header  Referrer-Policy;
             set $backend_upstream http://backend:8000;

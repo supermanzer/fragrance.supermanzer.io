@@ -1,0 +1,14 @@
+# Copy this file to a *.conf file in this same directory (e.g. 00-operator.conf) and add your
+# real IP address(es). Files in this directory are gitignored — only this .example file is
+# tracked, so a fresh clone never ships anyone's real IP.
+#
+# This directory is included via a glob (`include /etc/nginx/admin_allowlist.d/*.conf;`) followed
+# by `deny all;` in the admin location block. An empty directory (the state on a fresh clone) is
+# NOT an nginx startup error — the glob simply matches nothing, and every request falls through to
+# `deny all;`. That is the intended fail-closed default: nobody can reach the admin path until an
+# operator adds their own IP here and recreates the nginx container
+# (`docker compose up -d --force-recreate nginx` — `restart` alone will not pick up a new file).
+#
+# Find your current public IP with: curl -4 ifconfig.me
+#
+allow 203.0.113.4;
