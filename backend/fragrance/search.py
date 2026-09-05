@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from django.conf import settings
 
+from .ai_providers.base import StructuredLLMProvider
 from .models import PreferenceProfile, Recommendation
 
 
@@ -61,9 +62,13 @@ def verify_candidates(
     run_id: int,
     candidates: list[dict],
     profile: PreferenceProfile,
+    provider: StructuredLLMProvider,
 ) -> list[dict]:
     """
-    Pipeline step 4. Fires 5 parallel searches, one per candidate.
+    Pipeline step 4. Fires one search per candidate, up to 2 in parallel
+    (ThreadPoolExecutor(max_workers=2) below — deliberately reduced from 5
+    per commit 0bb5bfd to lessen memory pressure on the droplet's 1 vCPU/2GB;
+    do not raise this back to 5).
 
     For each candidate:
     - Confirmed (name appears in a result title): create a Recommendation with
@@ -139,6 +144,7 @@ def verify_candidates(
                 failed_candidate=candidate,
                 search_results=results_text,
                 profile=profile,
+                provider=provider,
             )
             Recommendation.objects.create(
                 user_id=user_id,

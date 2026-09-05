@@ -77,8 +77,17 @@ certbot/
 searxng/settings.yml
 
 # ── Nginx ─────────────────────────────────────────────────────────────────────
-# nginx.conf is checked in; ignore generated dhparam files
+# nginx.conf.template is checked in; the rendered nginx.conf only ever exists inside the
+# container filesystem. Ignore generated dhparam files.
 nginx/dhparam.pem
+
+# Real IP allowlist entries for the admin path — only the *.example reference file is tracked;
+# an operator's actual allowed IPs never enter git. Ignores everything in the directory by
+# default (not just *.conf) so a misnamed real file — wrong extension, no extension, a .bak —
+# can't slip past the ignore rule and get committed by accident (confirmed live: the narrower
+# *.conf-only rule missed exactly this case).
+nginx/admin_allowlist.d/*
+!nginx/admin_allowlist.d/*.example
 
 # ── OS & editor noise ─────────────────────────────────────────────────────────
 .DS_Store

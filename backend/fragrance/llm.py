@@ -2,13 +2,16 @@
 fragrance/llm.py
 
 Implements LLM components of fragrance recommendation generation.
-Each function corresponds to one of the four structured Anthropic SDK calls in the pipeline.
+Each function corresponds to one of the four structured LLM calls in the pipeline,
+issued through a resolved `StructuredLLMProvider` (see fragrance/ai_providers) rather
+than a hardcoded Anthropic client — the active provider is resolved once per run by
+fragrance/tasks.py and threaded through every call so a run never straddles two
+providers.
 """
 
 import logging
 
-import anthropic
-
+from .ai_providers.base import StructuredLLMProvider
 from .models import (
     Fragrance,
     PreferenceProfile,
@@ -16,97 +19,119 @@ from .models import (
     RecommendationRun,
 )
 
-client = anthropic.Anthropic()
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
 # Tool schemas — define the structured output shape for each LLM call.
-# Anthropic's tool_choice forces the model to invoke the named tool, so the
-# response is always parseable as JSON without any fallback string parsing.
+#
+# `*_SCHEMA` constants are the inner JSON Schema object only (no vendor
+# envelope: no {"name", "input_schema"} Anthropic wrapper, no {"type":
+# "json_schema", "json_schema": {...}} OpenAI wrapper). Each provider adapter
+# assembles its own request shape from (tool_name, description, schema) —
+# keeping the envelope out of these constants is what stops a vendor-specific
+# shape from leaking into every adapter.
 # ---------------------------------------------------------------------------
 
-MODEL = "claude-haiku-4-5-20251001"
-
-PROFILE_TOOL_SCHEMA = {
-    "name": "create_profile",
-    "description": "Create a fragrance preference profile from the user collection.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "loved_notes": {"type": "string"},
-            "liked_notes": {"type": "string"},
-            "disliked_notes": {"type": "string"},
-            "owns_list": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Names of fragrances the user currently owns",
-            },
-            "search_angle_1": {
-                "type": "string",
-                "description": "First targeted search query for discovery",
-            },
-            "search_angle_2": {
-                "type": "string",
-                "description": "Second targeted search query for discovery",
-            },
+PROFILE_TOOL_NAME = "create_profile"
+PROFILE_TOOL_DESCRIPTION = (
+    "Create a fragrance preference profile from the user collection."
+)
+PROFILE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "loved_notes": {"type": "string"},
+        "liked_notes": {"type": "string"},
+        "disliked_notes": {"type": "string"},
+        "owns_list": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Names of fragrances the user currently owns",
         },
-        "required": [
-            "loved_notes",
-            "liked_notes",
-            "disliked_notes",
-            "owns_list",
-            "search_angle_1",
-            "search_angle_2",
-        ],
+        "search_angle_1": {
+            "type": "string",
+            "description": "First targeted search query for discovery",
+        },
+        "search_angle_2": {
+            "type": "string",
+            "description": "Second targeted search query for discovery",
+        },
     },
+    "required": [
+        "loved_notes",
+        "liked_notes",
+        "disliked_notes",
+        "owns_list",
+        "search_angle_1",
+        "search_angle_2",
+    ],
 }
 
-CANDIDATES_TOOL_SCHEMA = {
-    "name": "select_candidates",
-    "description": "Select exactly 5 fragrances to recommend, one per fragrance house.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "candidates": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "house": {"type": "string"},
-                    },
-                    "required": ["name", "house"],
+CANDIDATES_TOOL_NAME = "select_candidates"
+CANDIDATES_TOOL_DESCRIPTION = (
+    "Select exactly 5 fragrances to recommend, one per fragrance house."
+)
+CANDIDATES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "candidates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "house": {"type": "string"},
                 },
-                "minItems": 5,
-                "maxItems": 5,
+                "required": ["name", "house"],
             },
+            "minItems": 5,
+            "maxItems": 5,
         },
-        "required": ["candidates"],
     },
+    "required": ["candidates"],
+}
+EXPECTED_CANDIDATE_COUNT = 5
+
+REPLACEMENT_TOOL_NAME = "select_replacement"
+REPLACEMENT_TOOL_DESCRIPTION = (
+    "Select one replacement fragrance for a candidate that failed verification."
+)
+REPLACEMENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "house": {"type": "string"},
+    },
+    "required": ["name", "house"],
 }
 
-REPLACEMENT_TOOL_SCHEMA = {
-    "name": "select_replacement",
-    "description": "Select one replacement fragrance for a candidate that failed verification.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "name": {"type": "string"},
-            "house": {"type": "string"},
-        },
-        "required": ["name", "house"],
-    },
-}
+EMAIL_CONTENT_TOOL_NAME = "generate_email_content"
+EMAIL_CONTENT_TOOL_DESCRIPTION = (
+    "Generate a personalized intro and per-fragrance rationale for the "
+    "recommendation email."
+)
+
+
+class CandidateCountError(ValueError):
+    """
+    Raised when an LLM response's candidate list doesn't have the exact
+    expected count. No provider family reliably enforces minItems/maxItems at
+    generation time (confirmed unsupported in OpenAI's documented strict
+    subset behavior we could verify; unconfirmed but not to be trusted for
+    Qwen; never enforced for Anthropic even pre-refactor) — this is an
+    explicit app-level check, not schema-level trust.
+    """
 
 
 def build_email_content_tool_schema(confirmed_names: list[str]) -> dict:
     """
-    Builds the generate_email_content tool schema for one call, constraining each
-    rationale's "name" to the exact confirmed Recommendation names for this run via
-    JSON Schema enum. "strict" is set so the enum is grammar-enforced by the API rather
-    than advisory guidance the model can still paraphrase away from (bare enum without
-    strict is not sampling-constrained) — see Anthropic's strict tool use docs.
+    Builds the generate_email_content schema for one call, constraining each
+    rationale's "name" to the exact confirmed Recommendation names for this run
+    via JSON Schema enum. This is the one schema where enum must be
+    grammar-enforced, not advisory guidance the model can paraphrase away from
+    — see registry.get_active_provider(enum_required=True), which refuses to
+    resolve a model whose AIModelConfig.supports_enum_enforcement is False for
+    exactly this call.
     """
     name_schema: dict = {
         "type": "string",
@@ -116,35 +141,30 @@ def build_email_content_tool_schema(confirmed_names: list[str]) -> dict:
         name_schema["enum"] = confirmed_names
 
     return {
-        "name": "generate_email_content",
-        "description": "Generate a personalized intro and per-fragrance rationale for the recommendation email.",
-        "strict": True,
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "intro": {
-                    "type": "string",
-                    "description": "Personalized 2-3 sentence introduction paragraph",
-                },
-                "rationales": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": name_schema,
-                            "rationale": {
-                                "type": "string",
-                                "description": "One sentence explaining why this suits the user",
-                            },
+        "type": "object",
+        "properties": {
+            "intro": {
+                "type": "string",
+                "description": "Personalized 2-3 sentence introduction paragraph",
+            },
+            "rationales": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": name_schema,
+                        "rationale": {
+                            "type": "string",
+                            "description": "One sentence explaining why this suits the user",
                         },
-                        "required": ["name", "rationale"],
-                        "additionalProperties": False,
                     },
+                    "required": ["name", "rationale"],
+                    "additionalProperties": False,
                 },
             },
-            "required": ["intro", "rationales"],
-            "additionalProperties": False,
         },
+        "required": ["intro", "rationales"],
+        "additionalProperties": False,
     }
 
 
@@ -221,26 +241,13 @@ Use the generate_email_content tool to return your response."""
 
 
 # ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
-
-
-def extract_tool_result(response: anthropic.types.Message) -> dict:
-    # tool_choice forces exactly one tool_use block; this is always the first content item.
-    for block in response.content:
-        if block.type == "tool_use":
-            return block.input
-    raise ValueError(
-        f"No tool_use block in LLM response. Stop reason: {response.stop_reason}"
-    )
-
-
-# ---------------------------------------------------------------------------
 # LLM pipeline functions — called in order by fragrance/tasks.py
 # ---------------------------------------------------------------------------
 
 
-def generate_preference_profile(user_id: int, run_id: int) -> PreferenceProfile:
+def generate_preference_profile(
+    user_id: int, run_id: int, provider: StructuredLLMProvider
+) -> PreferenceProfile:
     """LLM call #1. Reads the fragrance collection and writes a PreferenceProfile row."""
     fragrances = Fragrance.objects.filter(user_id=user_id)
     collection_text = "\n".join(
@@ -254,22 +261,16 @@ def generate_preference_profile(user_id: int, run_id: int) -> PreferenceProfile:
         )
     )
 
-    response = client.messages.create(
-        model=MODEL,
+    profile_data = provider.generate_structured(
+        prompt=PROFILE_PROMPT.format(
+            collection=collection_text,
+            past_recommendations=", ".join(past_recommendations),
+        ),
+        tool_name=PROFILE_TOOL_NAME,
+        description=PROFILE_TOOL_DESCRIPTION,
+        schema=PROFILE_SCHEMA,
         max_tokens=1024,
-        tools=[PROFILE_TOOL_SCHEMA],
-        tool_choice={"type": "tool", "name": "create_profile"},
-        messages=[
-            {
-                "role": "user",
-                "content": PROFILE_PROMPT.format(
-                    collection=collection_text,
-                    past_recommendations=", ".join(past_recommendations),
-                ),
-            }
-        ],
     )
-    profile_data = extract_tool_result(response=response)
     profile = PreferenceProfile.objects.create(
         user_id=user_id,
         loved_notes=profile_data["loved_notes"],
@@ -285,7 +286,10 @@ def generate_preference_profile(user_id: int, run_id: int) -> PreferenceProfile:
 
 
 def select_candidates(
-    user_id: int, profile_id: int, search_results: str
+    user_id: int,
+    profile_id: int,
+    search_results: str,
+    provider: StructuredLLMProvider,
 ) -> list[dict]:
     """LLM call #2. Picks 5 fragrances from discovery search results."""
     profile = PreferenceProfile.objects.get(id=profile_id)
@@ -295,27 +299,27 @@ def select_candidates(
         )
     )
 
-    response = client.messages.create(
-        model=MODEL,
+    result = provider.generate_structured(
+        prompt=CANDIDATES_PROMPT.format(
+            loved_notes=profile.loved_notes,
+            liked_notes=profile.liked_notes,
+            disliked_notes=profile.disliked_notes,
+            owns_list=", ".join(profile.owns_list),
+            past_recommendations=", ".join(past_recommendations),
+            search_results=search_results,
+        ),
+        tool_name=CANDIDATES_TOOL_NAME,
+        description=CANDIDATES_TOOL_DESCRIPTION,
+        schema=CANDIDATES_SCHEMA,
         max_tokens=1024,
-        tools=[CANDIDATES_TOOL_SCHEMA],
-        tool_choice={"type": "tool", "name": "select_candidates"},
-        messages=[
-            {
-                "role": "user",
-                "content": CANDIDATES_PROMPT.format(
-                    loved_notes=profile.loved_notes,
-                    liked_notes=profile.liked_notes,
-                    disliked_notes=profile.disliked_notes,
-                    owns_list=", ".join(profile.owns_list),
-                    past_recommendations=", ".join(past_recommendations),
-                    search_results=search_results,
-                ),
-            }
-        ],
     )
-    result = extract_tool_result(response=response)
-    return result["candidates"]
+    candidates = result["candidates"]
+    if len(candidates) != EXPECTED_CANDIDATE_COUNT:
+        raise CandidateCountError(
+            f"select_candidates expected exactly {EXPECTED_CANDIDATE_COUNT} "
+            f"candidates, got {len(candidates)}."
+        )
+    return candidates
 
 
 def select_replacement(
@@ -323,6 +327,7 @@ def select_replacement(
     failed_candidate: dict,
     search_results: str,
     profile: PreferenceProfile,
+    provider: StructuredLLMProvider,
 ) -> dict:
     """LLM call #3. Called by verify_candidates in search.py when a candidate fails title-match."""
     past_recommendations = list(
@@ -331,29 +336,30 @@ def select_replacement(
         )
     )
 
-    response = client.messages.create(
-        model=MODEL,
+    result = provider.generate_structured(
+        prompt=REPLACEMENT_PROMPT.format(
+            failed_name=failed_candidate["name"],
+            loved_notes=profile.loved_notes,
+            liked_notes=profile.liked_notes,
+            disliked_notes=profile.disliked_notes,
+            past_recommendations=", ".join(past_recommendations),
+            search_results=search_results,
+        ),
+        tool_name=REPLACEMENT_TOOL_NAME,
+        description=REPLACEMENT_TOOL_DESCRIPTION,
+        schema=REPLACEMENT_SCHEMA,
         max_tokens=512,
-        tools=[REPLACEMENT_TOOL_SCHEMA],
-        tool_choice={"type": "tool", "name": "select_replacement"},
-        messages=[
-            {
-                "role": "user",
-                "content": REPLACEMENT_PROMPT.format(
-                    failed_name=failed_candidate["name"],
-                    loved_notes=profile.loved_notes,
-                    liked_notes=profile.liked_notes,
-                    disliked_notes=profile.disliked_notes,
-                    past_recommendations=", ".join(past_recommendations),
-                    search_results=search_results,
-                ),
-            }
-        ],
     )
-    return extract_tool_result(response=response)
+    if "name" not in result or "house" not in result:
+        raise CandidateCountError(
+            f"select_replacement response missing required field(s): {result!r}"
+        )
+    return result
 
 
-def generate_email_content(run_id: int, verified_picks: list[dict]) -> None:
+def generate_email_content(
+    run_id: int, verified_picks: list[dict], provider: StructuredLLMProvider
+) -> None:
     """
     LLM call #4. Updates Recommendation rows with rationale and stores the intro on the run.
     verified_picks contains both 'confirmed' and 'replaced' entries; only confirmed picks
@@ -373,23 +379,17 @@ def generate_email_content(run_id: int, verified_picks: list[dict]) -> None:
     confirmed = [p for p in verified_picks if p["status"] == "confirmed"]
     picks_text = "\n".join(f"- {p['name']} by {p['house']}" for p in confirmed)
 
-    response = client.messages.create(
-        model=MODEL,
+    result = provider.generate_structured(
+        prompt=EMAIL_CONTENT_PROMPT.format(
+            loved_notes=profile.loved_notes,
+            liked_notes=profile.liked_notes,
+            picks=picks_text,
+        ),
+        tool_name=EMAIL_CONTENT_TOOL_NAME,
+        description=EMAIL_CONTENT_TOOL_DESCRIPTION,
+        schema=build_email_content_tool_schema(confirmed_names=confirmed_names),
         max_tokens=2048,
-        tools=[build_email_content_tool_schema(confirmed_names=confirmed_names)],
-        tool_choice={"type": "tool", "name": "generate_email_content"},
-        messages=[
-            {
-                "role": "user",
-                "content": EMAIL_CONTENT_PROMPT.format(
-                    loved_notes=profile.loved_notes,
-                    liked_notes=profile.liked_notes,
-                    picks=picks_text,
-                ),
-            }
-        ],
     )
-    result = extract_tool_result(response=response)
 
     rationale_map = {r["name"]: r["rationale"] for r in result["rationales"]}
     for rec in recs:

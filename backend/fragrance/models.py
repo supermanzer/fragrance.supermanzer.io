@@ -1,7 +1,12 @@
 from django.contrib.auth.models import User
-from django.db import models
+from django.db import IntegrityError, models, transaction
 
 # Constants
+AI_PROVIDER_FAMILIES = [
+    ("anthropic", "Anthropic"),
+    ("openai", "OpenAI"),
+    ("qwen", "Qwen"),
+]
 FREQUENCIES = [
     ("weekly", "Weekly"),
     ("monthly", "Monthly"),
@@ -116,6 +121,13 @@ class RecommendationRun(models.Model):
     email_status = models.CharField(
         max_length=10, choices=EMAIL_STATUSES, null=True, blank=True, default=None
     )
+    # Snapshot of the AIModelConfig resolved at run start — plain fields, not a
+    # FK, so a run's provenance survives even if the AIModelConfig row it was
+    # resolved from is later edited or deleted.
+    provider_family = models.CharField(
+        max_length=20, choices=AI_PROVIDER_FAMILIES, blank=True
+    )
+    provider_model_id = models.CharField(max_length=255, blank=True)
 
 
 class Recommendation(models.Model):
@@ -137,3 +149,80 @@ class Recommendation(models.Model):
     )
     rationale = models.TextField()  # LLM generated: why was this recommended?
     search_source_url = models.URLField(blank=True)
+
+
+class ActiveAIModelConfigConflictError(Exception):
+    """
+    Raised when two concurrent saves both try to make a different
+    AIModelConfig row the active one. The DB-level partial unique index
+    (`one_active_ai_model_config`) is the actual source of truth — this
+    exists to translate the resulting IntegrityError into a message an admin
+    can act on, since the raw constraint-violation text names an index, not
+    a row.
+    """
+
+
+class AIModelConfig(models.Model):
+    """
+    Selectable (family, model_id) pair for the LLM pipeline, plus its proven
+    structured-output capabilities. Holds selection only — never credentials;
+    API keys stay in environment variables per family (see fragrance/ai_providers).
+
+    Global configuration, not per-user: unlike every other model in this file,
+    there is deliberately no `user` FK here. Which LLM the whole pipeline runs
+    against is an operator/admin decision, not a per-tenant one.
+    """
+
+    family = models.CharField(max_length=20, choices=AI_PROVIDER_FAMILIES)
+    model_id = models.CharField(max_length=255)
+    max_tokens_default = models.PositiveIntegerField(default=1024)
+    supports_strict_schema = models.BooleanField(default=False)
+    supports_enum_enforcement = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=False)
+    verified_at = models.DateTimeField(
+        null=True, blank=True
+    )  # set by the verify_ai_model conformance harness
+    notes = models.TextField(blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["family", "model_id"], name="unique_ai_model_config"
+            ),
+            # "At most one active row" enforced at the DB level, independent
+            # of any transaction's stale snapshot. save() below only reduces
+            # how often two admins actually collide with this constraint; it
+            # cannot substitute for it — two transactions activating two
+            # *different*, already-existing rows near-simultaneously never
+            # contend for the same row lock, so app-level checks alone can't
+            # serialize them (traced in .claude/reports/
+            # 2026-08-30-ai-provider-abstraction-review.md, finding 5).
+            models.UniqueConstraint(
+                fields=["is_active"],
+                condition=models.Q(is_active=True),
+                name="one_active_ai_model_config",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.family}:{self.model_id}" + (" (active)" if self.is_active else "")
+
+    def save(self, *args: object, **kwargs: object) -> None:
+        # Deactivate other rows *before* activating self — the reverse of
+        # this method's original order — so this transaction never holds two
+        # is_active=True rows at once, even momentarily: the partial unique
+        # index above is checked per-statement, not just at commit.
+        if not self.is_active:
+            super().save(*args, **kwargs)
+            return
+        with transaction.atomic():
+            AIModelConfig.objects.filter(is_active=True).exclude(
+                pk=self.pk
+            ).update(is_active=False)
+            try:
+                super().save(*args, **kwargs)
+            except IntegrityError as exc:
+                raise ActiveAIModelConfigConflictError(
+                    "Another admin just changed the active AI model at the "
+                    "same time. Reload and try again."
+                ) from exc

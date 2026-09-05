@@ -11,12 +11,30 @@ from django.db.models import Max
 from django.template.loader import render_to_string
 from django.utils import timezone
 
+from .ai_providers import registry
+from .ai_providers.base import StructuredLLMProvider, sanitize_sdk_error_message
+from .ai_providers.registry import (
+    EnumEnforcementUnsupportedError,
+    MissingCredentialError,
+    NoActiveAIModelConfigError,
+)
 from .llm import generate_email_content, generate_preference_profile, select_candidates
 from .models import Fragrance, FragranceConfig, PreferenceProfile, RecommendationRun
 from .search import run_discovery_searches, verify_candidates
 from .services import generate_recommendation_token
 
 RATING_ACTIONS = ('own', 'like', 'dislike')
+
+# Configuration errors: retrying on the same backoff as transient
+# network/API errors cannot fix a missing AIModelConfig row, a missing API
+# key, or an active model that can't grammar-enforce enum — so these fail
+# the run on the first attempt instead of after 2 retries x 300s (up to 10
+# minutes of a config error being invisible in run.error_message).
+NON_RETRYABLE_CONFIG_EXCEPTIONS = (
+    NoActiveAIModelConfigError,
+    MissingCredentialError,
+    EnumEnforcementUnsupportedError,
+)
 
 
 def render_and_send_email(user_id: int, run_id: int) -> None:
@@ -65,7 +83,9 @@ def render_and_send_email(user_id: int, run_id: int) -> None:
     run.save(update_fields=['sent_at', 'email_status'])
 
 
-def _resolve_profile(user_id: int, run_id: int) -> PreferenceProfile:
+def _resolve_profile(
+    user_id: int, run_id: int, provider: StructuredLLMProvider
+) -> PreferenceProfile:
     """
     Return the profile to use for this run. Generates a new one via LLM only when the
     user's fragrance collection has changed since the last profile was produced; otherwise
@@ -90,7 +110,9 @@ def _resolve_profile(user_id: int, run_id: int) -> PreferenceProfile:
     )
 
     if needs_new_profile:
-        return generate_preference_profile(user_id=user_id, run_id=run_id)
+        return generate_preference_profile(
+            user_id=user_id, run_id=run_id, provider=provider
+        )
 
     # Reuse the existing profile but still link it to this run.
     RecommendationRun.objects.filter(id=run_id).update(profile=latest_profile)
@@ -125,28 +147,50 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
         # Wipe any picks from a previous attempt so retries start clean.
         Recommendation.objects.filter(run=run).delete()
     try:
-        profile = _resolve_profile(user_id=user_id, run_id=run.id)
+        # Resolved once per run, not once per call: a run must not straddle two
+        # providers if an admin flips AIModelConfig.is_active mid-run. Resolved
+        # inside this try so a misconfigured/unverified active model (no active
+        # row, missing API key, or a model that can't grammar-enforce enum for
+        # the email-content call) lands in run.error_message via the except
+        # block below, instead of raising before the run row is even 'running'.
+        config = registry.get_active_config(enum_required=True)
+        provider = registry.build_provider(config=config)
+        run.provider_family = config.family
+        run.provider_model_id = config.model_id
+        run.save(update_fields=['provider_family', 'provider_model_id'])
+
+        profile = _resolve_profile(user_id=user_id, run_id=run.id, provider=provider)
         results = run_discovery_searches(user_id=user_id, profile_id=profile.id)
         candidates = select_candidates(
             user_id=user_id,
             profile_id=profile.id,
             search_results=results,
+            provider=provider,
         )
         picks = verify_candidates(
             user_id=user_id,
             run_id=run.id,
             candidates=candidates,
             profile=profile,
+            provider=provider,
         )
-        generate_email_content(run_id=run.id, verified_picks=picks)
+        generate_email_content(run_id=run.id, verified_picks=picks, provider=provider)
         run.status = 'done'
         run.email_status = 'pending'
         run.save(update_fields=['status', 'email_status'])
         send_recommendation_email.delay(user_id=user_id, run_id=run.id)
     except Exception as exc:
-        if self.request.retries >= self.max_retries:
+        # Config errors fail immediately, on any attempt — retrying can't fix
+        # them. Everything else keeps the existing retry-then-fail behavior.
+        # Either way, the message that lands in run.error_message (served to
+        # the frontend via the authenticated /runs/ API) is sanitized: a raw
+        # str(exc) on an OpenAI/Anthropic SDK APIError can otherwise carry a
+        # vendor-masked key fragment.
+        is_config_error = isinstance(exc, NON_RETRYABLE_CONFIG_EXCEPTIONS)
+        is_final_attempt = self.request.retries >= self.max_retries
+        if is_config_error or is_final_attempt:
             run.status = 'failed'
-            run.error_message = str(exc)
+            run.error_message = sanitize_sdk_error_message(exc)
             run.save(update_fields=['status', 'error_message'])
             raise
         raise self.retry(exc=exc, countdown=300)

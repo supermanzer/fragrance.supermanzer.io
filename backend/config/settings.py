@@ -10,9 +10,11 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+import re
 from pathlib import Path
 
 from decouple import Csv, config
+from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -25,6 +27,41 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = config("DJANGO_SECRET_KEY")
 DEBUG = config("DEBUG", default=False, cast=bool)
 ALLOWED_HOSTS = config("DJANGO_ALLOWED_HOSTS", cast=Csv())
+
+# Non-standard admin mount point — see .claude/plans/2026-08-30-admin-hardening-plan.md.
+# No default: an unset value must fail Django startup loudly rather than
+# silently mounting the admin at the guessable "admin/".
+_ADMIN_URL_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{7,}")
+
+
+def _validated_admin_url(raw: str) -> str:
+    """
+    Strip leading/trailing slashes and enforce a minimum-entropy shape
+    (lowercase alphanumeric + hyphens, 8+ characters) so a value typed
+    under deploy pressure (e.g. "dashboard") can't slip through as
+    "hard to guess." Factored out of module scope so it can be exercised
+    directly in tests without reloading the settings module.
+    """
+    stripped = raw.strip("/")
+    if not _ADMIN_URL_PATTERN.fullmatch(stripped):
+        raise ImproperlyConfigured(
+            "DJANGO_ADMIN_URL must be lowercase alphanumeric/hyphens, at least 8 "
+            "characters, and match the full value after stripping leading/trailing "
+            "slashes. Generate one with: openssl rand -hex 8"
+        )
+    return stripped
+
+
+DJANGO_ADMIN_URL = _validated_admin_url(config("DJANGO_ADMIN_URL"))
+
+# Masks DJANGO_ADMIN_URL (in addition to Django's own defaults) from the
+# settings dump Django's debug error page renders when DEBUG=True. Django's
+# settings-level HIDDEN_SETTINGS mechanism was removed in Django 3.1; masking
+# is now configured by pointing DEFAULT_EXCEPTION_REPORTER_FILTER at a
+# SafeExceptionReporterFilter subclass instead. See
+# .claude/plans/2026-08-30-admin-hardening-plan.md, Finding 13, and
+# config/debug.py for the full explanation.
+DEFAULT_EXCEPTION_REPORTER_FILTER = "config.debug.AdminHardeningExceptionReporterFilter"
 
 # Application definition
 
@@ -87,8 +124,26 @@ DATABASES = {
         "PORT": 5432,
     }
 }
-# Anthropic connection
-ANTHROPIC_API_KEY = config("ANTHROPIC_API_KEY")
+# AI provider credentials — resolution of *which* provider is active happens
+# in fragrance.ai_providers.registry via the AIModelConfig table; these three
+# are read with default="" (not the bare `config("X")` ANTHROPIC_API_KEY used
+# before this table existed) so Django can boot for anyone who hasn't
+# provisioned every family yet. A missing key surfaces as the registry's own
+# "missing credential" error at resolution time, not a startup crash.
+ANTHROPIC_API_KEY = config("ANTHROPIC_API_KEY", default="")
+# Only required when ANTHROPIC_API_KEY is an identity-linked key (one created
+# by a Console user who belongs to more than one workspace) rather than a
+# workspace-scoped key — Anthropic then needs to be told which workspace the
+# request acts in, or every call 400s with "anthropic-workspace-id is
+# required...". Left blank, no header is sent, which is correct for a
+# workspace-scoped key.
+ANTHROPIC_WORKSPACE_ID = config("ANTHROPIC_WORKSPACE_ID", default="")
+OPENAI_API_KEY = config("OPENAI_API_KEY", default="")
+DASHSCOPE_API_KEY = config("DASHSCOPE_API_KEY", default="")
+DASHSCOPE_BASE_URL = config(
+    "DASHSCOPE_BASE_URL",
+    default="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+)
 
 # Celery async task worker(s)
 # https://docs.celeryq.dev/en/latest/django/first-steps-with-django.html
@@ -127,6 +182,34 @@ REST_FRAMEWORK = {
 }
 CORS_ALLOWED_ORIGINS = config("CORS_ALLOWED_ORIGINS", cast=Csv())
 FRONTEND_URL = config("FRONTEND_URL", default="https://fragrances.supermanzer.io")
+
+# Cookie/CSRF hardening for Django admin — the first cookie-session-based auth
+# surface in this app reachable from the public internet (every DRF endpoint
+# uses JWT headers instead, per useApi.ts). env-gated on DEBUG rather than
+# hardcoded True: dev runs plain HTTP with no TLS, so a hardcoded True would
+# silently lock out local admin login.
+SESSION_COOKIE_SECURE = config("SESSION_COOKIE_SECURE", default=not DEBUG, cast=bool)
+CSRF_COOKIE_SECURE = config("CSRF_COOKIE_SECURE", default=not DEBUG, cast=bool)
+
+
+def _secure_proxy_ssl_header(debug: bool) -> tuple[str, str] | None:
+    """
+    Only safe to trust when the proxy unconditionally overwrites (never
+    appends to) this header on every request — true in prod, where nginx is
+    the only path to `backend` (no published port) and every proxied
+    location sets `proxy_set_header X-Forwarded-Proto $scheme;`. NOT true in
+    dev: docker-compose.override.yaml publishes backend directly on
+    0.0.0.0:8000, bypassing nginx entirely, so a client can forge this
+    header there. Gated on DEBUG, matching the two Secure-flag settings
+    above, rather than trusting a header dev has no way to guarantee is
+    proxy-set. Factored out (like _validated_admin_url above) so it's
+    directly testable without reloading the settings module.
+    """
+    return ("HTTP_X_FORWARDED_PROTO", "https") if not debug else None
+
+
+SECURE_PROXY_SSL_HEADER = _secure_proxy_ssl_header(debug=DEBUG)
+CSRF_TRUSTED_ORIGINS = [FRONTEND_URL]
 
 # Tokens expire in 1 hour; shorter than Django's 3-day default to limit
 # the window in which a reset link captured from email can be replayed.
