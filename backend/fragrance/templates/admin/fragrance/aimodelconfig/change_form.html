@@ -1,0 +1,22 @@
+{% extends "admin/change_form.html" %}
+{% load i18n admin_modify %}
+
+{# Adds a "Run conformance check now" button to the submit row on the
+   AIModelConfig change page only. It fires 4 real, billed LLM API calls
+   against this row's (family, model_id) via the shared verification harness
+   (fragrance.ai_providers.verification) and, on a full pass, persists
+   verified_at/supports_enum_enforcement/supports_strict_schema — the same
+   fields kept readonly on this form so this button is the only legitimate
+   way to change them here. Handled by AIModelConfigAdmin.response_change(). #}
+{% block submit_buttons_bottom %}
+  {% submit_row %}
+  {% if change and not is_popup %}
+    <div class="submit-row">
+      <input type="submit"
+             name="_verify_now"
+             value="{% translate 'Run conformance check now (real, billed API calls)' %}"
+             class="default"
+             onclick="return confirm('This will make 4 real API calls against the configured provider and may incur cost. Continue?');">
+    </div>
+  {% endif %}
+{% endblock %}

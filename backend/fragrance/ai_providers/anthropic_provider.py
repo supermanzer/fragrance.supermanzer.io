@@ -8,7 +8,7 @@ forcing, same single tool_use-block extraction.
 
 import anthropic
 
-from .base import StructuredOutputError
+from .base import PROVIDER_TIMEOUT_SECONDS, StructuredOutputError
 
 
 def extract_tool_result(response: "anthropic.types.Message") -> dict:
@@ -60,7 +60,9 @@ class AnthropicProvider:
                 else None
             )
             self._client = anthropic.Anthropic(
-                api_key=self._api_key, default_headers=default_headers
+                api_key=self._api_key,
+                default_headers=default_headers,
+                timeout=PROVIDER_TIMEOUT_SECONDS,
             )
         return self._client
 

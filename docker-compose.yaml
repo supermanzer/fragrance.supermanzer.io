@@ -76,6 +76,11 @@ services:
         condition: service_healthy
     networks:
       - internal
+      # backend now makes real outbound LLM API calls itself (the AIModelConfig
+      # admin "Run conformance check now" button runs inside this gunicorn
+      # process, not celery-worker) — needs the same public egress celery-worker
+      # already has, or every such click fails on connectivity alone.
+      - public
 
   celery-worker:
     build:

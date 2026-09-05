@@ -2,10 +2,14 @@ import importlib
 import json
 import re
 import threading
+from datetime import timedelta
 from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import anthropic
+import httpx
+import openai
 from django.apps import apps as django_apps
 from django.conf import settings
 from django.contrib.auth.models import User
@@ -16,6 +20,7 @@ from django.core.management.base import CommandError
 from django.test import Client, TestCase, TransactionTestCase, override_settings
 from django.urls import resolve, reverse
 from django.urls.exceptions import Resolver404
+from django.utils import timezone
 from django.views.debug import SafeExceptionReporterFilter
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -26,9 +31,15 @@ from config.settings import _secure_proxy_ssl_header, _validated_admin_url
 
 from .ai_providers import registry
 from .ai_providers.anthropic_provider import AnthropicProvider
-from .ai_providers.base import StructuredLLMProvider, StructuredOutputError
+from .ai_providers.base import PROVIDER_TIMEOUT_SECONDS, StructuredLLMProvider, StructuredOutputError
 from .ai_providers.openai_provider import OpenAIProvider, _to_strict_schema
 from .ai_providers.qwen_provider import DASHSCOPE_BASE_URL_DEFAULT, QwenProvider
+from .ai_providers.verification import (
+    CheckResult,
+    PersistOutcome,
+    persist_verification_results,
+    run_verification_checks,
+)
 from .llm import (
     CandidateCountError,
     build_email_content_tool_schema,
@@ -378,6 +389,17 @@ class AnthropicProviderTests(TestCase):
                 prompt="p", tool_name="t", description="d", schema={}, max_tokens=10
             )
 
+    def test_get_client_passes_explicit_timeout_to_sdk_constructor(self) -> None:
+        # Gunicorn's --timeout 120 (docker-compose.yaml) is the only backstop
+        # if the SDK's own 600s default is left in place; this must be
+        # comfortably shorter so a hung call fails fast into a reported
+        # CheckResult instead of a killed worker.
+        provider = AnthropicProvider(model_id="claude-haiku-4-5-20251001", api_key="k")
+        with patch("fragrance.ai_providers.anthropic_provider.anthropic.Anthropic") as mock_ctor:
+            provider._get_client()
+        self.assertEqual(mock_ctor.call_args.kwargs["timeout"], PROVIDER_TIMEOUT_SECONDS)
+        self.assertLess(PROVIDER_TIMEOUT_SECONDS, 120.0)
+
 
 class OpenAIProviderTests(TestCase):
     def test_to_strict_schema_adds_additional_properties_and_full_required(self) -> None:
@@ -516,6 +538,13 @@ class OpenAIProviderTests(TestCase):
                 prompt="p", tool_name="t", description="d", schema={}, max_tokens=10
             )
 
+    def test_get_client_passes_explicit_timeout_to_sdk_constructor(self) -> None:
+        provider = OpenAIProvider(model_id="gpt-4.1-mini", api_key="k")
+        with patch("fragrance.ai_providers.openai_provider.openai.OpenAI") as mock_ctor:
+            provider._get_client()
+        self.assertEqual(mock_ctor.call_args.kwargs["timeout"], PROVIDER_TIMEOUT_SECONDS)
+        self.assertLess(PROVIDER_TIMEOUT_SECONDS, 120.0)
+
 
 class QwenProviderTests(TestCase):
     def test_defaults_to_international_dashscope_base_url(self) -> None:
@@ -555,6 +584,15 @@ class QwenProviderTests(TestCase):
             model_id="qwen-max", api_key="k", token_param_name="max_tokens"
         )
         self.assertEqual(provider._delegate._token_param_name, "max_tokens")
+
+    def test_delegate_client_gets_the_explicit_timeout_too(self) -> None:
+        # QwenProvider has no client construction of its own — it composes
+        # over OpenAIProvider, so the shared timeout only reaches DashScope
+        # calls if the delegate's own _get_client() applies it.
+        provider = QwenProvider(model_id="qwen-max", api_key="k")
+        with patch("fragrance.ai_providers.openai_provider.openai.OpenAI") as mock_ctor:
+            provider._delegate._get_client()
+        self.assertEqual(mock_ctor.call_args.kwargs["timeout"], PROVIDER_TIMEOUT_SECONDS)
 
 
 class RegistryTests(TestCase):
@@ -1034,6 +1072,33 @@ class _ScriptedProvider:
         return self._responses[tool_name]
 
 
+class _ScriptedProviderWithErrors:
+    """
+    Like _ScriptedProvider, but a response value that is an Exception
+    instance is raised instead of returned — lets a single provider
+    stand-in exercise run_verification_checks' three-way exception handling
+    (StructuredOutputError / SDK BadRequestError / everything else) for one
+    specific check while the other three succeed normally.
+    """
+
+    def __init__(self, responses_by_tool: dict[str, dict | Exception]) -> None:
+        self._responses = responses_by_tool
+
+    def generate_structured(
+        self,
+        *,
+        prompt: str,
+        tool_name: str,
+        description: str,
+        schema: dict,
+        max_tokens: int,
+    ) -> dict:
+        value = self._responses[tool_name]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
 def _echo_query_search(query: str, num_results: int = 5) -> list[dict]:
     # verify_candidates title-matches on candidate name-in-title; embedding the
     # query (which always starts with the candidate name) in the fake title
@@ -1312,6 +1377,479 @@ class VerifyAIModelCommandTests(TestCase):
         self.assertIn("FAIL", out.getvalue())
         self.assertIn("3/4 schema checks passed", out.getvalue())
 
+    @override_settings(ANTHROPIC_API_KEY="sk-test")
+    def test_full_pass_persists_enum_and_strict_schema_flags_alongside_verified_at(
+        self,
+    ) -> None:
+        AIModelConfig.objects.create(
+            family="anthropic", model_id="claude-haiku-4-5-20251001", is_active=True
+        )
+        scripted = _ScriptedProvider(
+            responses_by_tool={
+                "create_profile": _VALID_PROFILE_RESPONSE,
+                "select_candidates": _valid_candidates_response(),
+                "select_replacement": _VALID_REPLACEMENT_RESPONSE,
+                "generate_email_content": _valid_email_content_response(),
+            }
+        )
+        out = StringIO()
+        with patch(self._build_command_path(), return_value=scripted):
+            call_command(
+                "verify_ai_model",
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+                "--yes",
+                stdout=out,
+            )
+
+        config = AIModelConfig.objects.get(
+            family="anthropic", model_id="claude-haiku-4-5-20251001"
+        )
+        self.assertIsNotNone(config.verified_at)
+        # email-content-with-enum is part of a full 4/4 pass here, so both
+        # capability flags land True.
+        self.assertTrue(config.supports_enum_enforcement)
+        self.assertTrue(config.supports_strict_schema)
+
+    @override_settings(ANTHROPIC_API_KEY="sk-test")
+    def test_partial_pass_resets_capability_flags_but_leaves_verified_at_untouched(
+        self,
+    ) -> None:
+        previously_verified_at = timezone.now() - timedelta(days=3)
+        AIModelConfig.objects.create(
+            family="anthropic",
+            model_id="claude-haiku-4-5-20251001",
+            is_active=True,
+            supports_enum_enforcement=True,
+            supports_strict_schema=True,
+            verified_at=previously_verified_at,
+        )
+        # 4 candidates violates CANDIDATES_SCHEMA's minItems/maxItems: 5 —
+        # a partial (3/4) pass that must not leave the stale True flags from
+        # a previous verification standing.
+        scripted = _ScriptedProvider(
+            responses_by_tool={
+                "create_profile": _VALID_PROFILE_RESPONSE,
+                "select_candidates": _valid_candidates_response(count=4),
+                "select_replacement": _VALID_REPLACEMENT_RESPONSE,
+                "generate_email_content": _valid_email_content_response(),
+            }
+        )
+        out = StringIO()
+        with patch(self._build_command_path(), return_value=scripted):
+            with self.assertRaises(SystemExit):
+                call_command(
+                    "verify_ai_model",
+                    "anthropic",
+                    "claude-haiku-4-5-20251001",
+                    stdout=out,
+                )
+
+        config = AIModelConfig.objects.get(
+            family="anthropic", model_id="claude-haiku-4-5-20251001"
+        )
+        self.assertFalse(config.supports_enum_enforcement)
+        self.assertFalse(config.supports_strict_schema)
+        # verified_at is untouched by a partial pass — neither cleared nor
+        # re-stamped.
+        self.assertEqual(config.verified_at, previously_verified_at)
+
+    @override_settings(ANTHROPIC_API_KEY="sk-test")
+    def test_inconclusive_check_leaves_trust_fields_untouched_and_exits_nonzero(
+        self,
+    ) -> None:
+        # A connectivity failure on one check must not be scored the same
+        # as a genuine schema failure: it carries zero information about
+        # this model's actual capability, so the pre-existing (real) trust
+        # state must survive untouched.
+        previously_verified_at = timezone.now() - timedelta(days=3)
+        AIModelConfig.objects.create(
+            family="anthropic",
+            model_id="claude-haiku-4-5-20251001",
+            is_active=True,
+            supports_enum_enforcement=True,
+            supports_strict_schema=True,
+            verified_at=previously_verified_at,
+        )
+        connection_error = anthropic.APIConnectionError(
+            request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        )
+        scripted = _ScriptedProviderWithErrors(
+            responses_by_tool={
+                "create_profile": _VALID_PROFILE_RESPONSE,
+                "select_candidates": connection_error,
+                "select_replacement": _VALID_REPLACEMENT_RESPONSE,
+                "generate_email_content": _valid_email_content_response(),
+            }
+        )
+        out = StringIO()
+        with patch(self._build_command_path(), return_value=scripted):
+            with self.assertRaises(SystemExit):
+                call_command(
+                    "verify_ai_model",
+                    "anthropic",
+                    "claude-haiku-4-5-20251001",
+                    stdout=out,
+                )
+
+        self.assertIn("Could not complete verification", out.getvalue())
+        config = AIModelConfig.objects.get(
+            family="anthropic", model_id="claude-haiku-4-5-20251001"
+        )
+        self.assertTrue(config.supports_enum_enforcement)
+        self.assertTrue(config.supports_strict_schema)
+        self.assertEqual(config.verified_at, previously_verified_at)
+
+    @override_settings(ANTHROPIC_API_KEY="sk-test")
+    def test_provider_rejected_request_is_a_definitive_failure_not_inconclusive(
+        self,
+    ) -> None:
+        # An SDK BadRequestError (e.g. Anthropic 400ing a strict tool_choice
+        # the model doesn't support) IS the signal the enum-enforcement
+        # check exists to catch — it must reset stale flags like any other
+        # genuine failure, not be treated as "we never found out".
+        previously_verified_at = timezone.now() - timedelta(days=3)
+        AIModelConfig.objects.create(
+            family="anthropic",
+            model_id="claude-haiku-4-5-20251001",
+            is_active=True,
+            supports_enum_enforcement=True,
+            supports_strict_schema=True,
+            verified_at=previously_verified_at,
+        )
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(400, request=request, json={"error": {"message": "bad"}})
+        bad_request_error = anthropic.BadRequestError(
+            "strict tool mode not supported", response=response, body=None
+        )
+        scripted = _ScriptedProviderWithErrors(
+            responses_by_tool={
+                "create_profile": _VALID_PROFILE_RESPONSE,
+                "select_candidates": _valid_candidates_response(),
+                "select_replacement": _VALID_REPLACEMENT_RESPONSE,
+                "generate_email_content": bad_request_error,
+            }
+        )
+        out = StringIO()
+        with patch(self._build_command_path(), return_value=scripted):
+            with self.assertRaises(SystemExit):
+                call_command(
+                    "verify_ai_model",
+                    "anthropic",
+                    "claude-haiku-4-5-20251001",
+                    stdout=out,
+                )
+
+        self.assertNotIn("Could not complete verification", out.getvalue())
+        self.assertIn("3/4 schema checks passed", out.getvalue())
+        config = AIModelConfig.objects.get(
+            family="anthropic", model_id="claude-haiku-4-5-20251001"
+        )
+        self.assertFalse(config.supports_enum_enforcement)
+        self.assertFalse(config.supports_strict_schema)
+        self.assertEqual(config.verified_at, previously_verified_at)
+
+    @override_settings(ANTHROPIC_API_KEY="sk-test")
+    def test_bad_request_error_on_non_enum_check_leaves_trust_fields_untouched(
+        self,
+    ) -> None:
+        # A BadRequestError on "profile" never asked for strict/enum mode,
+        # so — unlike the email-content-with-enum case above — it must be
+        # treated as inconclusive end to end: same "Could not complete
+        # verification" messaging and untouched trust fields as a plain
+        # connectivity failure. This is the exact shape of this project's
+        # earlier "anthropic-workspace-id is required" production incident,
+        # which 400ed on every call regardless of which check was running.
+        previously_verified_at = timezone.now() - timedelta(days=3)
+        AIModelConfig.objects.create(
+            family="anthropic",
+            model_id="claude-haiku-4-5-20251001",
+            is_active=True,
+            supports_enum_enforcement=True,
+            supports_strict_schema=True,
+            verified_at=previously_verified_at,
+        )
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(400, request=request, json={"error": {"message": "bad"}})
+        bad_request_error = anthropic.BadRequestError(
+            "anthropic-workspace-id is required", response=response, body=None
+        )
+        scripted = _ScriptedProviderWithErrors(
+            responses_by_tool={
+                "create_profile": bad_request_error,
+                "select_candidates": _valid_candidates_response(),
+                "select_replacement": _VALID_REPLACEMENT_RESPONSE,
+                "generate_email_content": _valid_email_content_response(),
+            }
+        )
+        out = StringIO()
+        with patch(self._build_command_path(), return_value=scripted):
+            with self.assertRaises(SystemExit):
+                call_command(
+                    "verify_ai_model",
+                    "anthropic",
+                    "claude-haiku-4-5-20251001",
+                    stdout=out,
+                )
+
+        self.assertIn("Could not complete verification", out.getvalue())
+        config = AIModelConfig.objects.get(
+            family="anthropic", model_id="claude-haiku-4-5-20251001"
+        )
+        self.assertTrue(config.supports_enum_enforcement)
+        self.assertTrue(config.supports_strict_schema)
+        self.assertEqual(config.verified_at, previously_verified_at)
+
+    @override_settings(ANTHROPIC_API_KEY="sk-test")
+    def test_bad_request_error_on_all_four_checks_is_inconclusive_not_partial_fail(
+        self,
+    ) -> None:
+        # This is this project's actual earlier production incident: a
+        # misconfigured "anthropic-workspace-id is required" 400 fired on
+        # every single call, regardless of which check was running. Before
+        # this fix, all four checks were scored as definitive failures
+        # (0/4 pass -> partial_fail), which reset both capability flags to
+        # False on real trust state built from a genuine prior verification.
+        # After this fix, three of the four checks (profile, candidates,
+        # replacement) are correctly recognized as carrying no capability
+        # signal and marked inconclusive, so persist_verification_results'
+        # `any(result.inconclusive for result in results)` guard fires and
+        # nothing is touched.
+        previously_verified_at = timezone.now() - timedelta(days=3)
+        AIModelConfig.objects.create(
+            family="anthropic",
+            model_id="claude-haiku-4-5-20251001",
+            is_active=True,
+            supports_enum_enforcement=True,
+            supports_strict_schema=True,
+            verified_at=previously_verified_at,
+        )
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(400, request=request, json={"error": {"message": "bad"}})
+        bad_request_error = anthropic.BadRequestError(
+            "anthropic-workspace-id is required", response=response, body=None
+        )
+        scripted = _ScriptedProviderWithErrors(
+            responses_by_tool={
+                "create_profile": bad_request_error,
+                "select_candidates": bad_request_error,
+                "select_replacement": bad_request_error,
+                "generate_email_content": bad_request_error,
+            }
+        )
+        out = StringIO()
+        with patch(self._build_command_path(), return_value=scripted):
+            with self.assertRaises(SystemExit):
+                call_command(
+                    "verify_ai_model",
+                    "anthropic",
+                    "claude-haiku-4-5-20251001",
+                    stdout=out,
+                )
+
+        self.assertIn("Could not complete verification", out.getvalue())
+        config = AIModelConfig.objects.get(
+            family="anthropic", model_id="claude-haiku-4-5-20251001"
+        )
+        self.assertTrue(config.supports_enum_enforcement)
+        self.assertTrue(config.supports_strict_schema)
+        self.assertEqual(config.verified_at, previously_verified_at)
+
+
+class RunVerificationChecksClassificationTests(TestCase):
+    """
+    Unit-level coverage of run_verification_checks' three-way exception
+    classification, independent of either caller (CLI/admin).
+    """
+
+    def test_generic_sdk_exception_is_marked_inconclusive(self) -> None:
+        connection_error = anthropic.APIConnectionError(
+            request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        )
+        provider = _ScriptedProviderWithErrors(
+            responses_by_tool={
+                "create_profile": connection_error,
+                "select_candidates": _valid_candidates_response(),
+                "select_replacement": _VALID_REPLACEMENT_RESPONSE,
+                "generate_email_content": _valid_email_content_response(),
+            }
+        )
+        results = run_verification_checks(provider=provider)
+        profile_result = next(r for r in results if r.label == "profile")
+        self.assertFalse(profile_result.passed)
+        self.assertTrue(profile_result.inconclusive)
+
+    def test_bad_request_error_on_non_enum_check_is_marked_inconclusive(self) -> None:
+        # BadRequestError on "profile" never asked for strict/enum mode (only
+        # ENUM_CHECK_LABEL does), so a 400 here carries zero signal about
+        # schema capability — exactly the misconfiguration class this
+        # project's earlier "anthropic-workspace-id is required" incident
+        # belonged to. It must be routed to inconclusive=True, not scored as
+        # a definitive capability failure.
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(400, request=request, json={"error": {"message": "bad"}})
+        bad_request_error = anthropic.BadRequestError(
+            "bad request", response=response, body=None
+        )
+        provider = _ScriptedProviderWithErrors(
+            responses_by_tool={
+                "create_profile": bad_request_error,
+                "select_candidates": _valid_candidates_response(),
+                "select_replacement": _VALID_REPLACEMENT_RESPONSE,
+                "generate_email_content": _valid_email_content_response(),
+            }
+        )
+        results = run_verification_checks(provider=provider)
+        profile_result = next(r for r in results if r.label == "profile")
+        self.assertFalse(profile_result.passed)
+        self.assertTrue(profile_result.inconclusive)
+
+    def test_bad_request_error_on_enum_check_is_a_definitive_failure_not_inconclusive(
+        self,
+    ) -> None:
+        # BadRequestError specifically on email-content-with-enum (the one
+        # check that requests strict/enum-constrained tool mode) IS the
+        # signal this harness exists to catch — it must remain a definitive
+        # failure, not inconclusive.
+        request = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        response = httpx.Response(400, request=request, json={"error": {"message": "bad"}})
+        bad_request_error = anthropic.BadRequestError(
+            "strict tool mode not supported", response=response, body=None
+        )
+        provider = _ScriptedProviderWithErrors(
+            responses_by_tool={
+                "create_profile": _VALID_PROFILE_RESPONSE,
+                "select_candidates": _valid_candidates_response(),
+                "select_replacement": _VALID_REPLACEMENT_RESPONSE,
+                "generate_email_content": bad_request_error,
+            }
+        )
+        results = run_verification_checks(provider=provider)
+        email_result = next(r for r in results if r.label == "email-content-with-enum")
+        self.assertFalse(email_result.passed)
+        self.assertFalse(email_result.inconclusive)
+
+    def test_structured_output_error_is_a_definitive_failure_not_inconclusive(
+        self,
+    ) -> None:
+        provider = _ScriptedProviderWithErrors(
+            responses_by_tool={
+                "create_profile": StructuredOutputError("malformed"),
+                "select_candidates": _valid_candidates_response(),
+                "select_replacement": _VALID_REPLACEMENT_RESPONSE,
+                "generate_email_content": _valid_email_content_response(),
+            }
+        )
+        results = run_verification_checks(provider=provider)
+        profile_result = next(r for r in results if r.label == "profile")
+        self.assertFalse(profile_result.passed)
+        self.assertFalse(profile_result.inconclusive)
+
+    def test_schema_violation_is_a_definitive_failure_not_inconclusive(self) -> None:
+        provider = _ScriptedProviderWithErrors(
+            responses_by_tool={
+                "create_profile": _VALID_PROFILE_RESPONSE,
+                "select_candidates": _valid_candidates_response(count=4),
+                "select_replacement": _VALID_REPLACEMENT_RESPONSE,
+                "generate_email_content": _valid_email_content_response(),
+            }
+        )
+        results = run_verification_checks(provider=provider)
+        candidates_result = next(r for r in results if r.label == "candidates")
+        self.assertFalse(candidates_result.passed)
+        self.assertFalse(candidates_result.inconclusive)
+
+
+class PersistVerificationResultsTests(TestCase):
+    """
+    Unit-level coverage of persist_verification_results' three possible
+    outcomes, independent of either caller (CLI/admin).
+    """
+
+    def setUp(self) -> None:
+        AIModelConfig.objects.all().delete()
+
+    def _full_pass_results(self) -> list[CheckResult]:
+        return [
+            CheckResult(label="profile", passed=True, detail="ok"),
+            CheckResult(label="candidates", passed=True, detail="ok"),
+            CheckResult(label="replacement", passed=True, detail="ok"),
+            CheckResult(label="email-content-with-enum", passed=True, detail="ok"),
+        ]
+
+    def test_no_matching_row_returns_none_config_and_that_status(self) -> None:
+        outcome = persist_verification_results(
+            family="anthropic", model_id="does-not-exist", results=self._full_pass_results()
+        )
+        self.assertIsInstance(outcome, PersistOutcome)
+        self.assertEqual(outcome.status, "no_matching_row")
+        self.assertIsNone(outcome.config)
+
+    def test_inconclusive_result_touches_nothing_even_on_the_active_row(self) -> None:
+        previously_verified_at = timezone.now() - timedelta(days=3)
+        AIModelConfig.objects.create(
+            family="anthropic",
+            model_id="claude-haiku-4-5-20251001",
+            is_active=True,
+            supports_enum_enforcement=True,
+            supports_strict_schema=True,
+            verified_at=previously_verified_at,
+        )
+        results = [
+            CheckResult(label="profile", passed=True, detail="ok"),
+            CheckResult(
+                label="candidates",
+                passed=False,
+                inconclusive=True,
+                detail="unexpected error: ...",
+            ),
+            CheckResult(label="replacement", passed=True, detail="ok"),
+            CheckResult(label="email-content-with-enum", passed=True, detail="ok"),
+        ]
+        outcome = persist_verification_results(
+            family="anthropic", model_id="claude-haiku-4-5-20251001", results=results
+        )
+        self.assertEqual(outcome.status, "inconclusive")
+        outcome.config.refresh_from_db()
+        self.assertTrue(outcome.config.supports_enum_enforcement)
+        self.assertTrue(outcome.config.supports_strict_schema)
+        self.assertEqual(outcome.config.verified_at, previously_verified_at)
+
+    def test_full_pass_returns_that_status_and_stamps_the_row(self) -> None:
+        AIModelConfig.objects.create(
+            family="anthropic", model_id="claude-haiku-4-5-20251001", is_active=True
+        )
+        outcome = persist_verification_results(
+            family="anthropic",
+            model_id="claude-haiku-4-5-20251001",
+            results=self._full_pass_results(),
+        )
+        self.assertEqual(outcome.status, "full_pass")
+        self.assertIsNotNone(outcome.config.verified_at)
+        self.assertTrue(outcome.config.supports_enum_enforcement)
+        self.assertTrue(outcome.config.supports_strict_schema)
+
+    def test_partial_fail_returns_that_status_and_resets_flags(self) -> None:
+        AIModelConfig.objects.create(
+            family="anthropic",
+            model_id="claude-haiku-4-5-20251001",
+            is_active=True,
+            supports_enum_enforcement=True,
+            supports_strict_schema=True,
+        )
+        results = [
+            CheckResult(label="profile", passed=True, detail="ok"),
+            CheckResult(label="candidates", passed=False, detail="schema violation"),
+            CheckResult(label="replacement", passed=True, detail="ok"),
+            CheckResult(label="email-content-with-enum", passed=True, detail="ok"),
+        ]
+        outcome = persist_verification_results(
+            family="anthropic", model_id="claude-haiku-4-5-20251001", results=results
+        )
+        self.assertEqual(outcome.status, "partial_fail")
+        self.assertFalse(outcome.config.supports_enum_enforcement)
+        self.assertFalse(outcome.config.supports_strict_schema)
+
 
 @override_settings(
     EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
@@ -1570,6 +2108,307 @@ class AIModelConfigAdminReadonlyFieldsTests(TestCase):
         self.assertFalse(self.config.supports_strict_schema)
         self.assertFalse(self.config.supports_enum_enforcement)
         self.assertIsNone(self.config.verified_at)
+
+
+class AIModelConfigAdminSaveModelTrustResetTests(TestCase):
+    """
+    Regression coverage for 2026-09-05-ai-model-config-admin-verify-now.md,
+    Finding 4 / 2026-09-05-ai-model-verification-admin-review.md Action Item
+    3: a plain Save (not "Run conformance check now") that changes family or
+    model_id must reset the three trust fields, since a verified_at/
+    capability-flag combination only ever attests to the *previous*
+    (family, model_id) pair. Unlike test_post_changes_editable_fields_but_
+    ignores_readonly_trust_fields above (which starts from an all-False/None
+    row and so can't distinguish "reset happened" from "was already False"),
+    this class starts from a genuinely verified, active row.
+    """
+
+    def setUp(self) -> None:
+        AIModelConfig.objects.all().delete()
+        self.superuser = User.objects.create_superuser(
+            username="hal", email="hal@example.com", password="hal-9000"
+        )
+        self.client.force_login(self.superuser)
+        self.previously_verified_at = timezone.now() - timedelta(days=3)
+        self.config = AIModelConfig.objects.create(
+            family="anthropic",
+            model_id="claude-haiku-4-5-20251001",
+            is_active=True,
+            supports_strict_schema=True,
+            supports_enum_enforcement=True,
+            verified_at=self.previously_verified_at,
+        )
+
+    def _change_url(self) -> str:
+        return reverse("admin:fragrance_aimodelconfig_change", args=[self.config.pk])
+
+    def _base_payload(self) -> dict:
+        return {
+            "family": self.config.family,
+            "model_id": self.config.model_id,
+            "max_tokens_default": self.config.max_tokens_default,
+            "is_active": "on",
+            "notes": self.config.notes,
+            "_save": "Save",
+        }
+
+    def test_model_id_change_resets_trust_fields(self) -> None:
+        payload = self._base_payload()
+        payload["model_id"] = "claude-opus-5-unverified"
+        response = self.client.post(self._change_url(), payload)
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+
+        self.config.refresh_from_db()
+        self.assertEqual(self.config.model_id, "claude-opus-5-unverified")
+        self.assertIsNone(self.config.verified_at)
+        self.assertFalse(self.config.supports_enum_enforcement)
+        self.assertFalse(self.config.supports_strict_schema)
+
+    def test_family_change_resets_trust_fields(self) -> None:
+        payload = self._base_payload()
+        payload["family"] = "openai"
+        payload["model_id"] = "gpt-4.1-mini"
+        response = self.client.post(self._change_url(), payload)
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+
+        self.config.refresh_from_db()
+        self.assertEqual(self.config.family, "openai")
+        self.assertIsNone(self.config.verified_at)
+        self.assertFalse(self.config.supports_enum_enforcement)
+        self.assertFalse(self.config.supports_strict_schema)
+
+    def test_unrelated_field_change_leaves_trust_fields_untouched(self) -> None:
+        payload = self._base_payload()
+        payload["notes"] = "operator note, no model change"
+        response = self.client.post(self._change_url(), payload)
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+
+        self.config.refresh_from_db()
+        self.assertEqual(self.config.notes, "operator note, no model change")
+        self.assertEqual(self.config.verified_at, self.previously_verified_at)
+        self.assertTrue(self.config.supports_enum_enforcement)
+        self.assertTrue(self.config.supports_strict_schema)
+
+    def test_max_tokens_default_only_change_leaves_trust_fields_untouched(self) -> None:
+        payload = self._base_payload()
+        payload["max_tokens_default"] = 2048
+        response = self.client.post(self._change_url(), payload)
+        self.assertEqual(response.status_code, status.HTTP_302_FOUND)
+
+        self.config.refresh_from_db()
+        self.assertEqual(self.config.max_tokens_default, 2048)
+        self.assertEqual(self.config.verified_at, self.previously_verified_at)
+        self.assertTrue(self.config.supports_enum_enforcement)
+        self.assertTrue(self.config.supports_strict_schema)
+
+
+class AIModelConfigAdminVerifyNowViewTests(TestCase):
+    """
+    Covers the "Run conformance check now" button added to the AIModelConfig
+    admin change page: it must require staff auth (the standard admin login
+    gate covers this — no bespoke permission check was added), and it must
+    delegate to the exact same shared verification functions used by
+    manage.py verify_ai_model, persisting results the same way.
+    """
+
+    def setUp(self) -> None:
+        AIModelConfig.objects.all().delete()
+        self.staff_user = User.objects.create_superuser(
+            username="hal", email="hal@example.com", password="hal-9000"
+        )
+        self.config = AIModelConfig.objects.create(
+            family="anthropic",
+            model_id="claude-haiku-4-5-20251001",
+            is_active=False,
+            supports_strict_schema=False,
+            supports_enum_enforcement=False,
+        )
+
+    def _change_url(self) -> str:
+        return reverse("admin:fragrance_aimodelconfig_change", args=[self.config.pk])
+
+    def _post_verify_now(self) -> object:
+        payload = {
+            "family": self.config.family,
+            "model_id": self.config.model_id,
+            "max_tokens_default": self.config.max_tokens_default,
+            "notes": self.config.notes,
+            "_verify_now": "Run conformance check now",
+        }
+        return self.client.post(self._change_url(), payload, follow=True)
+
+    def test_button_rendered_on_change_form_for_staff(self) -> None:
+        self.client.force_login(self.staff_user)
+        response = self.client.get(self._change_url())
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertContains(response, 'name="_verify_now"')
+        # The override replaces the submit_buttons_bottom block entirely —
+        # this guards against a mistake there silently dropping the stock
+        # Save button alongside adding the new one.
+        self.assertContains(response, 'name="_save"')
+
+    def test_unauthenticated_post_is_redirected_to_login_and_changes_nothing(
+        self,
+    ) -> None:
+        with patch(
+            "fragrance.admin.run_verification_checks"
+        ) as mock_run_checks:
+            response = self._post_verify_now()
+
+        mock_run_checks.assert_not_called()
+        # Anonymous users get bounced to the admin login page, never reach
+        # response_change.
+        self.assertIn("login", response.redirect_chain[-1][0])
+        self.config.refresh_from_db()
+        self.assertIsNone(self.config.verified_at)
+        self.assertFalse(self.config.supports_enum_enforcement)
+        self.assertFalse(self.config.supports_strict_schema)
+
+    def test_authenticated_non_staff_post_is_redirected_to_login_and_changes_nothing(
+        self,
+    ) -> None:
+        non_staff_user = User.objects.create_user(
+            username="dave", password="hal-9000", is_staff=False
+        )
+        self.client.force_login(non_staff_user)
+        with patch(
+            "fragrance.admin.run_verification_checks"
+        ) as mock_run_checks:
+            response = self._post_verify_now()
+
+        mock_run_checks.assert_not_called()
+        # A logged-in but non-staff user is a distinct path from anonymous:
+        # admin's staff_member_required gate rejects the session and
+        # redirects to login rather than ever reaching response_change.
+        self.assertIn("login", response.redirect_chain[-1][0])
+        self.config.refresh_from_db()
+        self.assertIsNone(self.config.verified_at)
+        self.assertFalse(self.config.supports_enum_enforcement)
+        self.assertFalse(self.config.supports_strict_schema)
+
+    def test_full_pass_persists_flags_and_reports_success(self) -> None:
+        self.client.force_login(self.staff_user)
+        full_pass_results = [
+            CheckResult(label="profile", passed=True, detail="ok"),
+            CheckResult(label="candidates", passed=True, detail="ok"),
+            CheckResult(label="replacement", passed=True, detail="ok"),
+            CheckResult(label="email-content-with-enum", passed=True, detail="ok"),
+        ]
+        with (
+            patch("fragrance.admin.registry.build_provider", return_value=object()),
+            patch(
+                "fragrance.admin.run_verification_checks",
+                return_value=full_pass_results,
+            ) as mock_run_checks,
+        ):
+            response = self._post_verify_now()
+
+        mock_run_checks.assert_called_once()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        messages_text = " ".join(str(m) for m in response.context["messages"])
+        self.assertIn("4/4", messages_text)
+
+        self.config.refresh_from_db()
+        self.assertIsNotNone(self.config.verified_at)
+        self.assertTrue(self.config.supports_enum_enforcement)
+        self.assertTrue(self.config.supports_strict_schema)
+
+    def test_partial_pass_resets_flags_and_reports_warning(self) -> None:
+        self.client.force_login(self.staff_user)
+        previously_verified_at = timezone.now() - timedelta(days=3)
+        self.config.supports_enum_enforcement = True
+        self.config.supports_strict_schema = True
+        self.config.verified_at = previously_verified_at
+        self.config.save(
+            update_fields=[
+                "supports_enum_enforcement",
+                "supports_strict_schema",
+                "verified_at",
+            ]
+        )
+
+        partial_pass_results = [
+            CheckResult(label="profile", passed=True, detail="ok"),
+            CheckResult(label="candidates", passed=False, detail="schema violation"),
+            CheckResult(label="replacement", passed=True, detail="ok"),
+            CheckResult(label="email-content-with-enum", passed=True, detail="ok"),
+        ]
+        with (
+            patch("fragrance.admin.registry.build_provider", return_value=object()),
+            patch(
+                "fragrance.admin.run_verification_checks",
+                return_value=partial_pass_results,
+            ) as mock_run_checks,
+        ):
+            response = self._post_verify_now()
+
+        mock_run_checks.assert_called_once()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        messages_text = " ".join(str(m) for m in response.context["messages"])
+        self.assertIn("3/4", messages_text)
+
+        self.config.refresh_from_db()
+        # verified_at is untouched by a partial pass — neither cleared nor
+        # re-stamped.
+        self.assertEqual(self.config.verified_at, previously_verified_at)
+        self.assertFalse(self.config.supports_enum_enforcement)
+        self.assertFalse(self.config.supports_strict_schema)
+
+    def test_inconclusive_check_reports_distinct_message_and_changes_nothing(
+        self,
+    ) -> None:
+        # A connectivity/auth/rate-limit failure must not be able to
+        # silently corrupt an already-verified active row's trust flags —
+        # this is the exact production failure mode the pipeline (tasks.py's
+        # registry.get_active_config(enum_required=True)) would otherwise
+        # hard-fail on for an unrelated reason.
+        self.client.force_login(self.staff_user)
+        previously_verified_at = timezone.now() - timedelta(days=3)
+        self.config.supports_enum_enforcement = True
+        self.config.supports_strict_schema = True
+        self.config.verified_at = previously_verified_at
+        self.config.save(
+            update_fields=[
+                "supports_enum_enforcement",
+                "supports_strict_schema",
+                "verified_at",
+            ]
+        )
+
+        inconclusive_results = [
+            CheckResult(label="profile", passed=True, detail="ok"),
+            CheckResult(
+                label="candidates",
+                passed=False,
+                inconclusive=True,
+                detail="unexpected error: ...",
+            ),
+            CheckResult(label="replacement", passed=True, detail="ok"),
+            CheckResult(label="email-content-with-enum", passed=True, detail="ok"),
+        ]
+        with (
+            patch("fragrance.admin.registry.build_provider", return_value=object()),
+            patch(
+                "fragrance.admin.run_verification_checks",
+                return_value=inconclusive_results,
+            ) as mock_run_checks,
+        ):
+            response = self._post_verify_now()
+
+        mock_run_checks.assert_called_once()
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        messages_text = " ".join(str(m) for m in response.context["messages"])
+        self.assertIn("Could not complete conformance check", messages_text)
+        self.assertIn("candidates", messages_text)
+        # Neither the pass/fail phrasing of a partial pass, nor the
+        # verified/success phrasing of a full pass, should appear.
+        self.assertNotIn("Marked verified", messages_text)
+        self.assertNotIn("Capability flags reset to False", messages_text)
+
+        self.config.refresh_from_db()
+        self.assertEqual(self.config.verified_at, previously_verified_at)
+        self.assertTrue(self.config.supports_enum_enforcement)
+        self.assertTrue(self.config.supports_strict_schema)
 
 
 class AdminHardeningExceptionReporterFilterTests(TestCase):

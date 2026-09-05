@@ -22,7 +22,7 @@ from typing import Any
 
 import openai
 
-from .base import StructuredOutputError
+from .base import PROVIDER_TIMEOUT_SECONDS, StructuredOutputError
 
 
 def _to_strict_schema(schema: dict) -> dict:
@@ -100,7 +100,7 @@ class OpenAIProvider:
     def _get_client(self) -> openai.OpenAI:
         # Constructed lazily so importing this module never requires an API key.
         if self._client is None:
-            kwargs: dict = {"api_key": self._api_key}
+            kwargs: dict = {"api_key": self._api_key, "timeout": PROVIDER_TIMEOUT_SECONDS}
             if self._base_url is not None:
                 kwargs["base_url"] = self._base_url
             self._client = openai.OpenAI(**kwargs)

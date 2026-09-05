@@ -6,161 +6,23 @@ constraint on email-content — the one call where a wrong/hallucinated name
 would silently corrupt a RecommendationRun if enum weren't actually
 grammar-enforced. Does not require the pair to be the currently-active
 AIModelConfig row.
+
+The actual check-running and result-persisting logic lives in
+fragrance.ai_providers.verification — this command is a thin CLI wrapper over
+it, shared with the AIModelConfig admin change-page "Run conformance check
+now" button.
 """
 
 import sys
 
 from django.core.management.base import BaseCommand, CommandError
-from django.utils import timezone
 
 from fragrance.ai_providers import registry
-from fragrance.ai_providers.base import StructuredOutputError, sanitize_sdk_error_message
-from fragrance.llm import (
-    CANDIDATES_PROMPT,
-    CANDIDATES_SCHEMA,
-    CANDIDATES_TOOL_DESCRIPTION,
-    CANDIDATES_TOOL_NAME,
-    EMAIL_CONTENT_PROMPT,
-    EMAIL_CONTENT_TOOL_DESCRIPTION,
-    EMAIL_CONTENT_TOOL_NAME,
-    PROFILE_PROMPT,
-    PROFILE_SCHEMA,
-    PROFILE_TOOL_DESCRIPTION,
-    PROFILE_TOOL_NAME,
-    REPLACEMENT_PROMPT,
-    REPLACEMENT_SCHEMA,
-    REPLACEMENT_TOOL_DESCRIPTION,
-    REPLACEMENT_TOOL_NAME,
-    build_email_content_tool_schema,
+from fragrance.ai_providers.verification import (
+    persist_verification_results,
+    run_verification_checks,
 )
 from fragrance.models import AI_PROVIDER_FAMILIES, AIModelConfig
-
-DUMMY_COLLECTION = (
-    "Aventus by Creed [own] - my signature scent\n"
-    "Bleu de Chanel by Chanel [like]\n"
-    "Sauvage by Dior [dislike] - too generic"
-)
-DUMMY_PAST_RECOMMENDATIONS = "Silver Mountain Water"
-DUMMY_SEARCH_RESULTS = (
-    "Search 1: niche oud fragrances:\n"
-    "- Oud Wood by Tom Ford: A smoky, creamy oud blend. (https://example.com/oud-wood)\n"
-    "- Black Afgano by Nasomatto: A dense, resinous oud. (https://example.com/black-afgano)"
-)
-DUMMY_CONFIRMED_NAMES = ["Aventus", "Bleu de Chanel"]
-DUMMY_PICKS_TEXT = "- Aventus by Creed\n- Bleu de Chanel by Chanel"
-
-
-def _validate_against_schema(data: object, schema: dict, path: str = "$") -> list[str]:
-    """
-    Minimal JSON Schema validator covering exactly the subset our four
-    pipeline schemas use (object/array/string, properties/required/items/enum/
-    additionalProperties/minItems/maxItems) — not a general-purpose validator.
-    """
-    errors: list[str] = []
-    expected_type = schema.get("type")
-
-    if expected_type == "object":
-        if not isinstance(data, dict):
-            return [f"{path}: expected object, got {type(data).__name__}"]
-        for required_key in schema.get("required", []):
-            if required_key not in data:
-                errors.append(f"{path}: missing required property '{required_key}'")
-        properties = schema.get("properties", {})
-        for key, value in data.items():
-            if key in properties:
-                errors.extend(
-                    _validate_against_schema(
-                        data=value, schema=properties[key], path=f"{path}.{key}"
-                    )
-                )
-            elif schema.get("additionalProperties") is False:
-                errors.append(f"{path}: unexpected property '{key}'")
-
-    elif expected_type == "array":
-        if not isinstance(data, list):
-            return [f"{path}: expected array, got {type(data).__name__}"]
-        item_schema = schema.get("items")
-        if item_schema:
-            for index, item in enumerate(data):
-                errors.extend(
-                    _validate_against_schema(
-                        data=item, schema=item_schema, path=f"{path}[{index}]"
-                    )
-                )
-        min_items = schema.get("minItems")
-        if min_items is not None and len(data) < min_items:
-            errors.append(f"{path}: expected at least {min_items} items, got {len(data)}")
-        max_items = schema.get("maxItems")
-        if max_items is not None and len(data) > max_items:
-            errors.append(f"{path}: expected at most {max_items} items, got {len(data)}")
-
-    elif expected_type == "string":
-        if not isinstance(data, str):
-            errors.append(f"{path}: expected string, got {type(data).__name__}")
-        elif "enum" in schema and data not in schema["enum"]:
-            errors.append(f"{path}: value {data!r} not in enum {schema['enum']}")
-
-    return errors
-
-
-def _build_checks() -> list[dict]:
-    return [
-        {
-            "label": "profile",
-            "prompt": PROFILE_PROMPT.format(
-                collection=DUMMY_COLLECTION,
-                past_recommendations=DUMMY_PAST_RECOMMENDATIONS,
-            ),
-            "tool_name": PROFILE_TOOL_NAME,
-            "description": PROFILE_TOOL_DESCRIPTION,
-            "schema": PROFILE_SCHEMA,
-            "max_tokens": 1024,
-        },
-        {
-            "label": "candidates",
-            "prompt": CANDIDATES_PROMPT.format(
-                loved_notes="oud, amber",
-                liked_notes="citrus",
-                disliked_notes="aquatic",
-                owns_list="Aventus",
-                past_recommendations=DUMMY_PAST_RECOMMENDATIONS,
-                search_results=DUMMY_SEARCH_RESULTS,
-            ),
-            "tool_name": CANDIDATES_TOOL_NAME,
-            "description": CANDIDATES_TOOL_DESCRIPTION,
-            "schema": CANDIDATES_SCHEMA,
-            "max_tokens": 1024,
-        },
-        {
-            "label": "replacement",
-            "prompt": REPLACEMENT_PROMPT.format(
-                failed_name="Silver Mountain Water",
-                loved_notes="oud, amber",
-                liked_notes="citrus",
-                disliked_notes="aquatic",
-                past_recommendations=DUMMY_PAST_RECOMMENDATIONS,
-                search_results=DUMMY_SEARCH_RESULTS,
-            ),
-            "tool_name": REPLACEMENT_TOOL_NAME,
-            "description": REPLACEMENT_TOOL_DESCRIPTION,
-            "schema": REPLACEMENT_SCHEMA,
-            "max_tokens": 512,
-        },
-        {
-            "label": "email-content-with-enum",
-            "prompt": EMAIL_CONTENT_PROMPT.format(
-                loved_notes="oud, amber",
-                liked_notes="citrus",
-                picks=DUMMY_PICKS_TEXT,
-            ),
-            "tool_name": EMAIL_CONTENT_TOOL_NAME,
-            "description": EMAIL_CONTENT_TOOL_DESCRIPTION,
-            "schema": build_email_content_tool_schema(
-                confirmed_names=DUMMY_CONFIRMED_NAMES
-            ),
-            "max_tokens": 2048,
-        },
-    ]
 
 
 class Command(BaseCommand):
@@ -181,7 +43,7 @@ class Command(BaseCommand):
             "--yes",
             action="store_true",
             dest="assume_yes",
-            help="On full pass, set verified_at on a matching AIModelConfig row without prompting",
+            help="On full pass, persist verified_at/capability flags on a matching AIModelConfig row without prompting",
         )
 
     def handle(self, *args: object, **options: object) -> None:
@@ -200,42 +62,47 @@ class Command(BaseCommand):
 
         self.stdout.write(f"Verifying {family}:{model_id} ...\n")
 
-        results: list[tuple[str, bool, str]] = []
-        for check in _build_checks():
-            label = check["label"]
-            try:
-                response = provider.generate_structured(
-                    prompt=check["prompt"],
-                    tool_name=check["tool_name"],
-                    description=check["description"],
-                    schema=check["schema"],
-                    max_tokens=check["max_tokens"],
-                )
-            except StructuredOutputError as exc:
-                results.append((label, False, f"provider error: {exc}"))
-                continue
-            except Exception as exc:  # network/auth/rate-limit errors from the real SDK
-                # Sanitized: an OpenAI/Qwen auth failure's exception text can
-                # carry a vendor-masked key fragment, and command stdout is a
-                # known capture surface for this project.
-                results.append((label, False, f"unexpected error: {sanitize_sdk_error_message(exc)}"))
-                continue
+        results = run_verification_checks(provider=provider)
 
-            errors = _validate_against_schema(data=response, schema=check["schema"])
-            if errors:
-                results.append((label, False, "; ".join(errors)))
-            else:
-                results.append((label, True, "ok"))
+        for result in results:
+            status_word = self.style.SUCCESS("PASS") if result.passed else self.style.ERROR("FAIL")
+            self.stdout.write(f"  [{status_word}] {result.label}: {result.detail}")
 
-        for label, passed, detail in results:
-            status_word = self.style.SUCCESS("PASS") if passed else self.style.ERROR("FAIL")
-            self.stdout.write(f"  [{status_word}] {label}: {detail}")
-
-        pass_count = sum(1 for _, passed, _ in results if passed)
+        pass_count = sum(1 for result in results if result.passed)
         total = len(results)
         self.stdout.write(f"\n{pass_count}/{total} schema checks passed.")
 
+        if any(result.inconclusive for result in results):
+            # At least one check never got a real answer (connectivity,
+            # auth, or rate-limit failure) — this is a safety no-op, not a
+            # partial pass: persist_verification_results leaves verified_at
+            # and both capability flags exactly as they were, since a
+            # transport failure carries zero information about the model's
+            # actual capability.
+            inconclusive_labels = ", ".join(
+                result.label for result in results if result.inconclusive
+            )
+            persist_verification_results(
+                family=family, model_id=model_id, results=results
+            )
+            self.stdout.write(
+                self.style.WARNING(
+                    "Could not complete verification: connectivity, authentication, "
+                    f"or rate-limit error on check(s) [{inconclusive_labels}]. No "
+                    "trust flags were changed."
+                )
+            )
+            sys.exit(1)
+
         if pass_count != total:
+            # Partial pass, every check reached the provider: reset any
+            # stale capability flags on a matching row (never touching
+            # verified_at) unconditionally — this is a safety reset, not an
+            # operator decision, so it isn't gated behind --yes/the
+            # confirmation prompt below.
+            persist_verification_results(
+                family=family, model_id=model_id, results=results
+            )
             sys.exit(1)
 
         config = AIModelConfig.objects.filter(family=family, model_id=model_id).first()
@@ -254,6 +121,7 @@ class Command(BaseCommand):
                 self.stdout.write("Skipped — verified_at left unchanged.")
                 return
 
-        config.verified_at = timezone.now()
-        config.save(update_fields=["verified_at"])
-        self.stdout.write(self.style.SUCCESS(f"Marked {config} as verified."))
+        outcome = persist_verification_results(
+            family=family, model_id=model_id, results=results
+        )
+        self.stdout.write(self.style.SUCCESS(f"Marked {outcome.config} as verified."))

@@ -15,6 +15,14 @@ from typing import Protocol, runtime_checkable
 import anthropic
 import openai
 
+# Both SDKs default to a 600s read timeout with 2 retries, far exceeding
+# gunicorn's --timeout 120 (docker-compose.yaml). Every provider's client
+# construction should pass this explicitly so a single slow/hung call fails
+# fast into a reported CheckResult/StructuredOutputError instead of relying
+# on gunicorn's worker-kill as the only backstop. Comfortably under 120s even
+# accounting for the SDKs' own internal retries.
+PROVIDER_TIMEOUT_SECONDS = 90.0
+
 
 def sanitize_sdk_error_message(exc: Exception) -> str:
     """
