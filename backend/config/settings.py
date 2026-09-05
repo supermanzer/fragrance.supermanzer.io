@@ -131,6 +131,13 @@ DATABASES = {
 # provisioned every family yet. A missing key surfaces as the registry's own
 # "missing credential" error at resolution time, not a startup crash.
 ANTHROPIC_API_KEY = config("ANTHROPIC_API_KEY", default="")
+# Only required when ANTHROPIC_API_KEY is an identity-linked key (one created
+# by a Console user who belongs to more than one workspace) rather than a
+# workspace-scoped key — Anthropic then needs to be told which workspace the
+# request acts in, or every call 400s with "anthropic-workspace-id is
+# required...". Left blank, no header is sent, which is correct for a
+# workspace-scoped key.
+ANTHROPIC_WORKSPACE_ID = config("ANTHROPIC_WORKSPACE_ID", default="")
 OPENAI_API_KEY = config("OPENAI_API_KEY", default="")
 DASHSCOPE_API_KEY = config("DASHSCOPE_API_KEY", default="")
 DASHSCOPE_BASE_URL = config(

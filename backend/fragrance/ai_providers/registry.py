@@ -80,6 +80,14 @@ def build_provider(*, config: AIModelConfig) -> StructuredLLMProvider:
             f"Unknown AI provider family: {config.family!r}"
         )
     api_key = _get_api_key(family=config.family)
+    if config.family == "anthropic":
+        from django.conf import settings
+
+        return provider_class(
+            model_id=config.model_id,
+            api_key=api_key,
+            workspace_id=getattr(settings, "ANTHROPIC_WORKSPACE_ID", ""),
+        )
     return provider_class(model_id=config.model_id, api_key=api_key)
 
 

@@ -40,16 +40,28 @@ def _contains_enum(node: object) -> bool:
 
 
 class AnthropicProvider:
-    def __init__(self, *, model_id: str, api_key: str) -> None:
+    def __init__(self, *, model_id: str, api_key: str, workspace_id: str = "") -> None:
         self._model_id = model_id
         self._api_key = api_key
+        self._workspace_id = workspace_id
         self._client: anthropic.Anthropic | None = None
 
     def _get_client(self) -> anthropic.Anthropic:
         # Constructed lazily so importing this module — and anything that
         # imports it — never requires ANTHROPIC_API_KEY to be set.
         if self._client is None:
-            self._client = anthropic.Anthropic(api_key=self._api_key)
+            # anthropic-workspace-id is only sent when configured — an
+            # identity-linked API key 400s without it, but a workspace-scoped
+            # key doesn't want it, so an empty workspace_id must mean "send
+            # nothing", not "send an empty header".
+            default_headers = (
+                {"anthropic-workspace-id": self._workspace_id}
+                if self._workspace_id
+                else None
+            )
+            self._client = anthropic.Anthropic(
+                api_key=self._api_key, default_headers=default_headers
+            )
         return self._client
 
     def generate_structured(
