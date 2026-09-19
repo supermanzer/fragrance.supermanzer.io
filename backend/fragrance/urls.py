@@ -2,6 +2,7 @@ from django.urls import path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
+    BetaSignupView,
     ExportCollectionView,
     FragranceConfigView,
     FragranceViewSet,
@@ -19,6 +20,7 @@ router.register('collection', FragranceViewSet, basename='fragrance')
 router.register('runs', RecommendationRunViewSet, basename='run')
 
 urlpatterns = router.urls + [
+    path('beta/signup/', BetaSignupView.as_view(), name='beta-signup'),
     path('export/', ExportCollectionView.as_view(), name='export-collection'),
     path('import/', ImportCollectionView.as_view(), name='import-collection'),
     path('config/', FragranceConfigView.as_view(), name='fragrance-config'),

@@ -1,7 +1,9 @@
 import codecs
 import csv
 import io
+import logging
 
+import redis
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
@@ -16,11 +18,14 @@ from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
 from rest_framework.parsers import MultiPartParser
+from rest_framework.request import Request
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import (
+    BetaSignup,
     Fragrance,
     FragranceConfig,
     PreferenceProfile,
@@ -28,6 +33,7 @@ from .models import (
     RecommendationRun,
 )
 from .serializers import (
+    BetaSignupSerializer,
     ChangePasswordSerializer,
     FragranceConfigSerializer,
     FragranceSerializer,
@@ -37,14 +43,18 @@ from .serializers import (
     RecommendationRatingSerializer,
     RecommendationRunSerializer,
     RecommendationSerializer,
-    UserRegistrationSerializer,
 )
 from .services import (
     RatingConflict,
     apply_recommendation_rating,
+    get_client_ip,
+    hash_signup_ip,
     import_collection_from_csv,
+    normalize_email,
     verify_recommendation_token,
 )
+
+logger = logging.getLogger(__name__)
 
 # Characters that spreadsheet apps interpret as formula triggers.
 _FORMULA_PREFIXES = ('=', '+', '-', '@', '\t', '\r')
@@ -57,22 +67,112 @@ def _safe_cell(value: str) -> str:
     return value
 
 
-class RegisterView(generics.CreateAPIView):
-    serializer_class = UserRegistrationSerializer
-    permission_classes = [permissions.AllowAny]
+_BETA_SIGNUP_RESPONSE = {
+    "detail": "Thanks for your interest. If a spot opens up, we'll be in touch."
+}
 
-    def create(self, request, *args, **kwargs):
+
+class BetaSignupThrottle(ScopedRateThrottle):
+    """
+    Keys the throttle on the same DEBUG-gated proxy-trust resolution as
+    services.get_client_ip, rather than the stock BaseThrottle.get_ident.
+
+    With NUM_PROXIES unset (the project's default, and unset deliberately --
+    no other throttle exists yet to need it), get_ident trusts the *entire*
+    client-supplied X-Forwarded-For string when present. In production nginx
+    only appends to XFF (proxy_set_header X-Forwarded-For
+    $proxy_add_x_forwarded_for), so a client that sends its own XFF value
+    gets a fresh bucket on every request and the rate limit never engages.
+    Reusing get_client_ip also makes this throttle's key agree with the
+    signup_ip_hash stored on BetaSignup, instead of the two quietly
+    disagreeing about which address is "the" client.
+    """
+
+    def get_ident(self, request: Request) -> str:
+        return get_client_ip(request=request)
+
+    def allow_request(self, request: Request, view: generics.GenericAPIView) -> bool:
+        """
+        Fails open on a Redis-backed cache error rather than propagating it.
+
+        settings.CACHES["default"] now points at Redis (see settings.py) so
+        this throttle can be enforced correctly across gunicorn's multiple
+        worker processes. Django's built-in RedisCache does not swallow
+        connection errors the way django-redis can with IGNORE_EXCEPTIONS --
+        SimpleRateThrottle.allow_request calls self.cache.get()/.set() with
+        no try/except of its own. Left uncaught, a Redis outage would 500 this
+        public, unauthenticated signup page. nginx's `zone=beta` limit_req is
+        the authoritative rate limit in production regardless (this DRF
+        throttle is defense-in-depth for the dev/no-nginx path and for
+        per-process dilution) -- defense-in-depth must never be the thing
+        that takes the page down, so an unreachable cache means "don't
+        throttle," not "error."
+        """
+        try:
+            return super().allow_request(request, view)
+        except redis.exceptions.RedisError:
+            logger.warning(
+                "beta signup throttle cache unavailable; allowing request without throttling"
+            )
+            return True
+
+
+class BetaSignupView(generics.GenericAPIView):
+    """
+    Public waitlist capture. Account creation happens only via admin approval
+    (a later slice) -- this endpoint never mints a User or a token.
+
+    Returns the exact same 202 body regardless of whether the email is new,
+    already pending, already approved, or belongs to an existing User:
+    anything that differs by case is an account-enumeration oracle. Same
+    rule already applied to verify_recommendation_token in services.py.
+    """
+
+    permission_classes = [permissions.AllowAny]
+    serializer_class = BetaSignupSerializer
+    throttle_classes = [BetaSignupThrottle]
+    throttle_scope = "beta-signup"
+
+    def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        user = serializer.save()
-        refresh = RefreshToken.for_user(user)
-        return Response(
-            {
-                "refresh": str(refresh),
-                "access": str(refresh.access_token),
-            },
-            status=status.HTTP_201_CREATED,
+
+        if serializer.validated_data.get("website"):
+            # Honeypot tripped -- persist nothing, but respond identically.
+            # Logged (not surfaced to the client) so a false-positive trip --
+            # e.g. a password manager/autofill heuristic populating a field
+            # literally named "website" for a real visitor -- is visible in
+            # ops instead of silently losing that person's signup. The raw
+            # email isn't logged, matching this project's existing restraint
+            # (sanitize_sdk_error_message) about what reaches log output.
+            logger.info("beta signup honeypot tripped")
+            return Response(_BETA_SIGNUP_RESPONSE, status=status.HTTP_202_ACCEPTED)
+
+        email = serializer.validated_data["email"]
+        normalized = normalize_email(email=email)
+        ip_hash = hash_signup_ip(ip=get_client_ip(request=request))
+        # Deliberately no "does a User already own this email" branch: that
+        # would query on the raw address while dedup is keyed on the
+        # normalized one, so the two could disagree (a Gmail-dot variant of
+        # an existing user's address would slip through and create a row
+        # anyway) -- and branching on it at all gives a timing/query-count
+        # signal on an endpoint whose whole point is not distinguishing
+        # these cases. The admin-approval step (a later slice) is where
+        # "does a User already exist for this email" actually gets guarded.
+        #
+        # bulk_create(..., ignore_conflicts=True) instead of get_or_create:
+        # on PostgreSQL this compiles to a single INSERT ... ON CONFLICT DO
+        # NOTHING, so the query shape is identical whether normalized_email
+        # is new or already present -- get_or_create's SELECT-then-maybe-
+        # INSERT gave "already on the waitlist" a measurably smaller query
+        # footprint than "new to the waitlist," a narrow but real timing
+        # signal. This narrows, not closes, that channel: a successful
+        # insert still does more index/WAL work than a no-op conflict.
+        BetaSignup.objects.bulk_create(
+            [BetaSignup(email=email, normalized_email=normalized, signup_ip_hash=ip_hash)],
+            ignore_conflicts=True,
         )
+        return Response(_BETA_SIGNUP_RESPONSE, status=status.HTTP_202_ACCEPTED)
 
 
 class ChangePasswordView(generics.GenericAPIView):

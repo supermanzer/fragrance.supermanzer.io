@@ -29,6 +29,12 @@ EMAIL_STATUSES = [
     ("sent", "Sent"),
     ("failed", "Failed"),
 ]
+BETA_SIGNUP_STATUSES = [
+    ("pending", "Pending"),
+    ("approved", "Approved"),
+    ("converted", "Converted"),
+    ("rejected", "Rejected"),
+]
 
 
 # Create your models here.
@@ -149,6 +155,45 @@ class Recommendation(models.Model):
     )
     rationale = models.TextField()  # LLM generated: why was this recommended?
     search_source_url = models.URLField(blank=True)
+
+
+class BetaSignup(models.Model):
+    """
+    A waitlist row, created before any User exists. This is triage, not
+    authorization -- manual admin approval (a later slice) is the real gate.
+    `normalized_email` (not `email`) carries the uniqueness constraint, since
+    a raw-email unique index does nothing against `+tag` or Gmail-dot abuse;
+    see services.normalize_email for the normalization rule it depends on.
+    """
+
+    email = models.EmailField()
+    normalized_email = models.EmailField(unique=True)
+    status = models.CharField(
+        max_length=10, choices=BETA_SIGNUP_STATUSES, default="pending"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="approved_beta_signups",
+    )
+    invited_user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="beta_signups",
+    )
+    # HMAC of the submitting client's IP, salted with SECRET_KEY -- never the
+    # raw address. Enough to correlate abuse across signups without storing PII.
+    signup_ip_hash = models.CharField(max_length=64, blank=True)
+    converted_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self) -> str:
+        return f"{self.email} ({self.status})"
 
 
 class ActiveAIModelConfigConflictError(Exception):

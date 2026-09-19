@@ -157,6 +157,31 @@ CELERY_BROKER_URL = config(
 CELERY_RESULT_BACKEND = CELERY_BROKER_URL
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 
+# DRF's SimpleRateThrottle reads django.core.cache's "default" backend. Left
+# unconfigured, that's Django's LocMemCache -- one dict per gunicorn worker
+# process, so a "5/min" scoped rate behaves as ~5/min * worker count and only
+# resets on a container recreate, not on any schedule. Pointed at Redis DB 1
+# (not DB 0, which CELERY_BROKER_URL/CELERY_RESULT_BACKEND above use) so a
+# debug FLUSHDB against the cache during an incident can't take Celery's
+# broker/result keys with it. This is Django's built-in RedisCache (shipped
+# since 4.0), not django-redis -- no new dependency; `redis` 6.4.0 is already
+# imported transitively via kombu/celery.
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": f"redis://{_redis_auth}{_redis_host}:6379/1",
+    }
+}
+
+# manage.py test's DiscoverRunner never creates an isolated test cache the
+# way it creates an isolated test database, so left alone CACHES above would
+# have every test run's cache.clear()/get()/set() hit the real Redis DB 1.
+# RedisSafeTestRunner swaps CACHES to LocMemCache for the lifetime of the
+# test run only -- TEST_RUNNER is consulted exclusively by the `test`
+# management command, so runserver/gunicorn/Celery are unaffected by
+# construction, not by a conditional. See config/testing.py.
+TEST_RUNNER = "config.testing.RedisSafeTestRunner"
+
 # Email Configuration
 EMAIL_BACKEND = "anymail.backends.postmark.EmailBackend"
 DEFAULT_FROM_EMAIL = config(
@@ -178,6 +203,42 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated"
+    ],
+    # No DEFAULT_THROTTLE_CLASSES here deliberately -- rates below are only
+    # applied to views that opt in via throttle_classes/throttle_scope (e.g.
+    # BetaSignupView). nginx is the general-purpose rate-limiting layer in
+    # production; it's absent in dev, which is why the public, unauthenticated
+    # beta-signup endpoint additionally carries its own scoped DRF throttle.
+    "DEFAULT_THROTTLE_RATES": {
+        "beta-signup": "5/min",
+    },
+    # DRF's default SimpleMetadata answers OPTIONS for any caller, including
+    # AllowAny views, by cloning the request per unsafe method and including
+    # full serializer field info for whichever pass permission checks --
+    # confirmed to leak BetaSignupSerializer's `website` honeypot field name
+    # (defeating the honeypot for a bot that probes OPTIONS before POST) and
+    # every view's docstring (RecommendationConfirmView's describes the
+    # anti-enumeration design in prose). This project has no public schema
+    # consumer, so there's no cost to disabling it: metadata_class becomes
+    # None on every APIView, and APIView.options() returns 405 instead.
+    "DEFAULT_METADATA_CLASS": None,
+    # BrowsableAPIRenderer is a second, independent path to the same
+    # disclosure DEFAULT_METADATA_CLASS was set above to close: it renders an
+    # HTML form (plus the view's docstring, under class="description") for
+    # any request whose Accept header prefers text/html -- which is what a
+    # browser sends by default when a URL is opened directly, no special
+    # tooling required. Confirmed live against BetaSignupView,
+    # RecommendationConfirmView, PasswordResetRequestView, and
+    # PasswordResetConfirmView: a plain GET with Accept: text/html returned a
+    # 268-line HTML page containing the `website` honeypot field name and the
+    # anti-enumeration docstrings verbatim. This project has no browsable-API
+    # consumer (the only client is the Nuxt frontend via $fetch, which never
+    # sends a strict text/html Accept header), so there's no cost to
+    # restricting rendering to JSON only. Do not re-add BrowsableAPIRenderer
+    # for local-testing convenience -- use curl -H "Accept: application/json"
+    # or DRF's format=json query param instead.
+    "DEFAULT_RENDERER_CLASSES": [
+        "rest_framework.renderers.JSONRenderer",
     ],
 }
 CORS_ALLOWED_ORIGINS = config("CORS_ALLOWED_ORIGINS", cast=Csv())

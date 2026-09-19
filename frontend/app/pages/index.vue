@@ -37,7 +37,7 @@
               variant="flat"
               rounded="lg"
               size="large"
-              :to="authStatus === 'authenticated' ? '/fragrance' : '/auth/login'"
+              :to="authStatus === 'authenticated' ? '/fragrance' : '/beta'"
               class="w-100 w-sm-auto"
             >
               Get started
@@ -197,7 +197,7 @@
           variant="flat"
           rounded="lg"
           size="large"
-          :to="authStatus === 'authenticated' ? '/fragrance' : '/auth/login'"
+          :to="authStatus === 'authenticated' ? '/fragrance' : '/beta'"
           class="w-100 w-sm-auto"
         >
           Get started

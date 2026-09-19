@@ -12,7 +12,17 @@
     </v-app-bar-title>
 
     <template #append>
-      <v-btn variant="text" size="default" to="/about">About</v-btn>
+      <v-btn variant="text" size="default" to="/about" class="d-none d-sm-inline-flex">About</v-btn>
+      <v-btn
+        variant="flat"
+        color="primary"
+        rounded="lg"
+        size="default"
+        to="/beta"
+        class="ml-2"
+      >
+        Join the beta
+      </v-btn>
       <v-btn
         variant="text"
         size="default"
@@ -56,6 +66,14 @@
           <v-btn
             variant="text"
             size="small"
+            to="/beta"
+            class="text-decoration-underline"
+          >
+            Join the beta
+          </v-btn>
+          <v-btn
+            variant="text"
+            size="small"
             :to="authStatus === 'authenticated' ? '/fragrance' : '/auth/login'"
             class="text-decoration-underline"
           >
@@ -85,6 +103,14 @@
             class="text-decoration-underline"
           >
             About
+          </v-btn>
+          <v-btn
+            variant="text"
+            size="small"
+            to="/beta"
+            class="text-decoration-underline"
+          >
+            Join the beta
           </v-btn>
           <v-btn
             variant="text"

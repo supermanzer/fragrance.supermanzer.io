@@ -6,6 +6,7 @@ from .ai_providers import registry
 from .ai_providers.verification import persist_verification_results, run_verification_checks
 from .models import (
     AIModelConfig,
+    BetaSignup,
     Fragrance,
     FragranceConfig,
     PreferenceProfile,
@@ -136,3 +137,31 @@ class RecommendationAdmin(admin.ModelAdmin):
 @admin.register(RecommendationRun)
 class RecommendationRunAdmin(admin.ModelAdmin):
     pass
+
+
+@admin.register(BetaSignup)
+class BetaSignupAdmin(admin.ModelAdmin):
+    # Approve/reject actions land in a later slice, alongside the User/
+    # Subscription creation they trigger -- this is a list/inspect view only.
+    list_display = ("email", "normalized_email", "status", "created_at", "approved_at")
+    list_filter = ("status",)
+    search_fields = ("email", "normalized_email")
+    readonly_fields = (
+        "email",
+        "normalized_email",
+        "status",
+        "created_at",
+        "approved_at",
+        "approved_by",
+        "invited_user",
+        "signup_ip_hash",
+        "converted_at",
+    )
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        # Every field is readonly for this slice, so the stock add form would
+        # render with nothing to fill in and "Save" would create a blank row
+        # that then 500s on the normalized_email unique constraint. Rows are
+        # created only by the public signup endpoint until slice 2 adds
+        # approve/reject actions.
+        return False

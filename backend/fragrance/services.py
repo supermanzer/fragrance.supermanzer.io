@@ -1,9 +1,13 @@
 import csv
+import hashlib
+import hmac
 from typing import IO
 
+from django.conf import settings
 from django.contrib.auth.models import User
 from django.core import signing
 from django.db import IntegrityError, transaction
+from rest_framework.request import Request
 
 from .models import FRAGRANCE_STATUSES, Fragrance, Recommendation
 
@@ -222,3 +226,66 @@ def verify_recommendation_token(token: str) -> dict | None:
     if payload["action"] not in {value for value, _ in FRAGRANCE_STATUSES}:
         return None
     return payload
+
+
+# Domains where the mailbox provider itself ignores dots in the local part,
+# so "r.yan@gmail.com" and "ryan@gmail.com" are the same inbox. Only Gmail's
+# own domains are known to do this widely enough to normalize on safely --
+# stripping dots elsewhere would risk merging two genuinely distinct addresses.
+_DOT_INSENSITIVE_DOMAINS = {"gmail.com", "googlemail.com"}
+
+
+def normalize_email(*, email: str) -> str:
+    """
+    Lowercase, strip +tags, and strip dots for Gmail-class domains.
+
+    A `unique` constraint on the raw email does nothing against
+    `ryan+1@gmail.com`, `ryan+2@gmail.com`, or `r.y.a.n@gmail.com` -- all of
+    which land in the same inbox as `ryan@gmail.com`. `BetaSignup`'s unique
+    constraint is keyed on this function's output, not the raw address, so
+    this is the anti-abuse primitive that actually stops one person from
+    occupying many waitlist slots.
+    """
+    email = email.strip().lower()
+    local, sep, domain = email.partition("@")
+    if not sep:
+        return email
+    local = local.split("+", 1)[0]
+    if domain in _DOT_INSENSITIVE_DOMAINS:
+        local = local.replace(".", "")
+    return f"{local}@{domain}"
+
+
+def get_client_ip(*, request: Request) -> str:
+    """
+    Best-available client IP for abuse correlation, not an authorization
+    control.
+
+    Typed as rest_framework.request.Request, not django.http.HttpRequest,
+    because both call sites (BetaSignupView.post, BetaSignupThrottle.get_ident)
+    receive the DRF-wrapped request -- it only worked against the Django type
+    via Request's passthrough .META property, which duck-typing papered over
+    but didn't document.
+
+    In production nginx is the only path to `backend` (no published port),
+    and its realip module rewrites `$remote_addr` from Cloudflare's trusted
+    `CF-Connecting-IP` before forwarding `X-Real-IP: $remote_addr` upstream --
+    so that header carries the true client IP there. In dev,
+    docker-compose.override publishes `backend` directly, bypassing nginx
+    entirely: there is no trusted proxy in front, so trusting a
+    client-supplied X-Real-IP there would be spoofable, and REMOTE_ADDR (the
+    actual TCP peer) is the honest value. Gated on DEBUG, matching the same
+    proxy-trust pattern as config.settings._secure_proxy_ssl_header.
+    """
+    if not settings.DEBUG:
+        real_ip = request.META.get("HTTP_X_REAL_IP")
+        if real_ip:
+            return real_ip
+    return request.META.get("REMOTE_ADDR", "")
+
+
+def hash_signup_ip(*, ip: str) -> str:
+    """HMACs a client IP with SECRET_KEY so BetaSignup never stores the raw address."""
+    return hmac.new(
+        key=settings.SECRET_KEY.encode(), msg=ip.encode(), digestmod=hashlib.sha256
+    ).hexdigest()

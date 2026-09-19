@@ -9,15 +9,12 @@ from rest_framework import serializers
 from .models import FRAGRANCE_STATUSES, FragranceConfig, Fragrance, PreferenceProfile, Recommendation, RecommendationRun
 
 
-class UserRegistrationSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True)
-
-    class Meta:
-        model = User
-        fields = ['username', 'email', 'password']
-
-    def create(self, validated_data):
-        return User.objects.create_user(**validated_data)
+class BetaSignupSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    # Honeypot: real users never see or fill this field (hidden in the
+    # frontend form); a bot that fills every input trips it. Non-empty means
+    # silently drop the submission, never store it.
+    website = serializers.CharField(required=False, allow_blank=True, default='')
 
 
 class FragranceConfigSerializer(serializers.ModelSerializer):
