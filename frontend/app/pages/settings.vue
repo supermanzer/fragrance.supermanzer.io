@@ -107,6 +107,12 @@
       </v-card-actions>
     </v-card>
 
+    <div v-if="known && !isExempt" class="mt-8" style="max-width: 560px">
+      <p class="text-h6 font-weight-regular mb-1">Subscription</p>
+      <p class="text-body-2 text-medium-emphasis mb-3">Change plans, update your card, or see invoices.</p>
+      <v-btn variant="text" color="primary" rounded="lg" to="/billing">Go to billing</v-btn>
+    </div>
+
     <!-- Change password -->
     <v-card class="mt-6" max-width="560" elevation="1" rounded="lg">
       <v-card-title class="pt-6 px-6 pb-2">Change Password</v-card-title>
@@ -252,7 +258,7 @@ const resetSessionState = useSessionReset()
 const saving = ref(false)
 const saved = ref<string | null>(null)
 
-const { isLapsed } = useSubscription()
+const { isLapsed, known, isExempt } = useSubscription()
 const readOnlyNotice = ref<string | null>(null)
 
 const { loading: importLoading, error: importError, readOnly: importReadOnly, result: importResult, importCollection, reset: importReset } = useImport()

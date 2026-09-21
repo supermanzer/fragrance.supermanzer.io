@@ -86,9 +86,16 @@
             :rules="[required, passwordsMatch]"
             :error-messages="errors.confirmPassword"
             hide-details="auto"
-            class="mb-6"
+            class="mb-4"
             :disabled="submitting"
           />
+
+          <p class="text-caption text-medium-emphasis mb-4">
+            By continuing you agree to the
+            <NuxtLink to="/terms" target="_blank" rel="noopener" class="text-primary text-decoration-underline">Terms of Service<span class="d-sr-only"> (opens in a new tab)</span></NuxtLink>
+            and
+            <NuxtLink to="/privacy" target="_blank" rel="noopener" class="text-primary text-decoration-underline">Privacy Policy<span class="d-sr-only"> (opens in a new tab)</span></NuxtLink>.
+          </p>
 
           <v-alert v-if="errors.general" type="error" variant="tonal" class="mb-4">
             {{ errors.general }}

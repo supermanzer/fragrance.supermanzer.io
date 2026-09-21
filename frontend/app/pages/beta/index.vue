@@ -47,6 +47,11 @@
           Join the waitlist
         </v-btn>
 
+        <p class="text-caption text-medium-emphasis text-center mt-3">
+          We use your email only to write to you about the beta. See our
+          <NuxtLink to="/privacy" target="_blank" rel="noopener" class="text-primary text-decoration-underline">Privacy Policy<span class="d-sr-only"> (opens in a new tab)</span></NuxtLink>.
+        </p>
+
         <div class="text-center mt-4">
           <NuxtLink to="/auth/login" class="text-body-2 text-primary">Already have an account? Sign in</NuxtLink>
         </div>

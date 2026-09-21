@@ -6,6 +6,15 @@
     <v-btn :to="{ path: '/runs' }" variant="text" active-color="primary">Runs</v-btn>
     <v-btn :to="{ path: '/profile' }" variant="text" active-color="primary">Profile</v-btn>
     <v-btn :to="{ path: '/settings' }" variant="text" active-color="primary">Settings</v-btn>
+    <v-btn
+      v-if="known && !isExempt"
+      :to="{ path: '/billing' }"
+      variant="text"
+      active-color="primary"
+      class="d-none d-sm-flex"
+    >
+      Billing
+    </v-btn>
     <v-btn :to="{ path: '/about' }" variant="text" active-color="primary">About</v-btn>
 
     <template #append>
@@ -30,7 +39,7 @@ import { clearTokens } from '~/composables/useApi'
 
 const route = useRoute()
 const subscriptionStale = useState<number>('subscription-stale', () => 0)
-const { fetchSubscription, refreshSubscription } = useSubscription()
+const { fetchSubscription, refreshSubscription, known, isExempt } = useSubscription()
 const resetSessionState = useSessionReset()
 
 onMounted(fetchSubscription)

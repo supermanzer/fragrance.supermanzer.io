@@ -14,6 +14,8 @@ export interface Subscription {
   access_expires_at: string | null
   has_active_access: boolean
   exempt: boolean
+  // True whenever a billing account exists, lapsed customers included; gate UI on active state too.
+  can_manage_billing: boolean
   quota: SubscriptionQuota
 }
 
@@ -49,6 +51,7 @@ export function useSubscription() {
   })
   const quota = computed<SubscriptionQuota | null>(() => subscription.value?.quota ?? null)
   const isExempt = computed(() => subscription.value?.exempt === true)
+  const canManageBilling = computed(() => subscription.value?.can_manage_billing === true && !isExempt.value)
   const unlimited = computed(() => quota.value !== null && quota.value.runs_allowed === null)
 
   function startFetch(): Promise<void> {
@@ -105,6 +108,7 @@ export function useSubscription() {
     lapsedKind,
     quota,
     isExempt,
+    canManageBilling,
     unlimited,
   }
 }

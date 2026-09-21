@@ -80,6 +80,24 @@
             Sign in
           </v-btn>
         </div>
+        <div class="d-flex justify-center ga-2 mt-1">
+          <v-btn
+            variant="text"
+            size="small"
+            to="/terms"
+            class="text-decoration-underline text-medium-emphasis"
+          >
+            Terms
+          </v-btn>
+          <v-btn
+            variant="text"
+            size="small"
+            to="/privacy"
+            class="text-decoration-underline text-medium-emphasis"
+          >
+            Privacy
+          </v-btn>
+        </div>
       </div>
 
       <!-- md+: single row, wordmark/tagline left, links right -->
@@ -119,6 +137,23 @@
             class="text-decoration-underline"
           >
             Sign in
+          </v-btn>
+          <v-divider vertical length="16" class="align-self-center" />
+          <v-btn
+            variant="text"
+            size="small"
+            to="/terms"
+            class="text-decoration-underline text-medium-emphasis"
+          >
+            Terms
+          </v-btn>
+          <v-btn
+            variant="text"
+            size="small"
+            to="/privacy"
+            class="text-decoration-underline text-medium-emphasis"
+          >
+            Privacy
           </v-btn>
         </div>
       </div>

@@ -1,7 +1,14 @@
 <template>
   <div style="max-width: 720px; margin: 0 auto">
     <VFadeTransition mode="out-in">
-      <div v-if="isLoading" key="loading">
+      <div v-if="isLoading && showSubscriptionView" key="subscription-loading">
+        <v-skeleton-loader type="heading" class="mb-2" />
+        <v-skeleton-loader type="text" class="mb-8" />
+        <v-skeleton-loader type="list-item-two-line" class="mb-8" />
+        <v-skeleton-loader type="list-item-two-line" />
+      </div>
+
+      <div v-else-if="isLoading" key="loading">
         <p class="text-h4 mb-2">Choose your plan</p>
         <p class="text-body-2 text-medium-emphasis mb-8">
           One plan, billed however you'd rather pay. Either way, you get one recommendation run
@@ -34,11 +41,130 @@
         <v-btn variant="flat" color="primary" rounded="lg" @click="loadAll">Try again</v-btn>
       </div>
 
-      <div v-else-if="alreadyActive" key="already-active" class="text-center py-16">
-        <v-icon icon="mdi-check-decagram-outline" size="48" color="primary" class="mb-4" />
-        <p class="text-h6 font-weight-regular mb-2">You're already subscribed</p>
-        <p class="text-body-2 text-medium-emphasis mb-6">{{ alreadyActiveBody }}</p>
-        <v-btn color="primary" variant="flat" rounded="lg" to="/fragrance">Go to your collection</v-btn>
+      <div v-else-if="showSubscriptionView" key="subscription">
+        <p class="text-h4 mb-2">Your subscription</p>
+        <p class="text-body-2 text-medium-emphasis mb-8">Your plan, what it costs, and how to change it.</p>
+
+        <div class="mb-8">
+          <p class="text-h6">{{ subscription?.plan?.name ?? 'Subscription' }}</p>
+          <p v-if="currentPlan" class="text-body-2 text-medium-emphasis">
+            {{ formatPlanPrice(currentPlan) }} / {{ intervalPhrase(currentPlan) }}
+          </p>
+          <p class="text-body-2 text-medium-emphasis">{{ activeThroughLine }}</p>
+        </div>
+
+        <VExpandTransition>
+          <div v-if="pending" role="region" aria-label="Scheduled plan change" class="mb-8">
+            <VAlert
+              type="info"
+              variant="tonal"
+              rounded="lg"
+              density="comfortable"
+              icon="mdi-calendar-clock-outline"
+              role="presentation"
+            >
+              <p id="pending-change-title" tabindex="-1" class="text-subtitle-1">{{ pendingTitle }}</p>
+              <p class="text-body-2 mb-3">{{ pendingBody }}</p>
+              <VBtn
+                variant="text"
+                color="primary"
+                rounded="lg"
+                :loading="cancellingChange"
+                :disabled="cancellingChange"
+                class="d-block d-sm-inline-flex w-100 w-sm-auto"
+                @click="keepCurrentPlan"
+              >
+                Keep my current plan
+              </VBtn>
+            </VAlert>
+          </div>
+        </VExpandTransition>
+
+        <VAlert
+          v-if="cancelChangeError"
+          type="error"
+          variant="tonal"
+          rounded="lg"
+          class="mb-4"
+        >
+          {{ cancelChangeError }}
+        </VAlert>
+
+        <VExpandTransition>
+          <div v-if="showPlanSection" class="mb-8">
+            <p class="text-h6 font-weight-regular mb-3">Plan</p>
+
+            <v-skeleton-loader v-if="planChangeLoading && !planChange" type="list-item-two-line" />
+
+            <div v-else-if="planChangeError">
+              <VAlert type="error" variant="tonal" rounded="lg" class="mb-4">{{ planChangeError }}</VAlert>
+              <VBtn variant="text" color="primary" rounded="lg" @click="fetchPlanChange">Try again</VBtn>
+            </div>
+
+            <p v-else-if="planChange?.cancel_at_period_end" class="text-body-2 text-medium-emphasis">
+              Your subscription ends on {{ formatExpiryDate(planChange.current_period_end) }} and won't renew.
+            </p>
+
+            <template v-else>
+              <div
+                v-for="target in planChange?.available ?? []"
+                :key="target.slug"
+                class="d-flex flex-column flex-sm-row align-sm-center ga-4 mb-4"
+              >
+                <div class="flex-grow-1">
+                  <p class="text-subtitle-1 mb-1">Switch to {{ target.name }} billing</p>
+                  <p class="text-body-2 text-medium-emphasis">{{ switchBody(target) }}</p>
+                </div>
+                <VBtn
+                  :id="`plan-switch-${target.slug}`"
+                  variant="outlined"
+                  color="primary"
+                  rounded="lg"
+                  prepend-icon="mdi-swap-horizontal"
+                  height="44"
+                  class="flex-shrink-0"
+                  @click="openDialog(target)"
+                >
+                  Switch to {{ target.name }}
+                </VBtn>
+              </div>
+            </template>
+          </div>
+        </VExpandTransition>
+
+        <div v-if="showManageBilling" class="mb-8">
+          <p class="text-h6 font-weight-regular mb-3">Payment and invoices</p>
+          <VAlert
+            v-if="portalError"
+            type="error"
+            variant="tonal"
+            rounded="lg"
+            class="mb-4"
+          >
+            {{ portalError }}
+          </VAlert>
+          <div class="d-flex flex-column flex-sm-row align-sm-center ga-4">
+            <p class="text-body-2 text-medium-emphasis flex-grow-1">
+              Update your card, see invoices and payment history, or cancel. This opens Stripe's secure billing page.
+            </p>
+            <VBtn
+              variant="flat"
+              color="primary"
+              rounded="lg"
+              prepend-icon="mdi-credit-card-outline"
+              height="44"
+              class="flex-shrink-0"
+              :loading="portalRedirecting"
+              :disabled="portalRedirecting"
+              @click="manageBilling"
+            >
+              Manage billing
+            </VBtn>
+          </div>
+          <p v-if="manageCaption" class="text-caption text-medium-emphasis mt-2">{{ manageCaption }}</p>
+        </div>
+
+        <VBtn variant="text" color="primary" rounded="lg" to="/fragrance">Go to your collection</VBtn>
       </div>
 
       <div v-else-if="noActivePlans" key="no-plans" class="text-center py-16">
@@ -104,8 +230,43 @@
             </v-card>
           </v-col>
         </v-row>
+
+        <p class="text-caption text-medium-emphasis mt-6">
+          Subscriptions renew automatically until cancelled, and payments are non-refundable.
+          Payments are handled by Stripe. By subscribing you agree to the
+          <NuxtLink to="/terms" target="_blank" rel="noopener" class="text-primary text-decoration-underline">Terms of Service<span class="d-sr-only"> (opens in a new tab)</span></NuxtLink>.
+        </p>
       </div>
     </VFadeTransition>
+
+    <PlanChangeDialog
+      v-if="dialogTarget"
+      v-model="dialogOpen"
+      :target="dialogTarget"
+      :current-name="subscription?.plan?.name ?? 'current'"
+      :date="planChange?.current_period_end ?? null"
+      :scheduling="scheduling"
+      :error="dialogError"
+      @confirm="confirmSwitch"
+      @dismiss="dismissDialog"
+    />
+
+    <v-snackbar v-model="snackbar.show" timeout="6000" location="bottom" rounded="lg">
+      {{ snackbar.message }}
+    </v-snackbar>
+
+    <v-overlay
+      :model-value="portalRedirecting"
+      persistent
+      class="align-center justify-center"
+      @keydown.esc.prevent
+    >
+      <div class="text-center">
+        <v-progress-circular indeterminate color="primary" size="48" width="3" class="mb-4" />
+        <p class="text-body-1">Opening Stripe's billing page&hellip;</p>
+        <p class="text-caption text-medium-emphasis">Don't close this tab.</p>
+      </div>
+    </v-overlay>
 
     <v-overlay :model-value="checkoutSubmitting" persistent class="align-center justify-center">
       <div class="text-center">
@@ -119,18 +280,41 @@
 
 <script setup lang="ts">
 import type { Plan } from '~/composables/useBilling'
+import { isAuthError } from '~/composables/useApi'
 
 definePageMeta({ layout: 'default' })
 
-const { plans, plansLoading, plansError, fetchPlans, startCheckout } = useBilling()
-const { subscription, loading: subscriptionLoading, isExempt: exempt, fetchSubscription, refreshSubscription } = useSubscription()
+const {
+  plans,
+  plansLoading,
+  plansError,
+  fetchPlans,
+  startCheckout,
+  planChange,
+  planChangeLoading,
+  planChangeError,
+  fetchPlanChange,
+  schedulePlanChange,
+  cancelPlanChange,
+  openBillingPortal,
+} = useBilling()
+const {
+  subscription,
+  loading: subscriptionLoading,
+  isExempt: exempt,
+  canManageBilling,
+  fetchSubscription,
+  refreshSubscription,
+} = useSubscription()
 
 const checkoutSubmitting = ref(false)
 const selectedSlug = ref<string | null>(null)
 const checkoutError = ref<string | null>(null)
 
 const isLoading = computed(() => plansLoading.value || subscriptionLoading.value)
-const loadError = computed(() => Boolean(plansError.value) && !plansLoading.value && !exempt.value)
+const loadError = computed(
+  () => Boolean(plansError.value) && !plansLoading.value && !exempt.value && !showSubscriptionView.value
+)
 
 const alreadyActive = computed(() => {
   const sub = subscription.value
@@ -139,23 +323,12 @@ const alreadyActive = computed(() => {
   return new Date(sub.access_expires_at) > new Date()
 })
 
-const alreadyActiveBody = computed(() => {
-  const sub = subscription.value
-  const name = sub?.plan?.name ?? 'subscription'
-  if (sub?.access_expires_at) {
-    return `Your ${name} plan is active through ${formatExpiry(sub.access_expires_at)}. No need to do anything else.`
-  }
-  return `Your ${name} plan is active. No need to do anything else.`
-})
-
 const noActivePlans = computed(
   () => !isLoading.value && !exempt.value && !loadError.value && !alreadyActive.value && plans.value.length === 0
 )
 
 function formatPrice(plan: Plan): string {
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: plan.currency }).format(
-    plan.amount_cents / 100
-  )
+  return formatPlanPrice(plan)
 }
 
 function formatMonthlyEquivalent(plan: Plan): string {
@@ -164,19 +337,232 @@ function formatMonthlyEquivalent(plan: Plan): string {
   )
 }
 
-function formatExpiry(dateStr: string): string {
-  return new Date(dateStr).toLocaleDateString('en-US', {
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-  })
-}
-
 async function loadAll(): Promise<void> {
   await Promise.all([fetchPlans(), fetchSubscription()])
 }
 
-onMounted(loadAll)
+const showSubscriptionView = computed(() => alreadyActive.value && !exempt.value)
+const showManageBilling = computed(() => showSubscriptionView.value && canManageBilling.value)
+const pending = computed(() => (showSubscriptionView.value ? planChange.value?.pending ?? null : null))
+
+const currentPlan = computed<Plan | null>(() => {
+  const slug = subscription.value?.plan?.slug
+  return slug ? plans.value.find((p) => p.slug === slug) ?? null : null
+})
+
+const activeThroughLine = computed(() => {
+  const expires = subscription.value?.access_expires_at
+  return expires ? `Active through ${formatExpiryDate(expires)}` : 'Active'
+})
+
+const showPlanSection = computed(() => {
+  if (!showSubscriptionView.value) return false
+  if (planChangeLoading.value && !planChange.value) return true
+  if (planChangeError.value) return true
+  const state = planChange.value
+  if (!state) return false
+  if (state.cancel_at_period_end) return true
+  return !state.pending && state.available.length > 0
+})
+
+const manageCaption = computed(() => {
+  if (pending.value) {
+    return 'To cancel, first choose \u201cKeep my current plan\u201d above. Cancelling isn\u2019t available while a plan change is scheduled.'
+  }
+  if (planChange.value?.cancel_at_period_end) return null
+  const expires = subscription.value?.access_expires_at
+  return expires
+    ? `If you cancel, you keep access through ${formatExpiryDate(expires)}. Nothing is refunded or charged partway.`
+    : "If you cancel, you keep access through the period you've paid for. Nothing is refunded or charged partway."
+})
+
+function switchBody(target: Plan): string {
+  const price = formatPlanPrice(target)
+  return target.billing_interval === 'year'
+    ? `Pay ${price} once a year instead of every month. The change happens when your current period ends; nothing is charged today.`
+    : `Pay ${price} a month instead. Your annual term stays in place until it ends; nothing is charged today.`
+}
+
+const pendingPlan = computed<Plan | null>(() => {
+  const slug = pending.value?.slug
+  if (!slug) return null
+  return (
+    planChange.value?.available.find((p) => p.slug === slug) ?? plans.value.find((p) => p.slug === slug) ?? null
+  )
+})
+
+const pendingTitle = computed(() => {
+  const p = pending.value
+  if (!p) return ''
+  const date = formatExpiryDate(p.effective_at)
+  return p.name ? `Switching to ${p.name} on ${date}` : `Your plan changes on ${date}`
+})
+
+const pendingBody = computed(() => {
+  const p = pending.value
+  if (!p) return ''
+  const current = subscription.value?.plan?.name ?? 'current'
+  const date = formatExpiryDate(p.effective_at)
+  const target = pendingPlan.value
+  if (!target) return `Until then you stay on your ${current} plan. Nothing is charged today.`
+  const price = formatPlanPrice(target)
+  return target.billing_interval === 'year'
+    ? `Until then you stay on your ${current} plan. On ${date} you'll be charged ${price} for a year. Nothing is charged today.`
+    : `Your ${current} term runs until ${date}. Then you'll be charged ${price} a month. Nothing is charged today.`
+})
+
+const snackbar = reactive({ show: false, message: '' })
+function notify(message: string): void {
+  snackbar.message = message
+  snackbar.show = true
+}
+
+function focusById(id: string): void {
+  nextTick(() => document.getElementById(id)?.focus())
+}
+
+// Plan change dialog
+const dialogOpen = ref(false)
+const dialogTarget = ref<Plan | null>(null)
+const dialogError = ref<string | null>(null)
+const scheduling = ref(false)
+const cancellingChange = ref(false)
+const cancelChangeError = ref<string | null>(null)
+
+function openDialog(target: Plan): void {
+  dialogTarget.value = target
+  dialogError.value = null
+  dialogOpen.value = true
+}
+
+function dismissDialog(): void {
+  if (scheduling.value) return
+  dialogOpen.value = false
+  if (dialogTarget.value) focusById(`plan-switch-${dialogTarget.value.slug}`)
+}
+
+async function confirmSwitch(): Promise<void> {
+  const target = dialogTarget.value
+  if (!target || scheduling.value) return
+  const periodEnd = planChange.value?.current_period_end ?? null
+  dialogError.value = null
+  scheduling.value = true
+  try {
+    await schedulePlanChange(target.slug)
+    dialogOpen.value = false
+    await fetchPlanChange()
+    notify(
+      periodEnd
+        ? `Plan change scheduled. You'll switch to ${target.name} on ${formatExpiryDate(periodEnd)}.`
+        : `Plan change scheduled. You'll switch to ${target.name} when your current period ends.`,
+    )
+    focusById('pending-change-title')
+  } catch (err: unknown) {
+    if (isAuthError(err)) return
+    const e = err as { status?: number; data?: { code?: string } }
+    const code = e?.data?.code
+    if (e?.status === 409) {
+      dialogOpen.value = false
+      if (code === 'already_scheduled') {
+        await fetchPlanChange()
+        notify('A plan change was already scheduled. Here are the details.')
+      } else if (code === 'same_plan') {
+        await fetchPlanChange()
+        notify("You're already on that plan.")
+      } else if (code === 'cancellation_scheduled') {
+        await fetchPlanChange()
+      } else {
+        await refreshSubscription()
+      }
+    } else if (e?.status === 429) {
+      dialogError.value = 'Too many attempts. Please wait a moment and try again.'
+    } else {
+      dialogError.value = "We couldn't schedule the change just now. Please try again in a moment."
+      void fetchPlanChange()
+    }
+  } finally {
+    scheduling.value = false
+  }
+}
+
+async function keepCurrentPlan(): Promise<void> {
+  if (cancellingChange.value) return
+  cancelChangeError.value = null
+  cancellingChange.value = true
+  const currentName = subscription.value?.plan?.name ?? 'your current plan'
+  try {
+    await cancelPlanChange()
+    await fetchPlanChange()
+    notify(`Plan change cancelled. You're staying on ${currentName}.`)
+    const first = planChange.value?.available[0]
+    if (first) focusById(`plan-switch-${first.slug}`)
+  } catch (err: unknown) {
+    if (isAuthError(err)) return
+    const e = err as { status?: number; data?: { code?: string } }
+    if (e?.status === 404 && e.data?.code === 'no_pending_change') {
+      await fetchPlanChange()
+    } else if (e?.status === 409 && e.data?.code === 'exempt') {
+      await refreshSubscription()
+    } else if (e?.status === 429) {
+      cancelChangeError.value = 'Too many attempts. Please wait a moment and try again.'
+    } else {
+      cancelChangeError.value = "We couldn't cancel the plan change just now. Please try again in a moment."
+      void fetchPlanChange()
+    }
+  } finally {
+    cancellingChange.value = false
+  }
+}
+
+// Billing portal
+const portalRedirecting = ref(false)
+const portalError = ref<string | null>(null)
+
+async function manageBilling(): Promise<void> {
+  if (portalRedirecting.value) return
+  portalError.value = null
+  portalRedirecting.value = true
+  try {
+    const { url } = await openBillingPortal()
+    if (!isValidPortalUrl(url)) throw new Error('Unexpected billing portal URL')
+    window.location.href = url
+  } catch (err: unknown) {
+    portalRedirecting.value = false
+    if (isAuthError(err)) return
+    const e = err as { status?: number; data?: { code?: string } }
+    if (e?.status === 409) {
+      portalError.value = "Billing management isn't available for this account."
+      await refreshSubscription()
+    } else if (e?.status === 429) {
+      portalError.value = 'Too many attempts. Please wait a moment and try again.'
+    } else {
+      portalError.value = "We couldn't open the billing page just now. Please try again in a moment."
+    }
+  }
+}
+
+// Only fetch plan-change data once the subscription resolves as active and non-exempt.
+watch(showSubscriptionView, (visible) => {
+  if (visible) void fetchPlanChange()
+  else planChange.value = null
+})
+
+// Back from Stripe restores this page from bfcache with the overlay still on.
+function onPageShow(event: PageTransitionEvent): void {
+  if (!event.persisted) return
+  portalRedirecting.value = false
+  checkoutSubmitting.value = false
+  void refreshSubscription()
+  if (showSubscriptionView.value) void fetchPlanChange()
+}
+
+onMounted(async () => {
+  window.addEventListener('pageshow', onPageShow)
+  if (showSubscriptionView.value) void fetchPlanChange()
+  await loadAll()
+})
+
+onBeforeUnmount(() => window.removeEventListener('pageshow', onPageShow))
 
 async function subscribe(slug: string): Promise<void> {
   checkoutError.value = null
@@ -184,6 +570,7 @@ async function subscribe(slug: string): Promise<void> {
   selectedSlug.value = slug
   try {
     const { url } = await startCheckout(slug)
+    if (!isValidCheckoutUrl(url)) throw new Error('Unexpected checkout URL')
     window.location.href = url
     // Overlay stays mounted through the redirect; there is no success path that
     // hides it, because success means the page is about to unload.
