@@ -32,6 +32,30 @@
       <slot />
     </v-container>
   </v-main>
+
+  <v-divider class="mb-0" />
+  <v-footer color="background" class="mt-8 pt-4 pb-4">
+    <v-container class="py-0">
+      <div class="d-flex justify-center justify-md-end ga-2 ga-md-4">
+        <v-btn
+          variant="text"
+          size="small"
+          to="/terms"
+          class="text-decoration-underline text-medium-emphasis"
+        >
+          Terms
+        </v-btn>
+        <v-btn
+          variant="text"
+          size="small"
+          to="/privacy"
+          class="text-decoration-underline text-medium-emphasis"
+        >
+          Privacy
+        </v-btn>
+      </div>
+    </v-container>
+  </v-footer>
 </template>
 
 <script setup lang="ts">

@@ -124,7 +124,7 @@ const sections: readonly LegalSection[] = [
       `You can view and edit your collection in the app, and export it as a CSV file at any time, including after a subscription lapses. You can change your delivery email and schedule in Settings.`,
       `You can ask us to give you a copy of your information, correct it, or delete your account and the data linked to it, by emailing [CONTACT EMAIL]. We'll respond within [RESPONSE TIME, e.g. 30 days]. We may need to keep limited records (for example, payment records) where the law requires.`,
       `Depending on where you live, you may also have rights to object to or restrict certain processing, to data portability, and to complain to your local data protection authority. [JURISDICTION-SPECIFIC RIGHTS SECTION, e.g. GDPR / UK GDPR / CCPA, per counsel.]`,
-      `We can't currently delete your account from within the app; deletion is handled by request. (Remove this sentence if a self-serve delete feature is built.)`,
+      `We can't currently delete your account from within the app; deletion is handled by request.`,
     ],
   },
   {
