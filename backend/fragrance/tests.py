@@ -3641,6 +3641,31 @@ class BillingCheckoutViewTests(TestCase):
         self.assertEqual(response.json()["url"], "https://checkout.stripe.com/cs_existing")
         mock_create.assert_not_called()
 
+    @patch("fragrance.billing.stripe.checkout.Session.create")
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_reuse_path_works_with_a_real_sdk_session_object(self, mock_retrieve, mock_create) -> None:
+        # Regression, found by the sandbox walkthrough: on a real session, `.metadata` is a
+        # StripeObject, which is NOT a dict and has no `.get()`, so the reuse path raised
+        # AttributeError (a 500 on the second click of "Subscribe"). Every other test here builds
+        # the session from a SimpleNamespace with a plain-dict metadata, which is why nothing caught
+        # it. This one builds a genuine SDK object.
+        Subscription.objects.create(
+            user=self.user, stripe_customer_id="cus_real_obj", last_checkout_session_id="cs_real_obj"
+        )
+        real = stripe.checkout.Session.construct_from({
+            "id": "cs_real_obj", "object": "checkout.session", "status": "open", "mode": "subscription",
+            "url": "https://checkout.stripe.com/cs_real_obj",
+            "metadata": {"plan_slug": "beta-monthly", "price_id": "price_mo"},
+        }, "sk_test_dummy")
+        self.assertFalse(hasattr(real.metadata, "get") and isinstance(real.metadata, dict))
+        mock_retrieve.return_value = real
+
+        response = self.client.post(self.url, {"slug": "beta-monthly"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["url"], "https://checkout.stripe.com/cs_real_obj")
+        mock_create.assert_not_called()
+
     @patch("fragrance.billing.stripe.checkout.Session.expire")
     @patch("fragrance.billing.stripe.checkout.Session.create")
     @patch("fragrance.billing.stripe.checkout.Session.retrieve")

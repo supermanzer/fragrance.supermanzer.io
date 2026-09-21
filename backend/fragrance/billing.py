@@ -146,6 +146,18 @@ def _get_or_create_customer(*, user: User, subscription: Subscription) -> str:
     return customer.id
 
 
+def _metadata_dict(obj: Any) -> dict:
+    """
+    Stripe metadata as a plain dict. On a real SDK object `.metadata` is a StripeObject, which is
+    NOT a dict and has no `.get()` (calling it raises AttributeError); it must go through
+    `.to_dict()`. Tests and older code paths hand in plain dicts, so accept both.
+    """
+    md = getattr(obj, "metadata", None)
+    if not md:
+        return {}
+    return md.to_dict() if hasattr(md, "to_dict") else dict(md)
+
+
 def _reusable_open_session_url(
     *, subscription: Subscription, plan: Plan
 ) -> str | None:
@@ -180,9 +192,10 @@ def _reusable_open_session_url(
     # handed back and the user would check out against the old Price --
     # the same "validate the price, not a proxy for it" reasoning the plan
     # applies everywhere else in this file.
+    metadata = _metadata_dict(existing)
     if (
-        existing.metadata.get("plan_slug") == plan.slug
-        and existing.metadata.get("price_id") == plan.stripe_price_id
+        metadata.get("plan_slug") == plan.slug
+        and metadata.get("price_id") == plan.stripe_price_id
     ):
         return existing.url
     stripe.checkout.Session.expire(session_id)
