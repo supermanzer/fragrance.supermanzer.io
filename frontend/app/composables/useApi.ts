@@ -29,6 +29,11 @@ export function isAuthError(err: unknown): boolean {
   return (err as any)?.status === 401
 }
 
+export function isSubscriptionRequired(err: unknown): boolean {
+  const e = err as { status?: number; data?: { code?: string } } | null
+  return e?.status === 402 && e?.data?.code === 'subscription_required'
+}
+
 // Three-way outcome for a refresh attempt, distinguishing "confirmed invalid"
 // (safe to clear tokens and force login) from "indeterminate" (a network blip,
 // a 429 from nginx throttling, etc. — NOT grounds to log a user out).
@@ -52,6 +57,10 @@ interface RefreshResponse {
 
 export function useApi() {
   const config = useRuntimeConfig()
+  // A counter rather than an import of useSubscription: that composable imports
+  // this one, so importing back would be circular. The default layout watches it.
+  const subscriptionStale = useState<number>('subscription-stale', () => 0)
+  const resetSessionState = useSessionReset()
 
   // _fetch injects the current access token on every request. Because onRequest
   // re-reads localStorage each call, the retry below automatically picks up the
@@ -104,11 +113,16 @@ export function useApi() {
     try {
       return await _fetch<T>(url, options)
     } catch (err) {
+      if (isSubscriptionRequired(err)) {
+        subscriptionStale.value++
+        throw err
+      }
       if (!isAuthError(err)) throw err
 
       const refreshResult = await refreshTokens()
       if (refreshResult === 'invalid') {
         clearTokens()
+        resetSessionState()
         await navigateTo('/auth/login')
         throw err
       }
@@ -119,7 +133,12 @@ export function useApi() {
         throw err
       }
 
-      return await _fetch<T>(url, options)
+      try {
+        return await _fetch<T>(url, options)
+      } catch (retryErr) {
+        if (isSubscriptionRequired(retryErr)) subscriptionStale.value++
+        throw retryErr
+      }
     }
   }
 

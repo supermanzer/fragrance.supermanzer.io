@@ -17,6 +17,15 @@
         </v-row>
       </div>
 
+      <div v-else-if="exempt" key="exempt" class="text-center py-16">
+        <v-icon icon="mdi-check-decagram-outline" size="48" color="primary" class="mb-4" />
+        <p class="text-h6 font-weight-regular mb-2">No subscription needed</p>
+        <p class="text-body-2 text-medium-emphasis mb-6">
+          Your account has full access, so there's nothing to buy. Runs aren't limited on this account.
+        </p>
+        <v-btn color="primary" variant="flat" rounded="lg" to="/fragrance">Go to your collection</v-btn>
+      </div>
+
       <div v-else-if="loadError" key="load-error">
         <p class="text-h4 mb-2">Choose your plan</p>
         <v-alert type="error" variant="tonal" class="mb-4">
@@ -114,14 +123,14 @@ import type { Plan } from '~/composables/useBilling'
 definePageMeta({ layout: 'default' })
 
 const { plans, plansLoading, plansError, fetchPlans, startCheckout } = useBilling()
-const { subscription, loading: subscriptionLoading, fetchSubscription } = useSubscription()
+const { subscription, loading: subscriptionLoading, isExempt: exempt, fetchSubscription, refreshSubscription } = useSubscription()
 
 const checkoutSubmitting = ref(false)
 const selectedSlug = ref<string | null>(null)
 const checkoutError = ref<string | null>(null)
 
 const isLoading = computed(() => plansLoading.value || subscriptionLoading.value)
-const loadError = computed(() => Boolean(plansError.value) && !plansLoading.value)
+const loadError = computed(() => Boolean(plansError.value) && !plansLoading.value && !exempt.value)
 
 const alreadyActive = computed(() => {
   const sub = subscription.value
@@ -140,7 +149,7 @@ const alreadyActiveBody = computed(() => {
 })
 
 const noActivePlans = computed(
-  () => !isLoading.value && !loadError.value && !alreadyActive.value && plans.value.length === 0
+  () => !isLoading.value && !exempt.value && !loadError.value && !alreadyActive.value && plans.value.length === 0
 )
 
 function formatPrice(plan: Plan): string {
@@ -182,7 +191,7 @@ async function subscribe(slug: string): Promise<void> {
     checkoutSubmitting.value = false
     if (err?.status === 409) {
       selectedSlug.value = null
-      await fetchSubscription()
+      await refreshSubscription()
       return
     }
     selectedSlug.value = null

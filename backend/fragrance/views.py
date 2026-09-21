@@ -40,6 +40,7 @@ from .models import (
     StripeEvent,
     Subscription,
 )
+from .permissions import HasActiveSubscription, HasActiveSubscriptionOrReadOnly
 from .serializers import (
     BetaAcceptSerializer,
     BetaSignupSerializer,
@@ -58,13 +59,17 @@ from .serializers import (
 from .services import (
     BetaInviteTokenAlreadyUsedError,
     BetaInviteTokenInvalidError,
+    QuotaExceeded,
     RatingConflict,
+    RunInProgress,
     apply_recommendation_rating,
     get_client_ip,
+    get_or_create_fragrance_config,
     hash_signup_ip,
     import_collection_from_csv,
     normalize_email,
     resolve_beta_invite_signup,
+    start_recommendation_run,
     verify_recommendation_token,
 )
 
@@ -362,14 +367,15 @@ class PasswordResetConfirmView(generics.GenericAPIView):
 
 class FragranceConfigView(generics.RetrieveUpdateAPIView):
     serializer_class = FragranceConfigSerializer
+    permission_classes = [HasActiveSubscriptionOrReadOnly]
 
     def get_object(self):
-        obj, _ = FragranceConfig.objects.get_or_create(user=self.request.user)
-        return obj
+        return get_or_create_fragrance_config(user=self.request.user)
 
 
 class FragranceViewSet(viewsets.ModelViewSet):
     serializer_class = FragranceSerializer
+    permission_classes = [HasActiveSubscriptionOrReadOnly]
 
     def get_queryset(self):
         qs = Fragrance.objects.filter(user=self.request.user)
@@ -417,6 +423,7 @@ class RecommendationListView(generics.ListAPIView):
 
 class RecommendationRunViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = RecommendationRunSerializer
+    permission_classes = [HasActiveSubscriptionOrReadOnly]
 
     def get_queryset(self):
         return RecommendationRun.objects.filter(
@@ -455,19 +462,37 @@ class RecommendationRunViewSet(viewsets.ReadOnlyModelViewSet):
     def trigger(self, request):
         from fragrance.tasks import monthly_fragrance_run
 
-        if RecommendationRun.objects.filter(
-            user=request.user, status__in=["pending", "running"]
-        ).exists():
+        try:
+            run = start_recommendation_run(user=request.user, source="api")
+        except QuotaExceeded as exc:
             return Response(
-                {"detail": "A run is already in progress."},
+                {
+                    "code": "quota_exceeded",
+                    "detail": "The run quota for this period has been used.",
+                    "next_eligible_at": exc.next_eligible_at,
+                },
                 status=status.HTTP_429_TOO_MANY_REQUESTS,
             )
-        run = RecommendationRun.objects.create(
-            user=request.user, status="pending"
-        )
-        task = monthly_fragrance_run.delay(
-            user_id=request.user.id, run_id=run.id
-        )
+        except RunInProgress:
+            return Response(
+                {"code": "run_in_progress", "detail": "A run is already in progress."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+        # SubscriptionRequired propagates: DRF renders it as the 402 body.
+        try:
+            task = monthly_fragrance_run.delay(
+                user_id=request.user.id, run_id=run.id
+            )
+        except OperationalError:
+            # Broker down: don't leave a 'pending' run that would block this
+            # user via the in-flight guard forever. 'failed' doesn't burn quota.
+            run.status = "failed"
+            run.error_message = "Could not queue the run; please try again shortly."
+            run.save(update_fields=["status", "error_message"])
+            return Response(
+                {"detail": "Could not queue the run; please try again shortly."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         run.celery_task_id = task.id
         run.save(update_fields=["celery_task_id"])
         return Response({"run_id": run.id}, status=status.HTTP_202_ACCEPTED)
@@ -495,6 +520,7 @@ class ExportCollectionView(generics.GenericAPIView):
 
 
 class ImportCollectionView(generics.GenericAPIView):
+    permission_classes = [HasActiveSubscription]
     parser_classes = [MultiPartParser]
 
     def post(self, request):
@@ -673,6 +699,16 @@ class BillingCheckoutView(generics.GenericAPIView):
     def post(self, request: Request) -> Response:
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        # Exempt (staff) accounts already have full access: refuse before any
+        # Stripe call, Customer, or Subscription row so a refusal has no side effects.
+        if request.user.is_staff or request.user.is_superuser:
+            return Response(
+                {
+                    "code": "exempt",
+                    "detail": "This account has full access, so no subscription is needed.",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
         try:
             url = billing.create_checkout_session(
                 user=request.user, plan_slug=serializer.validated_data["slug"]
@@ -704,9 +740,9 @@ class BillingSubscriptionView(generics.GenericAPIView):
     Already-active detection for the /billing paywall page: a user who
     already has a live subscription should never be shown the plan picker.
     Read-only, unlike BillingSessionView -- it never talks to Stripe, it
-    only reads the local Subscription row (creating one on first touch, the
-    same get_or_create pattern FragranceConfigView uses, so a brand-new
-    approved user reads as {"status": "none", ...} rather than 404).
+    only reads the local Subscription row. A user with no row gets an
+    unsaved placeholder (status "none", plan None) so the response is the
+    same {"status": "none", ...} rather than 404 -- and a GET never writes.
 
     Returns the same shape as BillingSessionView (billing.
     subscription_status_payload) plus that view's own "granted" flag --
@@ -714,9 +750,13 @@ class BillingSubscriptionView(generics.GenericAPIView):
     harder to get wrong.
     """
 
+    throttle_classes = [FailOpenScopedRateThrottle]
+    throttle_scope = "billing-status"
+
     def get(self, request: Request) -> Response:
-        subscription, _ = Subscription.objects.select_related("plan").get_or_create(
-            user=request.user
+        subscription = (
+            Subscription.objects.select_related("plan").filter(user=request.user).first()
+            or Subscription(user=request.user)
         )
         return Response(billing.subscription_status_payload(subscription=subscription))
 

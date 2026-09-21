@@ -3,6 +3,7 @@
     <h1 class="text-h4 mb-6">Settings</h1>
 
     <AppAlert v-model="error" class="mb-4" />
+    <AppAlert v-model="readOnlyNotice" type="info" class="mb-4" />
     <AppAlert v-model="saved" type="success" class="mb-4" />
 
     <v-skeleton-loader v-if="loading" type="card" max-width="560" />
@@ -10,6 +11,9 @@
     <v-card v-else max-width="560" elevation="1" rounded="lg">
       <v-card-title class="pt-6 px-6 pb-2">Schedule</v-card-title>
       <v-card-text class="px-6 pb-2">
+        <p v-if="isLapsed" class="text-caption text-medium-emphasis mb-4">
+          Schedule changes need an active subscription.
+        </p>
         <v-text-field
           v-model="form.recipient_email"
           label="Recipient email"
@@ -17,6 +21,7 @@
           variant="outlined"
           rounded="lg"
           hide-details="auto"
+          :readonly="isLapsed"
           class="mb-4"
         />
         <v-select
@@ -26,6 +31,7 @@
           variant="outlined"
           rounded="lg"
           hide-details="auto"
+          :readonly="isLapsed"
           class="mb-4"
         />
         <v-text-field
@@ -37,6 +43,7 @@
           variant="outlined"
           rounded="lg"
           hide-details="auto"
+          :readonly="isLapsed"
           class="mb-4"
         />
         <v-text-field
@@ -49,6 +56,7 @@
           variant="outlined"
           rounded="lg"
           hide-details="auto"
+          :readonly="isLapsed"
           class="mb-4"
         />
         <v-text-field
@@ -61,6 +69,7 @@
           variant="outlined"
           rounded="lg"
           hide-details="auto"
+          :readonly="isLapsed"
           class="mb-4"
         />
         <v-text-field
@@ -73,14 +82,28 @@
           variant="outlined"
           rounded="lg"
           hide-details="auto"
+          :readonly="isLapsed"
           class="mb-4"
         />
       </v-card-text>
       <v-card-actions class="px-6 pb-6 pt-2">
         <v-spacer />
-        <v-btn color="primary" variant="flat" rounded="lg" :loading="saving" @click="submit">
-          Save Settings
-        </v-btn>
+        <LapsedGate
+          :locked="isLapsed"
+          label="Save Settings"
+          reason="Changing your schedule needs an active subscription."
+        >
+          <v-btn
+            color="primary"
+            variant="flat"
+            rounded="lg"
+            :loading="saving"
+            :disabled="isLapsed"
+            @click="submit"
+          >
+            Save Settings
+          </v-btn>
+        </LapsedGate>
       </v-card-actions>
     </v-card>
 
@@ -178,9 +201,14 @@
           prepend-icon=""
           prepend-inner-icon="mdi-file-delimited-outline"
           hide-details="auto"
+          :disabled="isLapsed"
           @update:model-value="importReset()"
         />
+        <p v-if="isLapsed" class="text-caption text-medium-emphasis mt-2">
+          Importing needs an active subscription.
+        </p>
         <AppAlert v-model="importError" class="mt-4" />
+        <AppAlert v-model="importReadOnly" type="info" class="mt-4" />
         <AppAlert v-model="importResult" type="success" class="mt-4">
           Import complete —
           {{ importResult?.created }} added,
@@ -190,17 +218,23 @@
       </v-card-text>
       <v-card-actions class="px-6 pb-6 pt-4">
         <v-spacer />
-        <v-btn
-          color="primary"
-          variant="flat"
-          rounded="lg"
-          prepend-icon="mdi-upload"
-          :loading="importLoading"
-          :disabled="!importFile"
-          @click="runImport"
+        <LapsedGate
+          :locked="isLapsed"
+          label="Upload"
+          reason="Importing needs an active subscription."
         >
-          Upload
-        </v-btn>
+          <v-btn
+            color="primary"
+            variant="flat"
+            rounded="lg"
+            prepend-icon="mdi-upload"
+            :loading="importLoading"
+            :disabled="!importFile || isLapsed"
+            @click="runImport"
+          >
+            Upload
+          </v-btn>
+        </LapsedGate>
       </v-card-actions>
     </v-card>
   </div>
@@ -210,14 +244,18 @@
 import { useSettings, type FragranceConfigInput } from '~/composables/useSettings'
 import { useImport } from '~/composables/useImport'
 import { useExport } from '~/composables/useExport'
-import { useApi, clearTokens } from '~/composables/useApi'
+import { useApi, clearTokens, isSubscriptionRequired } from '~/composables/useApi'
 
 const { config, loading, error, fetchConfig, updateConfig } = useSettings()
 const { api } = useApi()
+const resetSessionState = useSessionReset()
 const saving = ref(false)
 const saved = ref<string | null>(null)
 
-const { loading: importLoading, error: importError, result: importResult, importCollection, reset: importReset } = useImport()
+const { isLapsed } = useSubscription()
+const readOnlyNotice = ref<string | null>(null)
+
+const { loading: importLoading, error: importError, readOnly: importReadOnly, result: importResult, importCollection, reset: importReset } = useImport()
 const importFile = ref<File | null>(null)
 
 const { loading: exportLoading, error: exportError, exportCollection, reset: exportReset } = useExport()
@@ -229,7 +267,7 @@ async function runExport(): Promise<void> {
 
 async function runImport(): Promise<void> {
   const file = importFile.value
-  if (!file) return
+  if (!file || isLapsed.value) return
   await importCollection(file)
   if (importResult.value) importFile.value = null
 }
@@ -266,9 +304,13 @@ onMounted(async () => {
 async function submit() {
   saving.value = true
   saved.value = null
+  readOnlyNotice.value = null
   try {
     await updateConfig({ ...form })
     saved.value = 'Settings saved.'
+  } catch (err: unknown) {
+    if (!isSubscriptionRequired(err)) throw err
+    readOnlyNotice.value = READ_ONLY_WRITE_NOTICE
   } finally {
     saving.value = false
   }
@@ -294,6 +336,7 @@ async function changePassword() {
     passwordSaved.value = 'Password updated. Please sign in again.'
     Object.keys(passwordForm).forEach(k => (passwordForm as any)[k] = '')
     clearTokens()
+    resetSessionState()
     setTimeout(() => navigateTo('/auth/login'), 1500)
   } catch (err: any) {
     const data = err?.data

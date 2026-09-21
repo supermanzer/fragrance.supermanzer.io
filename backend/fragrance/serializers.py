@@ -61,6 +61,14 @@ class FragranceConfigSerializer(serializers.ModelSerializer):
     class Meta:
         model = FragranceConfig
         exclude = ['user']
+        # An out-of-range value would save and then yield an invalid crontab;
+        # django-celery-beat swallows that error, silently losing the run.
+        extra_kwargs = {
+            'run_hour': {'min_value': 0, 'max_value': 23},
+            'run_day_of_week': {'min_value': 0, 'max_value': 6},
+            'run_day_of_month': {'min_value': 1, 'max_value': 31},
+            'run_month': {'min_value': 1, 'max_value': 12},
+        }
 
 
 class FragranceSerializer(serializers.ModelSerializer):

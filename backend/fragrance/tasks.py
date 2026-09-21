@@ -4,7 +4,11 @@ fragrance/tasks.py
 Implements Celery tasks for Fragrance Recommendation Runs
 """
 
+import logging
+from datetime import timedelta
+
 from celery import shared_task
+from celery.exceptions import SoftTimeLimitExceeded
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
@@ -25,7 +29,15 @@ from .ai_providers.registry import (
 from .llm import generate_email_content, generate_preference_profile, select_candidates
 from .models import BetaSignup, Fragrance, FragranceConfig, PreferenceProfile, RecommendationRun, StripeEvent
 from .search import run_discovery_searches, verify_candidates
-from .services import generate_beta_invite_token, generate_recommendation_token
+from .permissions import SubscriptionRequired
+from .services import (
+    QuotaExceeded,
+    RunInProgress,
+    generate_beta_invite_token,
+    IN_FLIGHT_MAX_AGE,
+    generate_recommendation_token,
+    start_recommendation_run,
+)
 
 # The only two event types the endpoint is configured for in the Stripe
 # Dashboard -- kept here, not in views.stripe_webhook, since this is the
@@ -34,6 +46,8 @@ from .services import generate_beta_invite_token, generate_recommendation_token
 # type added there without a matching handler) is a documented no-op, not
 # an error: the StripeEvent row is still marked 'processed'.
 STRIPE_HANDLED_EVENT_TYPES = {"payment_intent.succeeded", "charge.dispute.created"}
+
+logger = logging.getLogger(__name__)
 
 RATING_ACTIONS = ('own', 'like', 'dislike')
 
@@ -208,11 +222,28 @@ def send_recommendation_email(self: 'send_recommendation_email', user_id: int, r
         raise self.retry(exc=exc, countdown=300)
 
 
-@shared_task(bind=True, max_retries=2)
+@shared_task(bind=True, max_retries=2, soft_time_limit=1200, time_limit=1500)
 def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: int | None = None) -> None:
     from .models import Recommendation
     if run_id is None:
-        run = RecommendationRun.objects.create(user_id=user_id, status='running')
+        # Beat path. The API view path arrives with a run_id its own call to
+        # start_recommendation_run already created (and counted); calling the
+        # chokepoint again there would double-count it and trip the in-flight
+        # guard on its own pending run.
+        user = User.objects.filter(pk=user_id).first()
+        if user is None:
+            logger.info("scheduled run skipped: user %s no longer exists", user_id)
+            return
+        try:
+            run = start_recommendation_run(user=user, source='beat')
+        except (SubscriptionRequired, QuotaExceeded, RunInProgress) as refusal:
+            # A lapsed or exhausted user's scheduled run is normal, not an error.
+            logger.info(
+                "scheduled run skipped for user %s: %s", user_id, type(refusal).__name__
+            )
+            return
+        run.status = 'running'
+        run.save(update_fields=['status'])
     else:
         run = RecommendationRun.objects.get(id=run_id)
         run.status = 'running'
@@ -253,6 +284,14 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
         run.email_status = 'pending'
         run.save(update_fields=['status', 'email_status'])
         send_recommendation_email.delay(user_id=user_id, run_id=run.id)
+    except SoftTimeLimitExceeded:
+        # A run that overran its budget is a failure, not a transient error:
+        # retrying would just burn another 20 minutes.
+        run.status = 'failed'
+        run.error_message = STALE_RUN_TIMEOUT_MESSAGE
+        run.save(update_fields=['status', 'error_message'])
+        logger.error("run %s for user %s exceeded its soft time limit", run.id, user_id)
+        return
     except Exception as exc:
         # Config errors fail immediately, on any attempt — retrying can't fix
         # them. Everything else keeps the existing retry-then-fail behavior.
@@ -267,7 +306,33 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
             run.error_message = sanitize_sdk_error_message(exc)
             run.save(update_fields=['status', 'error_message'])
             raise
-        raise self.retry(exc=exc, countdown=300)
+        # Retry against the run we already own: re-entering the beat path would
+        # be refused by the in-flight guard and strand this run as 'running'.
+        raise self.retry(
+            exc=exc,
+            countdown=300,
+            kwargs={'user_id': user_id, 'run_id': run.id},
+        )
+
+
+STALE_RUN_ERROR_MESSAGE = "Run did not finish (worker restarted or timed out)."
+STALE_RUN_TIMEOUT_MESSAGE = "Run took too long and was stopped."
+
+
+@shared_task
+def reap_stale_runs() -> int:
+    """
+    Fails pending/running runs older than IN_FLIGHT_MAX_AGE. An early-ack
+    worker that dies mid-run strands its row; a failed run does not burn
+    quota, so this also releases the allowance the stranded row was holding.
+    """
+    cutoff = timezone.now() - IN_FLIGHT_MAX_AGE
+    reaped = RecommendationRun.objects.filter(
+        status__in=('pending', 'running'), triggered_at__lt=cutoff
+    ).update(status='failed', error_message=STALE_RUN_ERROR_MESSAGE)
+    if reaped:
+        logger.warning("reaped %d stale in-flight run(s)", reaped)
+    return reaped
 
 
 @shared_task(bind=True, max_retries=3)
@@ -310,3 +375,47 @@ def process_stripe_event(self: 'process_stripe_event', stripe_event_id: str) -> 
         if self.request.retries >= self.max_retries:
             raise
         raise self.retry(exc=exc, countdown=300)
+
+
+@shared_task(soft_time_limit=240, time_limit=300)
+def reconcile_stripe_subscriptions() -> dict:
+    """
+    Nightly backstop for lost Stripe webhooks. Runs in celery-worker (public
+    egress); celery-beat only dispatches it.
+    """
+    from .billing import reconcile_subscriptions
+
+    return reconcile_subscriptions(dry_run=False)
+
+
+STRIPE_EVENT_PAYLOAD_RETENTION_DAYS = 90
+
+
+@shared_task
+def flush_expired_jwt_tokens() -> None:
+    """
+    The token_blacklist tables grow ~2.3 kB per refresh and nothing else
+    prunes them; AtomicTokenRefreshView row-locks that table on every refresh.
+    """
+    from django.core.management import call_command
+
+    call_command('flushexpiredtokens')
+
+
+@shared_task
+def prune_stripe_event_payloads() -> int:
+    """
+    Empties StripeEvent.payload after 90 days but keeps the row:
+    stripe_event_id is the replay guard and must outlive Stripe's 3-day retry
+    and 30-day manual-resend windows. The column is a non-null JSONField, so
+    "nulled" means reset to {} (which reconciliation already treats as
+    unreplayable).
+    """
+    cutoff = timezone.now() - timedelta(days=STRIPE_EVENT_PAYLOAD_RETENTION_DAYS)
+    pruned = (
+        StripeEvent.objects.filter(received_at__lt=cutoff)
+        .exclude(payload={})
+        .update(payload={})
+    )
+    logger.info('pruned payload from %d StripeEvent rows older than %d days', pruned, STRIPE_EVENT_PAYLOAD_RETENTION_DAYS)
+    return pruned

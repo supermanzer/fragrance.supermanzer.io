@@ -21,7 +21,7 @@ from .models import (
     StripeEvent,
     Subscription,
 )
-from .services import derive_unique_username
+from .services import default_schedule_for, derive_unique_username
 
 # Register your models here.
 
@@ -125,7 +125,16 @@ class AIModelConfigAdmin(admin.ModelAdmin):
 
 @admin.register(FragranceConfig)
 class FragranceConfigAdmin(admin.ModelAdmin):
-    pass
+    def save_model(self, request, obj, form, change) -> None:
+        # Jitter only on create, and only for schedule fields the admin left
+        # on the form's default -- a value they actually typed is a choice.
+        if not change:
+            day, hour = default_schedule_for(user_id=obj.user_id)
+            if "run_day_of_month" not in form.changed_data:
+                obj.run_day_of_month = day
+            if "run_hour" not in form.changed_data:
+                obj.run_hour = hour
+        super().save_model(request, obj, form, change)
 
 
 @admin.register(Fragrance)

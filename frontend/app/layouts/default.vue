@@ -16,6 +16,9 @@
   </v-app-bar>
 
   <v-main>
+    <v-container class="pt-6 pb-0">
+      <LapsedBanner />
+    </v-container>
     <v-container class="pt-8">
       <slot />
     </v-container>
@@ -25,8 +28,29 @@
 <script setup lang="ts">
 import { clearTokens } from '~/composables/useApi'
 
+const route = useRoute()
+const subscriptionStale = useState<number>('subscription-stale', () => 0)
+const { fetchSubscription, refreshSubscription } = useSubscription()
+const resetSessionState = useSessionReset()
+
+onMounted(fetchSubscription)
+
+// After Stripe redirects back, the layout mounts on /billing/success where the first
+// fetch may pre-date fulfilment; refetch when leaving /billing* so the banner is truthful.
+watch(
+  () => route.path,
+  (next, prev) => {
+    if (prev?.startsWith('/billing') && !next.startsWith('/billing')) refreshSubscription()
+  },
+)
+
+watch(subscriptionStale, () => {
+  refreshSubscription()
+})
+
 async function logout() {
   clearTokens()
+  resetSessionState()
   await navigateTo('/auth/login')
 }
 </script>

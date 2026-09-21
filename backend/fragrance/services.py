@@ -1,16 +1,29 @@
 import csv
 import hashlib
 import hmac
+import logging
+from datetime import datetime, timedelta
 from typing import IO
 
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core import signing
 from django.db import IntegrityError, transaction
+from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework.request import Request
 
-from .models import FRAGRANCE_STATUSES, BetaSignup, Fragrance, Recommendation
+from .models import (
+    FRAGRANCE_STATUSES,
+    BetaSignup,
+    Fragrance,
+    FragranceConfig,
+    Plan,
+    Recommendation,
+    RecommendationRun,
+    Subscription,
+)
+from .permissions import SubscriptionRequired
 
 REQUIRED_COLUMNS = {"fragrance", "status", "house", "notes"}
 
@@ -406,3 +419,192 @@ def resolve_beta_invite_signup(*, token: str) -> BetaSignup:
         raise BetaInviteTokenInvalidError()
 
     return signup
+
+
+logger = logging.getLogger(__name__)
+
+# Terms used when a subscription has no Plan (staff, comped/plan-less rows).
+DEFAULT_QUOTA_PERIOD_DAYS = 30
+DEFAULT_MAX_RUNS_PER_QUOTA_PERIOD = 1
+DEFAULT_FAILED_RUN_GRACE = 1
+
+# A failed run does not burn the allowance; everything else that was
+# dispatched does.
+_QUOTA_CONSUMING_STATUSES = ("pending", "running", "done")
+_IN_FLIGHT_STATUSES = ("pending", "running")
+
+# A pending/running row older than this is presumed stranded (worker OOM,
+# SIGKILL, container recreate) and no longer blocks a new trigger; the
+# reap_stale_runs task marks it failed. Comfortably above the task's worst
+# case: 3 attempts x 1500s hard limit + 2 x 300s retry backoff.
+IN_FLIGHT_MAX_AGE = timedelta(hours=2)
+
+
+class QuotaExceeded(Exception):
+    def __init__(self, *, next_eligible_at: datetime | None) -> None:
+        super().__init__("Run quota exhausted for this period.")
+        self.next_eligible_at = next_eligible_at
+
+
+class RunInProgress(Exception):
+    pass
+
+
+def in_flight_runs(*, user: User, now: datetime):
+    """Sole definition of "a run is in flight", shared by every guard so they cannot drift."""
+    return RecommendationRun.objects.filter(
+        user=user,
+        status__in=_IN_FLIGHT_STATUSES,
+        triggered_at__gte=now - IN_FLIGHT_MAX_AGE,
+    )
+
+
+def _is_staff(*, user: User) -> bool:
+    return bool(user.is_staff or user.is_superuser)
+
+
+def _quota_terms(*, plan: Plan | None) -> tuple[timedelta, int, int]:
+    """Reads quota_period_days, never billing_interval -- an annual plan must not allow twelve runs on day one."""
+    if plan is None:
+        return (
+            timedelta(days=DEFAULT_QUOTA_PERIOD_DAYS),
+            DEFAULT_MAX_RUNS_PER_QUOTA_PERIOD,
+            DEFAULT_FAILED_RUN_GRACE,
+        )
+    return (
+        timedelta(days=plan.quota_period_days),
+        plan.max_runs_per_quota_period,
+        plan.failed_run_grace,
+    )
+
+
+def _evaluate_quota(
+    *, user: User, plan: Plan | None, now: datetime
+) -> tuple[int, bool, datetime | None]:
+    """
+    Returns (consumed, blocked, next_eligible_at) for the rolling window.
+
+    consumed = pending/running/done runs in the window; blocked once that
+    reaches max_runs, or once *all* dispatched runs (failures included) reach
+    max_runs + failed_run_grace -- so one failure earns one retry and two
+    stop it. next_eligible_at is when enough of the oldest relevant runs
+    have left the window to drop back under the limit; None if not blocked
+    (or if a zero allowance means it never will be).
+    """
+    period, max_runs, grace = _quota_terms(plan=plan)
+    windowed = list(
+        RecommendationRun.objects.filter(
+            user=user, triggered_at__gte=now - period
+        )
+        .order_by("triggered_at")
+        .values_list("triggered_at", "status")
+    )
+    counted = [at for at, run_status in windowed if run_status in _QUOTA_CONSUMING_STATUSES]
+    consumed = len(counted)
+
+    frees_at: list[datetime] = []
+    blocked = False
+    if consumed >= max_runs:
+        blocked = True
+        if consumed - max_runs < consumed:
+            frees_at.append(counted[consumed - max_runs] + period)
+    dispatch_limit = max_runs + grace
+    if len(windowed) >= dispatch_limit:
+        blocked = True
+        if len(windowed) - dispatch_limit < len(windowed):
+            frees_at.append(windowed[len(windowed) - dispatch_limit][0] + period)
+    return consumed, blocked, (max(frees_at) if frees_at else None)
+
+
+def _check_can_start(
+    *,
+    user: User,
+    subscription: Subscription | None,
+    now: datetime,
+    quota: tuple[int, bool, datetime | None] | None = None,
+) -> tuple[Exception | None, datetime | None]:
+    """
+    The single rule set behind both start_recommendation_run (which calls it
+    under the row lock) and quota_snapshot (read-only, no lock), so the two
+    cannot drift. Returns (refusal or None, next_eligible_at). Creates nothing.
+    """
+    staff = _is_staff(user=user)
+    if not (staff or (subscription is not None and subscription.has_active_access)):
+        return SubscriptionRequired(), None
+    if in_flight_runs(user=user, now=now).exists():
+        return RunInProgress(), None
+    if staff:
+        return None, None
+    if quota is None:
+        quota = _evaluate_quota(user=user, plan=subscription.plan, now=now)
+    _, blocked, next_eligible_at = quota
+    if blocked:
+        return QuotaExceeded(next_eligible_at=next_eligible_at), next_eligible_at
+    return None, None
+
+
+def quota_snapshot(*, user: User, subscription: Subscription | None) -> dict:
+    """Frontend-facing quota state. Read-only: no writes, no locks."""
+    now = timezone.now()
+    staff = _is_staff(user=user)
+    plan = subscription.plan if subscription else None
+    _, max_runs, _ = _quota_terms(plan=plan)
+    has_access = staff or bool(subscription and subscription.has_active_access)
+    consumed, blocked, quota_next = _evaluate_quota(user=user, plan=plan, now=now)
+    refusal, next_eligible_at = _check_can_start(
+        user=user, subscription=subscription, now=now, quota=(consumed, blocked, quota_next)
+    )
+    if isinstance(refusal, RunInProgress):
+        # A run in flight hides the quota verdict; still report when a quota block lifts.
+        next_eligible_at = None if (staff or not blocked) else quota_next
+    return {
+        # None means unlimited (exempt staff); 0 means lapsed.
+        "runs_allowed": None if staff else (max_runs if has_access else 0),
+        "runs_used": consumed,
+        "next_eligible_at": next_eligible_at,
+        "can_trigger": refusal is None,
+    }
+
+
+def start_recommendation_run(*, user: User, source: str) -> RecommendationRun:
+    """
+    The single chokepoint both trigger paths (the API view and the beat task)
+    go through. Serialised per user by a row lock on their Subscription, which
+    get_or_create guarantees exists first -- select_for_update on a missing
+    row would lock nothing. The OneToOne unique constraint makes concurrent
+    creation safe. Raises SubscriptionRequired, RunInProgress or QuotaExceeded;
+    otherwise returns a new 'pending' run created inside the lock.
+    """
+    with transaction.atomic():
+        subscription, _ = Subscription.objects.get_or_create(user=user)
+        subscription = Subscription.objects.select_for_update().get(pk=subscription.pk)
+        refusal, _ = _check_can_start(
+            user=user, subscription=subscription, now=timezone.now()
+        )
+        if refusal is not None:
+            raise refusal
+        run = RecommendationRun.objects.create(user=user, status="pending")
+    logger.info("started recommendation run %s for user %s (source=%s)", run.id, user.id, source)
+    return run
+
+
+def default_schedule_for(*, user_id: int) -> tuple[int, int]:
+    """
+    Stable, evenly-spread (day_of_month, hour) derived from the user id: 672
+    slots. Day is 1-28 only -- 29-31 would silently skip short months.
+    Deterministic, so a user always lands in the same slot.
+    """
+    return (user_id % 28) + 1, (user_id // 28) % 24
+
+
+def get_or_create_fragrance_config(*, user: User) -> FragranceConfig:
+    """
+    The one place a FragranceConfig is first created with a jittered schedule.
+    Applied only at creation via `defaults` -- get_or_create never overwrites
+    an existing row, so a user's own choice is never touched.
+    """
+    day, hour = default_schedule_for(user_id=user.pk)
+    config, _ = FragranceConfig.objects.get_or_create(
+        user=user, defaults={"run_day_of_month": day, "run_hour": hour}
+    )
+    return config

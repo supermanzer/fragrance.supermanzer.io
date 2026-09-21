@@ -30,6 +30,7 @@ let inflight: Promise<void> | null = null
 export function useAuthStatus() {
   const config = useRuntimeConfig()
   const { refreshTokens } = useApi()
+  const resetSessionState = useSessionReset()
 
   // The verify endpoint only documents 200 (valid) and 401 (invalid/expired)
   // responses. A 401 is a confirmed-invalid access token, worth falling
@@ -76,6 +77,7 @@ export function useAuthStatus() {
       authStatus.value = 'authenticated'
     } else if (refreshResult === 'invalid') {
       clearTokens()
+      resetSessionState()
       authStatus.value = 'unauthenticated'
     }
     // refreshResult === 'indeterminate': same reasoning as above — leave

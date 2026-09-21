@@ -76,6 +76,7 @@ const STILL_PROCESSING_THRESHOLD = 4
 
 const route = useRoute()
 const { fetchSession } = useBilling()
+const { refreshSubscription } = useSubscription()
 
 const sessionId = computed(() => {
   const raw = route.query.session_id
@@ -91,6 +92,12 @@ const pollTimer = ref<ReturnType<typeof setTimeout> | null>(null)
 const sessionNotFound = computed(() => !sessionId.value || notFoundError.value)
 const resolved = computed(() => status.value === 'active')
 const revoked = computed(() => status.value === 'revoked')
+
+// Once fulfilment is confirmed, refresh the shared state so the layout banner is truthful
+// by the time the user leaves this page.
+watch(resolved, (isResolved) => {
+  if (isResolved) refreshSubscription()
+})
 const confirming = computed(
   () =>
     !sessionNotFound.value &&

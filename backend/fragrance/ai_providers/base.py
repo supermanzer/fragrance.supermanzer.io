@@ -52,6 +52,8 @@ def sanitize_sdk_error_message(exc: Exception) -> str:
             "The configured AI provider rejected the request (authentication "
             "or API error). Check the active family's API key and try again."
         )
+    if isinstance(exc, stripe.APIConnectionError):
+        return "Could not reach Stripe. Try again shortly."
     if isinstance(exc, stripe.StripeError):
         return "Stripe rejected the request. Check the Stripe configuration and try again."
     return str(exc)

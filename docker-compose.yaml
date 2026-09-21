@@ -88,6 +88,11 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     command: /app/.venv/bin/python -m celery -A config worker -l info --concurrency 1
+    # Compose's default stop grace is 10s. A recommendation run takes minutes, and the worker acks
+    # early (task_acks_late is off), so a recreate that SIGKILLs it mid-run loses the task AND strands
+    # its RecommendationRun row in `running`. 120s lets a short run finish on SIGTERM (warm shutdown).
+    # A stranded row is also bounded by the in-flight age limit and the `reap_stale_runs` task.
+    stop_grace_period: 120s
     env_file: backend/.env
     environment:
       - REDIS_PASSWORD=${REDIS_PASSWORD}

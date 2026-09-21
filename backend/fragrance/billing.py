@@ -29,6 +29,7 @@ just entered from the invoice side rather than through a PaymentIntent.
 """
 
 import logging
+import time
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
 from typing import Any
@@ -40,7 +41,8 @@ from django.core.exceptions import ImproperlyConfigured
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from .models import BetaSignup, Plan, ProcessedPayment, Subscription
+from .ai_providers.base import sanitize_sdk_error_message
+from .models import BetaSignup, Plan, ProcessedPayment, StripeEvent, Subscription
 
 logger = logging.getLogger(__name__)
 
@@ -118,12 +120,17 @@ def subscription_status_payload(*, subscription: Subscription) -> dict:
     quietly drift into two different shapes for the same underlying state.
     fulfill_checkout_session adds its own "granted" key on top of this.
     """
+    from .services import quota_snapshot
+
     plan = subscription.plan
+    exempt = bool(subscription.user.is_staff or subscription.user.is_superuser)
     return {
         "status": subscription.status,
         "plan": {"slug": plan.slug, "name": plan.name} if plan else None,
         "access_expires_at": subscription.access_expires_at,
-        "has_active_access": subscription.has_active_access,
+        "has_active_access": exempt or subscription.has_active_access,
+        "exempt": exempt,
+        "quota": quota_snapshot(user=subscription.user, subscription=subscription),
     }
 
 
@@ -282,6 +289,7 @@ def _grant_period_for_invoice(
     invoice: Any,
     expected_customer_id: str | None = None,
     payment_intent_id: str = "",
+    allow_revoked: bool = True,
 ) -> bool:
     """
     Steps 5-10 of the payment_intent.succeeded validation chain -- shared by
@@ -296,6 +304,11 @@ def _grant_period_for_invoice(
     so every entry path, present or future, inherits the payment check. A
     subscription whose first payment fails leaves an "open" invoice with
     amount_remaining > 0 attached to the Checkout Session.
+
+    allow_revoked defaults True: the webhook and success-page paths must let a
+    revoked customer subscribe again. Background reconciliation passes False,
+    and the check is made under the row lock so a dispute revoke landing
+    mid-loop cannot be overwritten.
     """
     if (
         getattr(invoice, "status", None) != "paid"
@@ -384,6 +397,13 @@ def _grant_period_for_invoice(
         locked = Subscription.objects.select_for_update().get(
             pk=local_subscription.pk
         )
+        if locked.status == "revoked" and not allow_revoked:
+            logger.warning(
+                "stripe invoice %s for revoked subscription %s; not re-granting",
+                invoice.id,
+                locked.pk,
+            )
+            return False
         new_expiry = _access_expires_at_for(
             line=line, plan=plan, current_expiry=locked.access_expires_at
         )
@@ -426,6 +446,51 @@ def _grant_period_for_invoice(
             ]
         )
     return True
+
+
+class ComplimentaryGrantError(Exception):
+    pass
+
+
+def grant_complimentary_access(*, user: User, days: int, reason: str) -> Subscription:
+    """
+    Explicit operator grant of access with no payment behind it -- the only
+    non-Stripe writer of access_expires_at, kept here beside
+    _grant_period_for_invoice so "access is only written in billing.py"
+    stays checkable by grep. Never called automatically; only the
+    grant_access management command reaches it. Extends from the later of
+    now and the current expiry (so it never shortens paid time), under the
+    same Subscription row lock the payment path uses. Refuses a `revoked`
+    subscription: a dispute revocation should not be silently undone by a
+    comp.
+    """
+    if days <= 0:
+        raise ComplimentaryGrantError("days must be a positive integer.")
+    if not reason.strip():
+        raise ComplimentaryGrantError("A reason is required.")
+    with transaction.atomic():
+        Subscription.objects.get_or_create(user=user)
+        locked = Subscription.objects.select_for_update().get(user=user)
+        if locked.status == "revoked":
+            raise ComplimentaryGrantError(
+                f"Subscription for {user.username} is revoked (dispute); resolve that first."
+            )
+        now = timezone.now()
+        previous_expiry = locked.access_expires_at
+        base = max(now, previous_expiry) if previous_expiry else now
+        locked.access_expires_at = base + timedelta(days=days)
+        locked.status = "active"
+        locked.save(update_fields=["access_expires_at", "status"])
+    logger.warning(
+        "COMPLIMENTARY ACCESS granted to user %s (%s) for %s days, until %s (was %s). Reason: %s",
+        user.pk,
+        user.username,
+        days,
+        locked.access_expires_at.isoformat(),
+        previous_expiry.isoformat() if previous_expiry else None,
+        reason,
+    )
+    return locked
 
 
 def fulfill_payment_intent(*, payment_intent_id: str) -> int:
@@ -565,6 +630,197 @@ def fulfill_checkout_session(*, session_id: str, user: User) -> dict:
         **subscription_status_payload(subscription=subscription),
         "granted": granted,
     }
+
+
+RECONCILE_MAX_CANDIDATES = 200
+# Far longer than Stripe's 3-day smart-retry window and tolerant of six missed
+# nightly runs; --days widens it for a manual sweep.
+RECONCILE_INVOICE_LOOKBACK = timedelta(days=7)
+RECONCILE_INVOICE_PAGE_SIZE = 100
+# Sanity ceiling on invoices walked per run; hitting it means the lookback or
+# the account has outgrown the nightly sweep and someone should look.
+RECONCILE_MAX_INVOICES = 5000
+# Wall-clock budget, below the task's soft_time_limit (240s) so the loop stops
+# itself cleanly before Celery does.
+RECONCILE_TIME_BUDGET_SECONDS = 200.0
+STUCK_EVENT_MIN_AGE = timedelta(minutes=10)
+STUCK_EVENT_MAX_AGE = timedelta(days=3)
+
+
+def _invoice_customer_id(*, invoice: Any) -> str:
+    customer = getattr(invoice, "customer", None)
+    if isinstance(customer, str):
+        return customer
+    return getattr(customer, "id", "") or ""
+
+
+def reconcile_subscriptions(
+    *,
+    dry_run: bool = False,
+    lookback: timedelta = RECONCILE_INVOICE_LOOKBACK,
+    time_budget_seconds: float = RECONCILE_TIME_BUDGET_SECONDS,
+) -> dict:
+    """
+    Backstop for a lost webhook, the only recovery once Stripe's retry window
+    has passed. Walks ONE account-wide, paginated list of recently PAID
+    invoices, keeps those whose customer maps to a known, non-revoked local
+    Subscription, skips any already in ProcessedPayment, and feeds the rest
+    through _grant_period_for_invoice -- the single grant path -- so a re-run
+    cannot double-grant. Cost is one Stripe call per 100 invoices regardless
+    of how many subscribers are abandoned or idle. Bounded by a wall-clock
+    budget and an invoice-count sanity cap. In dry_run mode nothing is
+    written or enqueued: an invoice counts as would_grant when it is paid,
+    fully settled and has no ProcessedPayment yet (the remaining guards --
+    price, parent, approval -- are only evaluated by a real run). Also
+    re-enqueues stuck StripeEvent rows. Returns a summary dict.
+    """
+    summary = {
+        "invoices_seen": 0,
+        "invoices_matched": 0,
+        "grants": 0,
+        "would_grant": 0,
+        "already_applied": 0,
+        "rejected": 0,
+        "errors": 0,
+        "events_requeued": 0,
+        "events_skipped_no_payload": 0,
+        "capped": False,
+        "deadline_exceeded": False,
+        "skipped": False,
+        "dry_run": dry_run,
+    }
+    if not settings.STRIPE_SECRET_KEY:
+        logger.warning("reconcile_subscriptions: STRIPE_SECRET_KEY is not set; nothing to do")
+        summary["skipped"] = True
+        return summary
+    _configure_stripe()
+
+    now = timezone.now()
+    deadline = time.monotonic() + time_budget_seconds
+    known_customers = set(
+        Subscription.objects.exclude(status="revoked")
+        .exclude(stripe_customer_id__isnull=True)
+        .exclude(stripe_customer_id="")
+        .values_list("stripe_customer_id", flat=True)
+    )
+    pending = 0
+
+    try:
+        invoices = stripe.Invoice.list(
+            status="paid",
+            created={"gte": int((now - lookback).timestamp())},
+            limit=RECONCILE_INVOICE_PAGE_SIZE,
+        ).auto_paging_iter()
+        for invoice in invoices:
+            if time.monotonic() >= deadline:
+                summary["deadline_exceeded"] = True
+                logger.error(
+                    "reconcile: %.0fs budget exhausted after %d invoices; stopping",
+                    time_budget_seconds,
+                    summary["invoices_seen"],
+                )
+                break
+            if summary["invoices_seen"] >= RECONCILE_MAX_INVOICES:
+                summary["capped"] = True
+                logger.warning(
+                    "reconcile: hit the %d-invoice sanity cap; remaining invoices not examined",
+                    RECONCILE_MAX_INVOICES,
+                )
+                break
+            summary["invoices_seen"] += 1
+            customer_id = _invoice_customer_id(invoice=invoice)
+            if customer_id not in known_customers:
+                continue
+            summary["invoices_matched"] += 1
+            try:
+                if ProcessedPayment.objects.filter(stripe_invoice_id=invoice.id).exists():
+                    summary["already_applied"] += 1
+                    continue
+                pending += 1
+                if dry_run:
+                    if (
+                        getattr(invoice, "status", None) == "paid"
+                        and getattr(invoice, "amount_remaining", None) == 0
+                    ):
+                        summary["would_grant"] += 1
+                        logger.info(
+                            "reconcile dry-run: would grant invoice %s for customer %s",
+                            invoice.id,
+                            customer_id,
+                        )
+                    else:
+                        summary["rejected"] += 1
+                    continue
+                if _grant_period_for_invoice(
+                    invoice=invoice, expected_customer_id=customer_id, allow_revoked=False
+                ):
+                    summary["grants"] += 1
+                    logger.warning(
+                        "reconcile: granted missed period for customer %s from invoice %s",
+                        customer_id,
+                        invoice.id,
+                    )
+                else:
+                    summary["rejected"] += 1
+            except Exception as exc:
+                summary["errors"] += 1
+                logger.error(
+                    "reconcile: invoice %s failed: %s",
+                    getattr(invoice, "id", "?"),
+                    sanitize_sdk_error_message(exc),
+                )
+    except Exception as exc:
+        summary["errors"] += 1
+        logger.error("reconcile: listing invoices failed: %s", sanitize_sdk_error_message(exc))
+
+    if not dry_run and summary["errors"] and not summary["grants"] and pending:
+        logger.error(
+            "reconcile: %d error(s) and NO grants while %d paid invoice(s) were pending; "
+            "paying customers may still lack access",
+            summary["errors"],
+            pending,
+        )
+
+    _requeue_stuck_events(summary=summary, now=now, dry_run=dry_run)
+
+    logger.info(
+        "reconcile summary: invoices_seen=%d matched=%d grants=%d would_grant=%d "
+        "already_applied=%d rejected=%d errors=%d events_requeued=%d capped=%s "
+        "deadline_exceeded=%s dry_run=%s",
+        summary["invoices_seen"],
+        summary["invoices_matched"],
+        summary["grants"],
+        summary["would_grant"],
+        summary["already_applied"],
+        summary["rejected"],
+        summary["errors"],
+        summary["events_requeued"],
+        summary["capped"],
+        summary["deadline_exceeded"],
+        dry_run,
+    )
+    return summary
+
+
+def _requeue_stuck_events(*, summary: dict, now: datetime, dry_run: bool) -> None:
+    from .tasks import process_stripe_event
+
+    stuck = StripeEvent.objects.filter(
+        status__in=["received", "failed"],
+        received_at__lte=now - STUCK_EVENT_MIN_AGE,
+        received_at__gte=now - STUCK_EVENT_MAX_AGE,
+    ).order_by("pk")[:RECONCILE_MAX_CANDIDATES]
+    for event in stuck:
+        if not event.payload:
+            summary["events_skipped_no_payload"] += 1
+            logger.warning(
+                "reconcile: stuck StripeEvent %s has no payload; cannot replay",
+                event.stripe_event_id,
+            )
+            continue
+        if not dry_run:
+            process_stripe_event.delay(stripe_event_id=event.stripe_event_id)
+        summary["events_requeued"] += 1
 
 
 def revoke_for_dispute(*, dispute: dict) -> None:

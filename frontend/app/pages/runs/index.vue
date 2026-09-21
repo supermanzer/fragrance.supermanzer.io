@@ -1,33 +1,49 @@
 <template>
   <div class="pt-8">
-    <div class="d-flex align-start justify-space-between mb-8">
+    <div class="d-flex flex-column flex-sm-row align-sm-start justify-space-between ga-4 mb-8">
       <div class="d-flex flex-column">
         <h1 class="text-h3 mb-1">Runs</h1>
         <p class="text-body-2 text-medium-emphasis mb-0">Monthly AI-curated fragrance picks</p>
       </div>
 
-      <!-- Wrap the disabled button in a span so the tooltip's pointer events
-           still fire when the button itself suppresses them via :disabled. -->
-      <VTooltip
-        location="bottom"
-        text="A run is already in progress"
-        :disabled="!hasActiveRun"
-      >
-        <template #activator="{ props: tooltipProps }">
-          <span v-bind="tooltipProps" class="d-inline-block">
-            <VBtn
-              color="primary"
-              variant="flat"
-              rounded="lg"
-              :disabled="hasActiveRun"
-              :loading="triggering"
-              @click="trigger"
-            >
-              Trigger Run
-            </VBtn>
-          </span>
-        </template>
-      </VTooltip>
+      <div class="d-flex flex-column align-start align-sm-end">
+        <LapsedGate
+          :locked="!available"
+          label="Trigger Run"
+          :reason="triggerReason"
+        >
+          <VBtn
+            color="primary"
+            variant="flat"
+            rounded="lg"
+            :disabled="!available"
+            :loading="triggering"
+            @click="trigger"
+          >
+            Trigger Run
+          </VBtn>
+        </LapsedGate>
+
+        <div class="mt-2 text-sm-right" style="max-width: 280px">
+          <VFadeTransition mode="out-in">
+            <VSkeletonLoader
+              v-if="quotaLoading"
+              key="quota-skeleton"
+              type="text"
+              width="180"
+            />
+            <div v-else-if="quotaCaption" :key="quotaCaption.key">
+              <p class="text-caption text-medium-emphasis mb-0">{{ quotaCaption.text }}</p>
+              <p
+                v-if="quotaCaption.key === 'quota-available' && lastRunFailed"
+                class="text-caption text-medium-emphasis mb-0 mt-1"
+              >
+                Your last run didn't finish, so it wasn't counted.
+              </p>
+            </div>
+          </VFadeTransition>
+        </div>
+      </div>
     </div>
 
     <VFadeTransition mode="out-in">
@@ -68,18 +84,42 @@
           class="text-medium-emphasis mb-4"
         />
         <p class="text-body-1 text-medium-emphasis">No runs yet.</p>
+        <template v-if="isLapsed">
+          <p class="text-body-2 text-medium-emphasis mt-1">
+            Recommendations arrive by email once you have an active subscription.
+          </p>
+          <VBtn
+            color="primary"
+            variant="flat"
+            rounded="lg"
+            class="mt-6"
+            to="/billing"
+          >
+            View plans
+          </VBtn>
+        </template>
+        <template v-else>
         <p class="text-body-2 text-medium-emphasis mt-1">
           Trigger a run to generate your first five fragrance picks, curated from your collection.
         </p>
-        <VBtn
-          color="primary"
-          variant="flat"
-          rounded="lg"
-          class="mt-6"
-          @click="trigger"
+        <LapsedGate
+          :locked="!available"
+          label="Trigger your first run"
+          :reason="triggerReason"
         >
-          Trigger your first run
-        </VBtn>
+          <VBtn
+            color="primary"
+            variant="flat"
+            rounded="lg"
+            class="mt-6"
+            :disabled="!available"
+            :loading="triggering"
+            @click="trigger"
+          >
+            Trigger your first run
+          </VBtn>
+        </LapsedGate>
+        </template>
       </div>
 
       <VExpansionPanels
@@ -209,16 +249,24 @@
               >
                 {{ run.email_status === 'failed' ? 'Email delivery failed.' : 'Email not yet sent.' }}
                 <template #append>
-                  <VBtn
-                    color="warning"
-                    variant="flat"
-                    size="small"
-                    rounded="lg"
-                    :loading="resending.has(run.id)"
-                    @click="handleResend(run.id)"
+                  <LapsedGate
+                    :locked="isLapsed"
+                    label="Resend"
+                    reason="Resending needs an active subscription."
+                    location="top"
                   >
-                    Resend
-                  </VBtn>
+                    <VBtn
+                      color="warning"
+                      variant="flat"
+                      size="small"
+                      rounded="lg"
+                      :loading="resending.has(run.id)"
+                      :disabled="isLapsed"
+                      @click="handleResend(run.id)"
+                    >
+                      Resend
+                    </VBtn>
+                  </LapsedGate>
                 </template>
               </VAlert>
 
@@ -356,6 +404,7 @@
 
 <script setup lang="ts">
 import { useRuns, type Recommendation } from '~/composables/useRuns'
+import { isSubscriptionRequired } from '~/composables/useApi'
 import { ratingLabel, ratingIcon, statusColor, type RatingAction } from '~/utils/rating'
 
 const {
@@ -371,6 +420,86 @@ const {
   resendEmail,
   rateRecommendation,
 } = useRuns()
+const {
+  subscription,
+  loading: subscriptionLoading,
+  isLapsed,
+  quota,
+  unlimited,
+  fetchSubscription,
+  refreshSubscription,
+} = useSubscription()
+
+// Bridge holding next_eligible_at from a 429 quota_exceeded until the refetch lands.
+const blockedUntil = ref<string | null>(null)
+watch(subscriptionLoading, (isLoading) => {
+  if (!isLoading) blockedUntil.value = null
+})
+
+const inProgress = computed(
+  () => !isLapsed.value && (hasActiveRun.value || (unlimited.value && quota.value?.can_trigger === false)),
+)
+const quotaUsed = computed(
+  () =>
+    !isLapsed.value
+    && !inProgress.value
+    && !unlimited.value
+    && (quota.value?.can_trigger === false || blockedUntil.value !== null),
+)
+const available = computed(() => !isLapsed.value && !inProgress.value && !quotaUsed.value)
+
+// A 429 is fresher than a cached page, so blockedUntil wins only when it is later.
+const nextEligibleAt = computed<string | null>(() => {
+  const fromQuota = quota.value?.next_eligible_at ?? null
+  const fromBridge = blockedUntil.value
+  if (fromQuota && fromBridge) return new Date(fromBridge) > new Date(fromQuota) ? fromBridge : fromQuota
+  return fromQuota ?? fromBridge
+})
+const nextRunDate = computed(() => (nextEligibleAt.value ? formatNextRunDate(nextEligibleAt.value) : null))
+
+const triggerReason = computed(() => {
+  if (isLapsed.value) return 'Running needs an active subscription.'
+  if (inProgress.value) return 'A run is already in progress'
+  return nextRunDate.value
+    ? `Your next run is available on ${nextRunDate.value}.`
+    : 'Your next run will be available when this period ends.'
+})
+
+const quotaLoading = computed(() => subscriptionLoading.value && !subscription.value)
+
+const lastRunFailed = computed(() => {
+  let newest: (typeof runs.value)[number] | null = null
+  for (const run of runs.value) {
+    if (!newest || new Date(run.triggered_at) > new Date(newest.triggered_at)) newest = run
+  }
+  return newest?.status === 'failed'
+})
+
+const quotaCaption = computed<{ key: string; text: string } | null>(() => {
+  const q = quota.value
+  // No caption for lapsed, exempt (unlimited), or unknown quota; also never
+  // interpolate "{used} of {allowed}" while runs_allowed is null.
+  if (isLapsed.value || unlimited.value || q === null || q.runs_allowed === null) return null
+  const noun = q.runs_allowed === 1 ? 'run' : 'runs'
+  const usage = `${q.runs_used} of ${q.runs_allowed} ${noun} used this period`
+  if (quotaUsed.value) {
+    if (q.can_trigger === false && q.runs_used < q.runs_allowed) {
+      return {
+        key: 'quota-blocked',
+        text: nextRunDate.value
+          ? `Two recent runs didn't finish. Your next run is available on ${nextRunDate.value}.`
+          : "Two recent runs didn't finish. Runs will be available again soon.",
+      }
+    }
+    return {
+      key: 'quota-used',
+      text: nextRunDate.value
+        ? `${usage}. Your next run is available on ${nextRunDate.value}.`
+        : `${usage}. Your next run will be available when this period ends.`,
+    }
+  }
+  return { key: available.value ? 'quota-available' : 'quota-in-progress', text: usage }
+})
 
 const openPanels = ref<number[]>([0])
 const openRationales = ref<Set<number>>(new Set())
@@ -395,21 +524,44 @@ function toggleRationale(id: number): void {
 }
 
 async function trigger(): Promise<void> {
+  if (!available.value) return
   try {
     await triggerRun()
     snackbar.value = { message: 'Run triggered', color: 'success' }
-    await fetchRuns()
-  } catch {
-    snackbar.value = { message: 'Failed to start run.', color: 'error' }
+    await Promise.all([fetchRuns(), refreshSubscription()])
+  } catch (err: unknown) {
+    const e = err as { status?: number; data?: { code?: string; next_eligible_at?: string | null } }
+    if (e?.status === 429 && e.data?.code === 'quota_exceeded') {
+      blockedUntil.value = e.data.next_eligible_at ?? null
+      const date = blockedUntil.value ? formatNextRunDate(blockedUntil.value) : null
+      snackbar.value = {
+        message: date ? `Your next run is available on ${date}.` : "You've already used this period's run.",
+        color: 'info',
+      }
+      await refreshSubscription()
+    } else if (e?.status === 429 && e.data?.code === 'run_in_progress') {
+      snackbar.value = { message: 'A run is already in progress.', color: 'info' }
+      await fetchRuns(true)
+    } else if (isSubscriptionRequired(err)) {
+      snackbar.value = {
+        message: "Your account is read-only right now, so a run can't be started.",
+        color: 'info',
+      }
+    } else {
+      snackbar.value = { message: 'Failed to start run.', color: 'error' }
+    }
   }
 }
 
 async function handleResend(runId: number): Promise<void> {
+  if (isLapsed.value) return
   try {
     await resendEmail(runId)
     snackbar.value = { message: 'Email resend queued', color: 'success' }
-  } catch {
-    snackbar.value = { message: 'Failed to resend email', color: 'error' }
+  } catch (err: unknown) {
+    snackbar.value = isSubscriptionRequired(err)
+      ? { message: "Your account is read-only right now, so the email can't be resent.", color: 'info' }
+      : { message: 'Failed to resend email', color: 'error' }
   }
 }
 

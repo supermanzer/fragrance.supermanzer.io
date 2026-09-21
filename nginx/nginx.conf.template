@@ -185,11 +185,13 @@ http {
         #
         # FAIL-CLOSED by design. Stripe gives seven days' notice before changing these addresses
         # via https://groups.google.com/a/lists.stripe.com/g/api-announce — subscribe to it. If
-        # the list changes unnoticed, webhooks 403 silently. Stripe's 72-hour retry window is
-        # currently the ONLY thing bounding the damage: the reconciliation task that is meant to
-        # re-fetch subscription state independently of webhooks is slice 3 and does not exist yet.
-        # Until it does, a delivery outage lasting longer than 72 hours is unrecoverable without
-        # manual intervention, and a lost grant means a paying customer silently loses access.
+        # the list changes unnoticed, webhooks 403 silently. Two things bound the damage: Stripe's
+        # 72-hour retry window, and the nightly `reconcile_stripe_subscriptions` task (03:17 UTC,
+        # fragrance/billing.py) which lists each candidate customer's PAID invoices from the last
+        # 60 days and applies any missed one through the same grant function the webhook uses
+        # (idempotent via ProcessedPayment). It only considers `checkout_started` subscriptions and
+        # `active` ones within ~14 days past expiry, and it never touches `revoked` ones, so an
+        # outage that outlives BOTH windows still needs `manage.py reconcile_stripe` by hand.
         #
         # The allowlist decides what REACHES Django. Signature verification decides what is
         # TRUSTED. Neither substitutes for the other.

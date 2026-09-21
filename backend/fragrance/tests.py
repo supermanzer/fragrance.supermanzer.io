@@ -74,13 +74,20 @@ from .models import (
 )
 from .services import (
     BETA_INVITE_MAX_AGE,
+    QuotaExceeded,
+    RunInProgress,
+    default_schedule_for,
+    start_recommendation_run,
     derive_unique_username,
     generate_beta_invite_token,
     generate_recommendation_token,
     normalize_email,
+    quota_snapshot,
     verify_beta_invite_token,
 )
 from .billing import (
+    ComplimentaryGrantError,
+    grant_complimentary_access,
     SessionNotFoundError,
     SessionOwnershipError,
     fulfill_checkout_session,
@@ -95,6 +102,18 @@ from .tasks import (
     send_password_reset_email,
 )
 from .views import BetaSignupThrottle, FailOpenScopedRateThrottle
+
+def active_subscription_for(
+    user: User, *, plan: Plan | None = None, days: int = 30
+) -> Subscription:
+    """Give a test user an active, unexpired subscription (the reusable factory)."""
+    subscription, _ = Subscription.objects.get_or_create(user=user)
+    subscription.plan = plan
+    subscription.status = "active"
+    subscription.access_expires_at = timezone.now() + timedelta(days=days)
+    subscription.save()
+    return subscription
+
 
 # Migration module filenames start with digits, which aren't valid dotted-
 # import identifiers — importlib is how Django's own migration loader
@@ -1152,6 +1171,7 @@ class MonthlyFragranceRunTests(TestCase):
         # from an empty table.
         AIModelConfig.objects.all().delete()
         self.user = User.objects.create_user(username="dave", password="hal-9000")
+        active_subscription_for(self.user)
         FragranceConfig.objects.create(
             user=self.user, recipient_email="dave@example.com"
         )
@@ -3707,15 +3727,62 @@ class BillingSubscriptionViewTests(TestCase):
         response = APIClient().get(self.url)
         self.assertEqual(response.status_code, 401)
 
-    def test_no_subscription_row_yet_returns_none_status_and_creates_one(self) -> None:
+    def test_no_subscription_row_yet_returns_none_status_and_writes_nothing(self) -> None:
         self.assertFalse(Subscription.objects.filter(user=self.user).exists())
         response = self.client.get(self.url)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             response.json(),
-            {"status": "none", "plan": None, "access_expires_at": None, "has_active_access": False},
+            {
+                "status": "none",
+                "plan": None,
+                "access_expires_at": None,
+                "has_active_access": False,
+                "exempt": False,
+                "quota": {"runs_allowed": 0, "runs_used": 0, "next_eligible_at": None, "can_trigger": False},
+            },
         )
-        self.assertTrue(Subscription.objects.filter(user=self.user).exists())
+        self.assertFalse(Subscription.objects.filter(user=self.user).exists())
+
+    def test_get_never_creates_a_row_for_any_kind_of_user(self) -> None:
+        staff = User.objects.create_user(username="substaff", password="pw12345!", is_staff=True)
+        client = APIClient()
+        client.force_authenticate(user=staff)
+        body = client.get(self.url).json()
+        self.assertEqual(Subscription.objects.count(), 0)
+        self.assertEqual(body["status"], "none")
+        self.assertTrue(body["exempt"])
+        self.assertTrue(body["has_active_access"])
+        self.assertIsNone(body["quota"]["runs_allowed"])
+
+    def test_lapsed_payload_is_unchanged(self) -> None:
+        Subscription.objects.create(
+            user=self.user, status="active", access_expires_at=timezone.now() - timedelta(days=1)
+        )
+        body = self.client.get(self.url).json()
+        self.assertEqual(body["status"], "active")
+        self.assertFalse(body["has_active_access"])
+        self.assertFalse(body["exempt"])
+        self.assertEqual(body["quota"]["runs_allowed"], 0)
+        self.assertFalse(body["quota"]["can_trigger"])
+
+    def test_active_payload_reports_one_run_allowed(self) -> None:
+        active_subscription_for(self.user)
+        body = self.client.get(self.url).json()
+        self.assertTrue(body["has_active_access"])
+        self.assertEqual(body["quota"]["runs_allowed"], 1)
+        self.assertTrue(body["quota"]["can_trigger"])
+
+    def test_throttle_scope_is_configured_and_fails_open(self) -> None:
+        self.assertEqual(settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]["billing-status"], "60/min")
+        with patch.object(
+            FailOpenScopedRateThrottle,
+            "cache",
+            **{"get.side_effect": redis.exceptions.ConnectionError("redis is down")},
+        ), self.assertLogs("fragrance.views", level="WARNING") as logs:
+            response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(any("scope=billing-status" in m for m in logs.output))
 
     def test_active_subscription_reports_plan_and_access(self) -> None:
         plan = Plan.objects.create(
@@ -4169,7 +4236,8 @@ class BillingSessionViewTests(TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(
-            set(body.keys()), {"status", "plan", "access_expires_at", "has_active_access", "granted"}
+            set(body.keys()),
+            {"status", "plan", "access_expires_at", "has_active_access", "exempt", "quota", "granted"},
         )
         self.assertTrue(body["granted"])
         self.assertEqual(body["status"], "active")
@@ -4189,7 +4257,8 @@ class BillingSessionViewTests(TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(
-            set(body.keys()), {"status", "plan", "access_expires_at", "has_active_access", "granted"}
+            set(body.keys()),
+            {"status", "plan", "access_expires_at", "has_active_access", "exempt", "quota", "granted"},
         )
         self.assertTrue(body["has_active_access"])
         self.assertFalse(body["granted"])
@@ -4556,8 +4625,1443 @@ class SanitizeStripeErrorMessageTests(TestCase):
         message = sanitize_sdk_error_message(exc)
         self.assertNotIn("sk_live_abc123", message)
 
+    def test_connection_error_has_its_own_fixed_message_without_leaking(self) -> None:
+        from fragrance.ai_providers.base import sanitize_sdk_error_message
+
+        exc = stripe.APIConnectionError("could not connect to sk_live_abc123 at api.stripe.com")
+        message = sanitize_sdk_error_message(exc)
+        self.assertEqual(message, "Could not reach Stripe. Try again shortly.")
+        self.assertNotIn("sk_live_abc123", message)
+        self.assertNotIn("Check the Stripe configuration", message)
+
+    def test_non_connection_stripe_error_keeps_config_message(self) -> None:
+        from fragrance.ai_providers.base import sanitize_sdk_error_message
+
+        message = sanitize_sdk_error_message(stripe.AuthenticationError("bad key sk_live_zzz"))
+        self.assertIn("Check the Stripe configuration", message)
+        self.assertNotIn("sk_live_zzz", message)
+
     def test_non_sdk_exception_passes_through_unchanged(self) -> None:
         from fragrance.ai_providers.base import sanitize_sdk_error_message
 
         exc = ValueError("plain application error")
         self.assertEqual(sanitize_sdk_error_message(exc), "plain application error")
+
+
+class SubscriptionPermissionTests(TestCase):
+    def setUp(self) -> None:
+        self.paid = User.objects.create_user(username="paid", password="pw12345!")
+        active_subscription_for(self.paid)
+        self.lapsed = User.objects.create_user(username="lapsed", password="pw12345!")
+        Subscription.objects.create(
+            user=self.lapsed,
+            status="active",
+            access_expires_at=timezone.now() - timedelta(days=1),
+        )
+        self.staff = User.objects.create_user(
+            username="staffer", password="pw12345!", is_staff=True
+        )
+        self.norow = User.objects.create_user(username="norow", password="pw12345!")
+
+    def _client(self, user: User) -> APIClient:
+        client = APIClient()
+        client.force_authenticate(user=user)
+        return client
+
+    def _assert_402(self, response) -> None:
+        self.assertEqual(response.status_code, 402)
+        self.assertEqual(
+            response.json(),
+            {
+                "code": "subscription_required",
+                "detail": "An active subscription is required for this action.",
+            },
+        )
+
+    def test_unauthenticated_is_401_not_402(self) -> None:
+        for url in (reverse("fragrance-list"), reverse("run-list"), reverse("import-collection")):
+            self.assertEqual(APIClient().get(url).status_code, 401)
+        self.assertEqual(APIClient().post(reverse("import-collection")).status_code, 401)
+
+    def test_paid_user_can_write_collection(self) -> None:
+        response = self._client(self.paid).post(
+            reverse("fragrance-list"),
+            {"name": "Aventus", "house": "Creed", "status": "own"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+
+    def test_expired_subscription_reads_but_cannot_write(self) -> None:
+        client = self._client(self.lapsed)
+        Fragrance.objects.create(user=self.lapsed, name="Old", house="H", status="own")
+        self.assertEqual(client.get(reverse("fragrance-list")).status_code, 200)
+        self.assertEqual(client.get(reverse("run-list")).status_code, 200)
+        self.assertEqual(client.get(reverse("fragrance-config")).status_code, 200)
+        self.assertEqual(client.get(reverse("export-collection")).status_code, 200)
+        self._assert_402(client.post(
+            reverse("fragrance-list"),
+            {"name": "New", "house": "H", "status": "own"},
+            format="json",
+        ))
+
+    def test_lapsed_user_writes_all_402(self) -> None:
+        client = self._client(self.lapsed)
+        fragrance = Fragrance.objects.create(user=self.lapsed, name="Old", house="H", status="own")
+        detail = reverse("fragrance-detail", args=[fragrance.pk])
+        self._assert_402(client.patch(detail, {"notes": "x"}, format="json"))
+        self._assert_402(client.put(
+            detail, {"name": "Old", "house": "H", "status": "like"}, format="json"
+        ))
+        self._assert_402(client.delete(detail))
+        self.assertTrue(Fragrance.objects.filter(pk=fragrance.pk).exists())
+        self._assert_402(client.post(reverse("import-collection")))
+        self._assert_402(client.patch(
+            reverse("fragrance-config"), {"run_hour": 5}, format="json"
+        ))
+        with patch("fragrance.tasks.monthly_fragrance_run.delay") as delay:
+            self._assert_402(client.post(reverse("run-trigger")))
+        delay.assert_not_called()
+        self.assertFalse(RecommendationRun.objects.filter(user=self.lapsed).exists())
+
+    def test_lapsed_import_is_402_even_with_no_file(self) -> None:
+        self._assert_402(self._client(self.lapsed).post(reverse("import-collection")))
+
+    def test_staff_bypasses_without_subscription(self) -> None:
+        client = self._client(self.staff)
+        response = client.post(
+            reverse("fragrance-list"),
+            {"name": "Aventus", "house": "Creed", "status": "own"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertFalse(Subscription.objects.filter(user=self.staff).exists())
+
+    def test_no_subscription_row_is_402_and_none_is_created(self) -> None:
+        client = self._client(self.norow)
+        self._assert_402(client.post(
+            reverse("fragrance-list"),
+            {"name": "X", "house": "H", "status": "own"},
+            format="json",
+        ))
+        self.assertEqual(client.get(reverse("fragrance-list")).status_code, 200)
+        self.assertEqual(client.get(reverse("export-collection")).status_code, 200)
+        self.assertFalse(Subscription.objects.filter(user=self.norow).exists())
+
+    def test_revoked_status_with_future_expiry_is_402(self) -> None:
+        subscription = active_subscription_for(self.norow)
+        subscription.status = "revoked"
+        subscription.save()
+        self._assert_402(self._client(self.norow).post(reverse("import-collection")))
+
+    def test_rate_and_profile_views_stay_open_to_lapsed_users(self) -> None:
+        client = self._client(self.lapsed)
+        self.assertEqual(client.get(reverse("recommendations")).status_code, 200)
+        self.assertEqual(client.get(reverse("preference-profile-history")).status_code, 200)
+        self.assertEqual(client.get(reverse("preference-profile")).status_code, 404)
+
+
+def _make_plan(*, slug: str, interval: str, access_days: int) -> Plan:
+    return Plan.objects.create(
+        name=slug, slug=slug, stripe_price_id=f"price_{slug}", amount_cents=400,
+        billing_interval=interval, access_days_granted=access_days,
+    )
+
+
+def _backdate_runs(*, user: User, days_ago: float) -> None:
+    RecommendationRun.objects.filter(user=user).update(
+        triggered_at=timezone.now() - timedelta(days=days_ago)
+    )
+
+
+class StartRecommendationRunTests(TestCase):
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="runner", password="pw12345!")
+        active_subscription_for(self.user)
+
+    def _finish_latest(self, *, run_status: str) -> RecommendationRun:
+        run = RecommendationRun.objects.filter(user=self.user).latest("triggered_at")
+        run.status = run_status
+        run.save(update_fields=["status"])
+        return run
+
+    def test_creates_pending_run(self) -> None:
+        run = start_recommendation_run(user=self.user, source="test")
+        self.assertEqual(run.status, "pending")
+        self.assertEqual(run.user, self.user)
+
+    def test_missing_subscription_row_is_created_at_the_chokepoint(self) -> None:
+        staff = User.objects.create_user(username="ops", password="pw12345!", is_staff=True)
+        self.assertFalse(Subscription.objects.filter(user=staff).exists())
+        start_recommendation_run(user=staff, source="test")
+        self.assertTrue(Subscription.objects.filter(user=staff).exists())
+
+    def test_no_subscription_raises_subscription_required(self) -> None:
+        from .permissions import SubscriptionRequired
+
+        nobody = User.objects.create_user(username="nobody", password="pw12345!")
+        with self.assertRaises(SubscriptionRequired):
+            start_recommendation_run(user=nobody, source="test")
+        self.assertFalse(RecommendationRun.objects.filter(user=nobody).exists())
+
+    def test_in_flight_run_blocks(self) -> None:
+        start_recommendation_run(user=self.user, source="test")
+        with self.assertRaises(RunInProgress):
+            start_recommendation_run(user=self.user, source="test")
+
+    def test_second_run_in_window_raises_with_next_eligible_at(self) -> None:
+        first = start_recommendation_run(user=self.user, source="test")
+        self._finish_latest(run_status="done")
+        with self.assertRaises(QuotaExceeded) as ctx:
+            start_recommendation_run(user=self.user, source="test")
+        first.refresh_from_db()
+        self.assertEqual(
+            ctx.exception.next_eligible_at, first.triggered_at + timedelta(days=30)
+        )
+
+    def test_run_allowed_again_after_window(self) -> None:
+        start_recommendation_run(user=self.user, source="test")
+        self._finish_latest(run_status="done")
+        _backdate_runs(user=self.user, days_ago=31)
+        self.assertEqual(
+            start_recommendation_run(user=self.user, source="test").status, "pending"
+        )
+
+    def test_one_failed_run_earns_one_retry_two_do_not(self) -> None:
+        start_recommendation_run(user=self.user, source="test")
+        self._finish_latest(run_status="failed")
+        start_recommendation_run(user=self.user, source="test")  # forgiven retry
+        self._finish_latest(run_status="failed")
+        with self.assertRaises(QuotaExceeded):
+            start_recommendation_run(user=self.user, source="test")
+
+    def test_successful_retry_after_failure_then_blocked(self) -> None:
+        start_recommendation_run(user=self.user, source="test")
+        self._finish_latest(run_status="failed")
+        start_recommendation_run(user=self.user, source="test")
+        self._finish_latest(run_status="done")
+        with self.assertRaises(QuotaExceeded):
+            start_recommendation_run(user=self.user, source="test")
+
+    def test_annual_plan_gets_one_run_per_30_days_not_twelve(self) -> None:
+        annual = _make_plan(slug="annual-q", interval="year", access_days=365)
+        active_subscription_for(self.user, plan=annual, days=365)
+        start_recommendation_run(user=self.user, source="test")
+        self._finish_latest(run_status="done")
+        with self.assertRaises(QuotaExceeded):
+            start_recommendation_run(user=self.user, source="test")
+        _backdate_runs(user=self.user, days_ago=31)
+        start_recommendation_run(user=self.user, source="test")
+
+    def test_larger_allowance_next_eligible_uses_correct_run(self) -> None:
+        plan = _make_plan(slug="three-q", interval="month", access_days=30)
+        plan.max_runs_per_quota_period = 3
+        plan.save()
+        active_subscription_for(self.user, plan=plan)
+        stamps = []
+        for days_ago in (20, 10, 1):
+            run = RecommendationRun.objects.create(user=self.user, status="done")
+            RecommendationRun.objects.filter(pk=run.pk).update(
+                triggered_at=timezone.now() - timedelta(days=days_ago)
+            )
+            run.refresh_from_db()
+            stamps.append(run.triggered_at)
+        with self.assertRaises(QuotaExceeded) as ctx:
+            start_recommendation_run(user=self.user, source="test")
+        # Only the oldest must leave the window to get back under 3.
+        self.assertEqual(ctx.exception.next_eligible_at, stamps[0] + timedelta(days=30))
+
+    def test_staff_bypass_quota_but_not_in_flight_guard(self) -> None:
+        staff = User.objects.create_user(username="ops", password="pw12345!", is_staff=True)
+        start_recommendation_run(user=staff, source="test")
+        RecommendationRun.objects.filter(user=staff).update(status="done")
+        start_recommendation_run(user=staff, source="test")  # quota bypassed
+        with self.assertRaises(RunInProgress):
+            start_recommendation_run(user=staff, source="test")
+
+    def test_other_users_runs_do_not_count(self) -> None:
+        other = User.objects.create_user(username="other", password="pw12345!")
+        active_subscription_for(other)
+        start_recommendation_run(user=other, source="test")
+        self.assertEqual(
+            start_recommendation_run(user=self.user, source="test").status, "pending"
+        )
+
+
+class StartRecommendationRunConcurrencyTests(TransactionTestCase):
+    def test_two_concurrent_triggers_produce_exactly_one_run(self) -> None:
+        user = User.objects.create_user(username="racer", password="pw12345!")
+        active_subscription_for(user)
+        outcomes: list[str] = []
+        outcomes_lock = threading.Lock()
+        barrier = threading.Barrier(2)
+
+        def _trigger() -> None:
+            from django.db import connection
+
+            try:
+                barrier.wait()
+                start_recommendation_run(user=user, source="test")
+                result = "ok"
+            except (QuotaExceeded, RunInProgress) as exc:
+                result = type(exc).__name__
+            finally:
+                connection.close()
+            with outcomes_lock:
+                outcomes.append(result)
+
+        threads = [threading.Thread(target=_trigger) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(RecommendationRun.objects.filter(user=user).count(), 1)
+        self.assertEqual(sorted(outcomes), ["RunInProgress", "ok"])
+
+    def test_two_concurrent_triggers_with_no_subscription_row_still_one_run(self) -> None:
+        staff = User.objects.create_user(username="racer_ops", password="pw12345!", is_staff=True)
+        barrier = threading.Barrier(2)
+
+        def _trigger() -> None:
+            from django.db import connection
+
+            try:
+                barrier.wait()
+                start_recommendation_run(user=staff, source="test")
+            except RunInProgress:
+                pass
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=_trigger) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(RecommendationRun.objects.filter(user=staff).count(), 1)
+        self.assertEqual(Subscription.objects.filter(user=staff).count(), 1)
+
+
+class TriggerViewQuotaTests(TestCase):
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="trig", password="pw12345!")
+        active_subscription_for(self.user)
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+        self.url = reverse("run-trigger")
+
+    def _post(self):
+        with patch("fragrance.tasks.monthly_fragrance_run.delay") as delay:
+            delay.return_value = SimpleNamespace(id="task-1")
+            response = self.client.post(self.url)
+        return response, delay
+
+    def test_success_queues_the_created_run(self) -> None:
+        response, delay = self._post()
+        self.assertEqual(response.status_code, 202)
+        run = RecommendationRun.objects.get(user=self.user)
+        self.assertEqual(response.json(), {"run_id": run.id})
+        delay.assert_called_once_with(user_id=self.user.id, run_id=run.id)
+        self.assertEqual(run.celery_task_id, "task-1")
+
+    def test_second_trigger_in_window_is_429_quota_exceeded(self) -> None:
+        self._post()
+        RecommendationRun.objects.filter(user=self.user).update(status="done")
+        response, delay = self._post()
+        self.assertEqual(response.status_code, 429)
+        body = response.json()
+        self.assertEqual(body["code"], "quota_exceeded")
+        self.assertIn("detail", body)
+        run = RecommendationRun.objects.get(user=self.user)
+        expected = (run.triggered_at + timedelta(days=30)).isoformat().replace("+00:00", "Z")
+        self.assertEqual(body["next_eligible_at"], expected)
+        delay.assert_not_called()
+
+    def test_trigger_while_running_is_429_run_in_progress(self) -> None:
+        self._post()
+        response, _ = self._post()
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(
+            response.json(),
+            {"code": "run_in_progress", "detail": "A run is already in progress."},
+        )
+
+    def test_broker_outage_fails_the_run_instead_of_stranding_it_pending(self) -> None:
+        from kombu.exceptions import OperationalError
+
+        with patch(
+            "fragrance.tasks.monthly_fragrance_run.delay", side_effect=OperationalError("down")
+        ):
+            response = self.client.post(self.url)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(RecommendationRun.objects.get(user=self.user).status, "failed")
+        # A failed run neither burns the allowance nor blocks a retry.
+        response, _ = self._post()
+        self.assertEqual(response.status_code, 202)
+
+
+class BeatPathQuotaTests(TestCase):
+    def setUp(self) -> None:
+        AIModelConfig.objects.all().delete()
+        self.user = User.objects.create_user(username="beat", password="pw12345!")
+        FragranceConfig.objects.create(user=self.user, recipient_email="beat@example.com")
+
+    def test_lapsed_user_is_skipped_quietly(self) -> None:
+        with self.assertLogs("fragrance.tasks", level="INFO") as logs:
+            monthly_fragrance_run(user_id=self.user.id)
+        self.assertFalse(RecommendationRun.objects.filter(user=self.user).exists())
+        self.assertTrue(any("skipped" in line for line in logs.output))
+
+    def test_exhausted_quota_is_skipped_quietly(self) -> None:
+        active_subscription_for(self.user)
+        RecommendationRun.objects.create(user=self.user, status="done")
+        monthly_fragrance_run(user_id=self.user.id)
+        self.assertEqual(RecommendationRun.objects.filter(user=self.user).count(), 1)
+
+    def test_run_in_progress_is_skipped_quietly(self) -> None:
+        active_subscription_for(self.user)
+        RecommendationRun.objects.create(user=self.user, status="running")
+        monthly_fragrance_run(user_id=self.user.id)
+        self.assertEqual(RecommendationRun.objects.filter(user=self.user).count(), 1)
+
+    def test_deleted_user_is_skipped_quietly(self) -> None:
+        monthly_fragrance_run(user_id=999999)
+
+    def test_beat_path_goes_through_chokepoint_and_marks_running(self) -> None:
+        active_subscription_for(self.user)
+        with patch("fragrance.tasks.registry.get_active_config", side_effect=RuntimeError("stop")):
+            monthly_fragrance_run.push_request(retries=monthly_fragrance_run.max_retries)
+            try:
+                with self.assertRaises(RuntimeError):
+                    monthly_fragrance_run(user_id=self.user.id)
+            finally:
+                monthly_fragrance_run.pop_request()
+        run = RecommendationRun.objects.get(user=self.user)
+        self.assertEqual(run.status, "failed")
+
+    def test_view_path_does_not_call_chokepoint_again(self) -> None:
+        active_subscription_for(self.user)
+        run = start_recommendation_run(user=self.user, source="test")
+        with (
+            patch("fragrance.tasks.start_recommendation_run") as chokepoint,
+            patch("fragrance.tasks.registry.get_active_config", side_effect=RuntimeError("stop")),
+        ):
+            monthly_fragrance_run.push_request(retries=monthly_fragrance_run.max_retries)
+            try:
+                with self.assertRaises(RuntimeError):
+                    monthly_fragrance_run(user_id=self.user.id, run_id=run.id)
+            finally:
+                monthly_fragrance_run.pop_request()
+        chokepoint.assert_not_called()
+        self.assertEqual(RecommendationRun.objects.filter(user=self.user).count(), 1)
+
+    def test_retry_reuses_the_beat_created_run(self) -> None:
+        active_subscription_for(self.user)
+        with (
+            patch("fragrance.tasks.registry.get_active_config", side_effect=RuntimeError("boom")),
+            patch.object(
+                monthly_fragrance_run, "retry", side_effect=RuntimeError("retried")
+            ) as mock_retry,
+        ):
+            with self.assertRaises(RuntimeError):
+                monthly_fragrance_run(user_id=self.user.id)
+        run = RecommendationRun.objects.get(user=self.user)
+        self.assertEqual(
+            mock_retry.call_args.kwargs["kwargs"],
+            {"user_id": self.user.id, "run_id": run.id},
+        )
+
+
+class GrantComplimentaryAccessTests(TestCase):
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="comp", password="pw12345!")
+
+    def test_grants_active_access_and_logs_warning(self) -> None:
+        with self.assertLogs("fragrance.billing", level="WARNING") as logs:
+            subscription = grant_complimentary_access(
+                user=self.user, days=30, reason="grandfathered beta user"
+            )
+        self.assertTrue(subscription.has_active_access)
+        self.assertIn("grandfathered beta user", logs.output[0])
+        self.assertIn("comp", logs.output[0])
+
+    def test_extends_from_later_of_now_and_current_expiry(self) -> None:
+        existing = active_subscription_for(self.user, days=10)
+        before = existing.access_expires_at
+        subscription = grant_complimentary_access(user=self.user, days=5, reason="extend")
+        self.assertEqual(subscription.access_expires_at, before + timedelta(days=5))
+
+    def test_refuses_revoked_subscription(self) -> None:
+        subscription = active_subscription_for(self.user)
+        subscription.status = "revoked"
+        subscription.save()
+        with self.assertRaises(ComplimentaryGrantError):
+            grant_complimentary_access(user=self.user, days=5, reason="x")
+
+    def test_rejects_non_positive_days_and_blank_reason(self) -> None:
+        with self.assertRaises(ComplimentaryGrantError):
+            grant_complimentary_access(user=self.user, days=0, reason="x")
+        with self.assertRaises(ComplimentaryGrantError):
+            grant_complimentary_access(user=self.user, days=5, reason="   ")
+
+    def test_command_requires_reason(self) -> None:
+        with self.assertRaises(CommandError):
+            call_command("grant_access", username="comp", days=30)
+        self.assertFalse(Subscription.objects.filter(user=self.user).exists())
+
+    def test_command_grants_access(self) -> None:
+        out = StringIO()
+        call_command(
+            "grant_access", username="comp", days=30, reason="operator comp", stdout=out
+        )
+        self.assertTrue(Subscription.objects.get(user=self.user).has_active_access)
+
+    def test_command_unknown_user_errors(self) -> None:
+        with self.assertRaises(CommandError):
+            call_command("grant_access", username="ghost", days=30, reason="x")
+
+
+class QuotaSnapshotPayloadTests(TestCase):
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="snap", password="pw12345!")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def _quota(self) -> dict:
+        return self.client.get(reverse("billing-subscription")).json()["quota"]
+
+    def test_lapsed_user_has_zero_allowed(self) -> None:
+        self.assertEqual(
+            self._quota(), {"runs_allowed": 0, "runs_used": 0, "next_eligible_at": None, "can_trigger": False}
+        )
+
+    def test_planless_active_subscription_uses_defaults(self) -> None:
+        active_subscription_for(self.user)
+        self.assertEqual(
+            self._quota(), {"runs_allowed": 1, "runs_used": 0, "next_eligible_at": None, "can_trigger": True}
+        )
+
+    def test_used_run_reports_next_eligible_at(self) -> None:
+        active_subscription_for(self.user)
+        run = RecommendationRun.objects.create(user=self.user, status="done")
+        quota = self._quota()
+        self.assertEqual(quota["runs_used"], 1)
+        self.assertEqual(
+            quota["next_eligible_at"],
+            (run.triggered_at + timedelta(days=30)).isoformat().replace("+00:00", "Z"),
+        )
+
+    def test_annual_plan_reports_one_run_allowed(self) -> None:
+        annual = _make_plan(slug="annual-s", interval="year", access_days=365)
+        active_subscription_for(self.user, plan=annual, days=365)
+        self.assertEqual(self._quota()["runs_allowed"], 1)
+
+    def test_staff_uses_defaults(self) -> None:
+        self.user.is_staff = True
+        self.user.save()
+        body = self.client.get(reverse("billing-subscription")).json()
+        self.assertTrue(body["exempt"])
+        self.assertTrue(body["has_active_access"])
+        self.assertIsNone(body["quota"]["runs_allowed"])
+        self.assertIsNone(body["quota"]["next_eligible_at"])
+        self.assertEqual(body["status"], "none")
+
+    def test_non_exempt_user_reports_exempt_false(self) -> None:
+        self.assertFalse(self.client.get(reverse("billing-subscription")).json()["exempt"])
+
+
+class DefaultScheduleForTests(SimpleTestCase):
+    def test_deterministic(self) -> None:
+        self.assertEqual(default_schedule_for(user_id=42), default_schedule_for(user_id=42))
+
+    def test_formula(self) -> None:
+        self.assertEqual(default_schedule_for(user_id=1), (2, 0))
+        self.assertEqual(default_schedule_for(user_id=28), (1, 1))
+
+    def test_day_always_1_to_28_and_hour_0_to_23_across_wide_sweep(self) -> None:
+        for user_id in range(1, 20001):
+            day, hour = default_schedule_for(user_id=user_id)
+            self.assertTrue(1 <= day <= 28, user_id)
+            self.assertTrue(0 <= hour <= 23, user_id)
+
+    def test_672_slots_spread_evenly(self) -> None:
+        from collections import Counter
+
+        slots = Counter(default_schedule_for(user_id=i) for i in range(1, 672 * 3 + 1))
+        self.assertEqual(len(slots), 672)
+        self.assertEqual(set(slots.values()), {3})
+        days = Counter(day for day, _ in slots.elements())
+        self.assertEqual(len(days), 28)
+        self.assertEqual(len(set(days.values())), 1)
+
+
+class FragranceConfigCreationJitterTests(TestCase):
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="jit", password="pw12345!")
+        active_subscription_for(self.user)
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_first_config_get_applies_jittered_default(self) -> None:
+        response = self.client.get(reverse("fragrance-config"))
+        day, hour = default_schedule_for(user_id=self.user.id)
+        self.assertEqual(response.json()["run_day_of_month"], day)
+        self.assertEqual(response.json()["run_hour"], hour)
+
+    def test_existing_choice_is_never_overwritten(self) -> None:
+        FragranceConfig.objects.create(
+            user=self.user, recipient_email="j@example.com", run_day_of_month=15, run_hour=3
+        )
+        response = self.client.get(reverse("fragrance-config"))
+        self.assertEqual(response.json()["run_day_of_month"], 15)
+        self.assertEqual(response.json()["run_hour"], 3)
+
+    def test_explicit_day_of_1_chosen_via_api_after_creation_is_kept(self) -> None:
+        self.client.get(reverse("fragrance-config"))
+        self.client.patch(
+            reverse("fragrance-config"), {"run_day_of_month": 1, "run_hour": 9}, format="json"
+        )
+        response = self.client.get(reverse("fragrance-config"))
+        self.assertEqual(response.json()["run_day_of_month"], 1)
+        self.assertEqual(response.json()["run_hour"], 9)
+
+
+class RebalanceRunSchedulesCommandTests(TestCase):
+    def setUp(self) -> None:
+        self.untouched = User.objects.create_user(username="untouched", password="pw12345!")
+        self.custom = User.objects.create_user(username="custom", password="pw12345!")
+        self.weekly = User.objects.create_user(username="weekly", password="pw12345!")
+        FragranceConfig.objects.create(user=self.untouched, recipient_email="a@example.com")
+        FragranceConfig.objects.create(
+            user=self.custom, recipient_email="b@example.com", run_day_of_month=15, run_hour=9
+        )
+        FragranceConfig.objects.create(
+            user=self.weekly, recipient_email="c@example.com", frequency="weekly"
+        )
+
+    def _run(self, **kwargs: object) -> str:
+        out = StringIO()
+        call_command("rebalance_run_schedules", stdout=out, **kwargs)
+        return out.getvalue()
+
+    def test_dry_run_by_default_writes_nothing_but_reports(self) -> None:
+        output = self._run()
+        config = FragranceConfig.objects.get(user=self.untouched)
+        self.assertEqual((config.run_day_of_month, config.run_hour), (1, 9))
+        self.assertIn("untouched", output)
+        self.assertIn("Dry run", output)
+
+    def test_apply_moves_untouched_row_and_skips_customised_and_weekly(self) -> None:
+        self._run(apply=True)
+        moved = FragranceConfig.objects.get(user=self.untouched)
+        self.assertEqual(
+            (moved.run_day_of_month, moved.run_hour),
+            default_schedule_for(user_id=self.untouched.id),
+        )
+        custom = FragranceConfig.objects.get(user=self.custom)
+        self.assertEqual((custom.run_day_of_month, custom.run_hour), (15, 9))
+        weekly = FragranceConfig.objects.get(user=self.weekly)
+        self.assertEqual((weekly.run_day_of_month, weekly.run_hour), (1, 9))
+
+    def test_apply_syncs_the_periodic_task(self) -> None:
+        from django_celery_beat.models import PeriodicTask
+
+        self._run(apply=True)
+        day, hour = default_schedule_for(user_id=self.untouched.id)
+        task = PeriodicTask.objects.get(name=f"fragrance-run-{self.untouched.id}")
+        self.assertEqual(task.crontab.day_of_month, str(day))
+        self.assertEqual(task.crontab.hour, str(hour))
+
+
+def _staff_not_superuser(*, username: str = "prod_user_2") -> User:
+    return User.objects.create_user(
+        username=username, password="pw12345!", is_staff=True, is_superuser=False
+    )
+
+
+class StaffNotSuperuserExemptionTests(TestCase):
+    """The production exempt account: is_staff=True, is_superuser=False, no Subscription row."""
+
+    def setUp(self) -> None:
+        AIModelConfig.objects.all().delete()
+        self.user = _staff_not_superuser()
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_writes_pass_both_permission_classes_without_creating_a_row(self) -> None:
+        self.assertFalse(self.user.is_superuser)
+        response = self.client.post(
+            reverse("fragrance-list"),
+            {"name": "Aventus", "house": "Creed", "status": "own"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertNotEqual(self.client.post(reverse("import-collection")).status_code, 402)
+        self.assertFalse(Subscription.objects.filter(user=self.user).exists())
+
+    def test_quota_bypassed_but_in_flight_guard_is_not(self) -> None:
+        start_recommendation_run(user=self.user, source="test")
+        with self.assertRaises(RunInProgress):
+            start_recommendation_run(user=self.user, source="test")
+        for status_ in ("pending", "running"):
+            RecommendationRun.objects.filter(user=self.user).update(status=status_)
+            with self.assertRaises(RunInProgress):
+                start_recommendation_run(user=self.user, source="test")
+        RecommendationRun.objects.filter(user=self.user).update(status="done")
+        start_recommendation_run(user=self.user, source="test")
+
+    def test_beat_path_runs_for_them(self) -> None:
+        FragranceConfig.objects.create(user=self.user, recipient_email="s@example.com")
+        with patch("fragrance.tasks.registry.get_active_config", side_effect=RuntimeError("stop")):
+            monthly_fragrance_run.push_request(retries=monthly_fragrance_run.max_retries)
+            try:
+                with self.assertRaises(RuntimeError):
+                    monthly_fragrance_run(user_id=self.user.id)
+            finally:
+                monthly_fragrance_run.pop_request()
+        self.assertEqual(RecommendationRun.objects.filter(user=self.user).count(), 1)
+
+    def test_payload_reports_effective_access(self) -> None:
+        body = self.client.get(reverse("billing-subscription")).json()
+        self.assertTrue(body["has_active_access"])
+        self.assertTrue(body["exempt"])
+        self.assertIsNone(body["quota"]["runs_allowed"])
+        self.assertIsNone(body["quota"]["next_eligible_at"])
+        self.assertTrue(body["quota"]["can_trigger"])
+        self.assertEqual(body["status"], "none")
+
+
+class CanTriggerQuotaPayloadTests(TestCase):
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="ct", password="pw12345!")
+        active_subscription_for(self.user)
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def _quota(self) -> dict:
+        return self.client.get(reverse("billing-subscription")).json()["quota"]
+
+    def test_available_run(self) -> None:
+        q = self._quota()
+        self.assertTrue(q["can_trigger"])
+        self.assertIsNone(q["next_eligible_at"])
+
+    def test_lapsed_user(self) -> None:
+        Subscription.objects.filter(user=self.user).update(status="none")
+        q = self._quota()
+        self.assertEqual((q["runs_allowed"], q["can_trigger"]), (0, False))
+        self.assertIsNone(q["next_eligible_at"])
+
+    def test_exhausted_quota(self) -> None:
+        run = RecommendationRun.objects.create(user=self.user, status="done")
+        q = self._quota()
+        self.assertFalse(q["can_trigger"])
+        self.assertIsNotNone(q["next_eligible_at"])
+
+    def test_failure_grace_block_reports_next_eligible_at(self) -> None:
+        for _ in range(2):
+            RecommendationRun.objects.create(user=self.user, status="failed")
+        oldest = RecommendationRun.objects.filter(user=self.user).order_by("triggered_at").first()
+        q = self._quota()
+        self.assertEqual(q["runs_used"], 0)
+        self.assertFalse(q["can_trigger"])
+        self.assertEqual(
+            q["next_eligible_at"],
+            (oldest.triggered_at + timedelta(days=30)).isoformat().replace("+00:00", "Z"),
+        )
+
+    def test_in_flight_run_is_not_triggerable(self) -> None:
+        RecommendationRun.objects.create(user=self.user, status="running")
+        self.assertFalse(self._quota()["can_trigger"])
+
+    def test_snapshot_writes_nothing(self) -> None:
+        other = User.objects.create_user(username="ct2", password="pw12345!")
+        client = APIClient()
+        client.force_authenticate(user=other)
+        client.get(reverse("billing-subscription"))
+        self.assertFalse(RecommendationRun.objects.filter(user=other).exists())
+
+    def test_can_trigger_agrees_with_chokepoint(self) -> None:
+        for statuses in ([], ["done"], ["failed"], ["failed", "failed"], ["running"]):
+            RecommendationRun.objects.filter(user=self.user).delete()
+            for st in statuses:
+                RecommendationRun.objects.create(user=self.user, status=st)
+            can = self._quota()["can_trigger"]
+            try:
+                start_recommendation_run(user=self.user, source="test")
+                started = True
+            except (QuotaExceeded, RunInProgress):
+                started = False
+            self.assertEqual(can, started, statuses)
+
+
+class RevokedAndResendTests(TestCase):
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="rev", password="pw12345!")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_revoked_user_can_start_checkout_again(self) -> None:
+        plan = _make_plan(slug="rev-plan", interval="month", access_days=30)
+        Subscription.objects.create(
+            user=self.user, status="revoked", access_expires_at=timezone.now(),
+            stripe_customer_id="cus_rev",
+        )
+        with patch("fragrance.billing.stripe.checkout.Session.create") as create, \
+                override_settings(STRIPE_SECRET_KEY="sk_test_x", STRIPE_API_VERSION="2025-09-30.clover"):
+            create.return_value = SimpleNamespace(id="cs_1", url="https://checkout.example/x")
+            response = self.client.post(
+                reverse("billing-checkout"), {"slug": plan.slug}, format="json"
+            )
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["url"], "https://checkout.example/x")
+
+    def test_resend_email_is_402_for_lapsed_user(self) -> None:
+        run = RecommendationRun.objects.create(user=self.user, status="done")
+        response = self.client.post(reverse("run-resend-email", args=[run.pk]))
+        self.assertEqual(response.status_code, 402)
+
+
+class GrantStaffMigrationTests(TestCase):
+    def test_forward_function(self) -> None:
+        from django.apps import apps as real_apps
+
+        migration = importlib.import_module(
+            "fragrance.migrations.0009_grant_staff_to_existing_users"
+        )
+        before = datetime(2026, 6, 21, tzinfo=dt_timezone.utc)
+        after = datetime(2026, 9, 20, 0, 0, tzinfo=dt_timezone.utc)
+        plain = User.objects.create_user(username="old_plain", password="pw12345!")
+        staff = User.objects.create_user(username="old_staff", password="pw12345!", is_staff=True)
+        late = User.objects.create_user(username="late_joiner", password="pw12345!")
+        User.objects.filter(pk__in=[plain.pk, staff.pk]).update(date_joined=before)
+        User.objects.filter(pk=late.pk).update(date_joined=after)
+        migration.grant_staff_to_existing_users(real_apps, None)
+        for user in (plain, staff, late):
+            user.refresh_from_db()
+        self.assertTrue(plain.is_staff)
+        self.assertTrue(staff.is_staff)
+        self.assertFalse(plain.is_superuser)
+        self.assertFalse(late.is_staff)
+        newcomer = User.objects.create_user(username="new_after", password="pw12345!")
+        self.assertFalse(newcomer.is_staff)
+
+    def test_already_staff_user_after_cutoff_is_untouched(self) -> None:
+        from django.apps import apps as real_apps
+
+        migration = importlib.import_module(
+            "fragrance.migrations.0009_grant_staff_to_existing_users"
+        )
+        staff = User.objects.create_user(username="late_staff", password="pw12345!", is_staff=True)
+        User.objects.filter(pk=staff.pk).update(
+            date_joined=datetime(2026, 10, 1, tzinfo=dt_timezone.utc)
+        )
+        migration.grant_staff_to_existing_users(real_apps, None)
+        staff.refresh_from_db()
+        self.assertTrue(staff.is_staff)
+
+
+class ExemptCheckoutRefusalTests(TestCase):
+    def test_staff_not_superuser_gets_409_with_no_side_effects(self) -> None:
+        user = _staff_not_superuser(username="exempt_checkout")
+        _make_plan(slug="ex-plan", interval="month", access_days=30)
+        client = APIClient()
+        client.force_authenticate(user=user)
+        with patch("fragrance.billing.stripe.Customer.create") as customer, \
+                patch("fragrance.billing.stripe.checkout.Session.create") as session:
+            response = client.post(reverse("billing-checkout"), {"slug": "ex-plan"}, format="json")
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json(),
+            {
+                "code": "exempt",
+                "detail": "This account has full access, so no subscription is needed.",
+            },
+        )
+        customer.assert_not_called()
+        session.assert_not_called()
+        self.assertFalse(Subscription.objects.filter(user=user).exists())
+
+
+class ExemptCanTriggerTests(TestCase):
+    def test_can_trigger_false_only_while_in_flight(self) -> None:
+        user = _staff_not_superuser(username="exempt_ct")
+        client = APIClient()
+        client.force_authenticate(user=user)
+        url = reverse("billing-subscription")
+        RecommendationRun.objects.create(user=user, status="done")
+        self.assertIs(client.get(url).json()["quota"]["can_trigger"], True)
+        RecommendationRun.objects.create(user=user, status="pending")
+        quota = client.get(url).json()["quota"]
+        self.assertIs(quota["can_trigger"], False)
+        self.assertIsNone(quota["runs_allowed"])
+        self.assertIsNone(quota["next_eligible_at"])
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
+class ReconcileSubscriptionsTests(TestCase):
+    def setUp(self) -> None:
+        from .billing import reconcile_subscriptions
+
+        self.reconcile = reconcile_subscriptions
+        self.plan = Plan.objects.create(
+            name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
+            amount_cents=400, billing_interval="month", access_days_granted=30,
+        )
+        self.period_end = int(timezone.now().timestamp()) + 30 * 86400
+
+    def _make_user(self, *, name: str, customer_id: str | None, status: str = "checkout_started",
+                   expires_in: timedelta | None = None) -> Subscription:
+        user = User.objects.create_user(username=name, email=f"{name}@example.com")
+        BetaSignup.objects.create(
+            email=f"{name}@example.com", normalized_email=f"{name}@example.com",
+            status="converted", invited_user=user,
+        )
+        return Subscription.objects.create(
+            user=user, stripe_customer_id=customer_id, status=status,
+            access_expires_at=timezone.now() + expires_in if expires_in is not None else None,
+        )
+
+    def _invoice(self, *, invoice_id: str, customer_id: str, **kwargs) -> SimpleNamespace:
+        return _fake_invoice(
+            invoice_id=invoice_id, customer_id=customer_id, subscription_id=f"sub_{invoice_id}", amount_paid=400,
+            lines=[_fake_line(price_id="price_mo", period_end=self.period_end)], **kwargs,
+        )
+
+    @staticmethod
+    def _listing(*invoices: SimpleNamespace) -> SimpleNamespace:
+        return SimpleNamespace(auto_paging_iter=lambda: iter(invoices))
+
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_lost_renewal_and_paid_never_loaded_are_granted_and_rerun_is_noop(self, mock_list) -> None:
+        renewal = self._make_user(name="renew", customer_id="cus_renew", status="active", expires_in=timedelta(days=-3))
+        loaded = self._make_user(name="missed", customer_id="cus_missed")
+        mock_list.return_value = self._listing(
+            self._invoice(invoice_id="in_renew", customer_id="cus_renew"),
+            self._invoice(invoice_id="in_missed", customer_id="cus_missed"),
+        )
+
+        first = self.reconcile()
+        renewal.refresh_from_db()
+        loaded.refresh_from_db()
+        expiry_after_first = loaded.access_expires_at
+        second = self.reconcile()
+        loaded.refresh_from_db()
+
+        self.assertEqual(first["grants"], 2)
+        self.assertEqual(renewal.status, "active")
+        self.assertGreater(renewal.access_expires_at, timezone.now())
+        self.assertEqual(loaded.status, "active")
+        self.assertEqual(second["grants"], 0)
+        self.assertEqual(second["already_applied"], 2)
+        self.assertEqual(loaded.access_expires_at, expiry_after_first)
+        self.assertEqual(ProcessedPayment.objects.count(), 2)
+
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_active_subscriber_long_past_expiry_is_still_reconciled(self, mock_list) -> None:
+        sub = self._make_user(name="ancient", customer_id="cus_old", status="active", expires_in=-timedelta(days=40))
+        mock_list.return_value = self._listing(self._invoice(invoice_id="in_old", customer_id="cus_old"))
+        self.assertEqual(self.reconcile()["grants"], 1)
+        sub.refresh_from_db()
+        self.assertGreater(sub.access_expires_at, timezone.now())
+
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_processed_invoice_counts_as_already_applied(self, mock_list) -> None:
+        sub = self._make_user(name="dup", customer_id="cus_dup", status="active", expires_in=timedelta(days=1))
+        ProcessedPayment.objects.create(
+            stripe_invoice_id="in_dup", subscription=sub, amount_paid_cents=400,
+            period_end=timezone.now() + timedelta(days=1),
+        )
+        before = sub.access_expires_at
+        mock_list.return_value = self._listing(self._invoice(invoice_id="in_dup", customer_id="cus_dup"))
+        summary = self.reconcile()
+        sub.refresh_from_db()
+        self.assertEqual(summary["already_applied"], 1)
+        self.assertEqual(summary["grants"], 0)
+        self.assertEqual(sub.access_expires_at, before)
+
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_unpaid_invoice_grants_nothing(self, mock_list) -> None:
+        sub = self._make_user(name="unpaid", customer_id="cus_unpaid")
+        mock_list.return_value = self._listing(
+            self._invoice(invoice_id="in_open", customer_id="cus_unpaid", status="open", amount_remaining=400)
+        )
+        summary = self.reconcile()
+        sub.refresh_from_db()
+        self.assertEqual(summary["grants"], 0)
+        self.assertIsNone(sub.access_expires_at)
+        self.assertEqual(ProcessedPayment.objects.count(), 0)
+
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_unapproved_user_grants_nothing(self, mock_list) -> None:
+        sub = self._make_user(name="pending", customer_id="cus_pending")
+        BetaSignup.objects.filter(invited_user=sub.user).update(status="pending")
+        mock_list.return_value = self._listing(self._invoice(invoice_id="in_pend", customer_id="cus_pending"))
+        summary = self.reconcile()
+        sub.refresh_from_db()
+        self.assertEqual(summary["grants"], 0)
+        self.assertEqual(sub.status, "checkout_started")
+
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_invoice_list_is_one_account_wide_call(self, mock_list) -> None:
+        self._make_user(name="params", customer_id="cus_params")
+        mock_list.return_value = self._listing()
+        self.reconcile()
+        mock_list.assert_called_once()
+        kwargs = mock_list.call_args.kwargs
+        self.assertNotIn("customer", kwargs)
+        self.assertEqual(kwargs["status"], "paid")
+        self.assertEqual(kwargs["limit"], 100)
+        now = int(timezone.now().timestamp())
+        self.assertAlmostEqual(kwargs["created"]["gte"], now - 7 * 86400, delta=5)
+
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_lookback_is_configurable(self, mock_list) -> None:
+        mock_list.return_value = self._listing()
+        self.reconcile(lookback=timedelta(days=30))
+        now = int(timezone.now().timestamp())
+        self.assertAlmostEqual(mock_list.call_args.kwargs["created"]["gte"], now - 30 * 86400, delta=5)
+
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_revoked_customers_paid_invoice_is_never_granted(self, mock_list) -> None:
+        sub = self._make_user(name="revoked", customer_id="cus_rev", status="revoked", expires_in=timedelta(days=1))
+        before = sub.access_expires_at
+        mock_list.return_value = self._listing(self._invoice(invoice_id="in_rev", customer_id="cus_rev"))
+        summary = self.reconcile()
+        sub.refresh_from_db()
+        self.assertEqual(summary["grants"], 0)
+        self.assertEqual(summary["invoices_matched"], 0)
+        self.assertEqual(sub.status, "revoked")
+        self.assertEqual(sub.access_expires_at, before)
+        self.assertEqual(ProcessedPayment.objects.count(), 0)
+
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_invoice_for_unknown_customer_is_ignored(self, mock_list) -> None:
+        mock_list.return_value = self._listing(self._invoice(invoice_id="in_x", customer_id="cus_stranger"))
+        summary = self.reconcile()
+        self.assertEqual(summary["invoices_seen"], 1)
+        self.assertEqual(summary["invoices_matched"], 0)
+        self.assertEqual(summary["grants"], 0)
+        self.assertEqual(ProcessedPayment.objects.count(), 0)
+
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_abandoned_checkout_costs_no_per_customer_call(self, mock_list) -> None:
+        for i in range(25):
+            self._make_user(name=f"abandoned{i}", customer_id=f"cus_ab{i}")
+        mock_list.return_value = self._listing()
+        self.reconcile()
+        self.assertEqual(mock_list.call_count, 1)
+
+    @patch("fragrance.billing._grant_period_for_invoice")
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_one_error_does_not_stop_the_batch(self, mock_list, mock_grant) -> None:
+        self._make_user(name="first", customer_id="cus_first")
+        self._make_user(name="second", customer_id="cus_second")
+        mock_list.return_value = self._listing(
+            self._invoice(invoice_id="in_first", customer_id="cus_first"),
+            self._invoice(invoice_id="in_second", customer_id="cus_second"),
+        )
+        mock_grant.side_effect = [RuntimeError("boom"), True]
+        summary = self.reconcile()
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["grants"], 1)
+
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_listing_failure_is_contained_and_events_still_requeued(self, mock_list) -> None:
+        mock_list.side_effect = stripe.APIConnectionError("boom")
+        with self.assertLogs("fragrance.billing", level="ERROR"):
+            summary = self.reconcile()
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["grants"], 0)
+
+    @patch("fragrance.billing._grant_period_for_invoice", side_effect=RuntimeError("boom"))
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_errors_with_no_grants_and_pending_invoices_log_at_error(self, mock_list, _mock_grant) -> None:
+        self._make_user(name="stuck", customer_id="cus_stuck")
+        mock_list.return_value = self._listing(self._invoice(invoice_id="in_stuck", customer_id="cus_stuck"))
+        with self.assertLogs("fragrance.billing", level="ERROR") as logs:
+            self.reconcile()
+        self.assertTrue(any("NO grants" in line for line in logs.output))
+
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_deadline_stops_the_loop(self, mock_list) -> None:
+        for name in ("a", "b", "c"):
+            self._make_user(name=name, customer_id=f"cus_{name}")
+        mock_list.return_value = self._listing(
+            *(self._invoice(invoice_id=f"in_{n}", customer_id=f"cus_{n}") for n in ("a", "b", "c"))
+        )
+        with self.assertLogs("fragrance.billing", level="ERROR") as logs:
+            summary = self.reconcile(time_budget_seconds=0)
+        self.assertTrue(summary["deadline_exceeded"])
+        self.assertEqual(summary["grants"], 0)
+        self.assertTrue(any("budget exhausted" in line for line in logs.output))
+
+    @patch("fragrance.billing.RECONCILE_MAX_INVOICES", 2)
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_pagination_sanity_cap_warns(self, mock_list) -> None:
+        mock_list.return_value = self._listing(
+            *(self._invoice(invoice_id=f"in_{i}", customer_id="cus_none") for i in range(5))
+        )
+        with self.assertLogs("fragrance.billing", level="WARNING") as logs:
+            summary = self.reconcile()
+        self.assertTrue(summary["capped"])
+        self.assertEqual(summary["invoices_seen"], 2)
+        self.assertTrue(any("sanity cap" in line for line in logs.output))
+
+    @override_settings(STRIPE_SECRET_KEY="")
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_unset_key_returns_cleanly(self, mock_list) -> None:
+        self._make_user(name="nokey", customer_id="cus_nokey")
+        with self.assertLogs("fragrance.billing", level="WARNING"):
+            summary = self.reconcile()
+        self.assertTrue(summary["skipped"])
+        mock_list.assert_not_called()
+
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_dry_run_writes_nothing(self, mock_list) -> None:
+        sub = self._make_user(name="dry", customer_id="cus_dry")
+        mock_list.return_value = self._listing(self._invoice(invoice_id="in_dry", customer_id="cus_dry"))
+        with patch("fragrance.tasks.process_stripe_event.delay") as mock_delay:
+            StripeEvent.objects.create(
+                stripe_event_id="evt_dry", event_type="payment_intent.succeeded",
+                payload={"data": {"object": {"id": "pi_1"}}},
+            )
+            StripeEvent.objects.filter(stripe_event_id="evt_dry").update(
+                received_at=timezone.now() - timedelta(hours=1)
+            )
+            summary = self.reconcile(dry_run=True)
+            mock_delay.assert_not_called()
+        sub.refresh_from_db()
+        self.assertEqual(summary["would_grant"], 1)
+        self.assertEqual(summary["events_requeued"], 1)
+        self.assertEqual(sub.status, "checkout_started")
+        self.assertIsNone(sub.access_expires_at)
+        self.assertEqual(ProcessedPayment.objects.count(), 0)
+
+    @patch("fragrance.billing.stripe.Invoice.list")
+    def test_management_command_dry_run_and_days(self, mock_list) -> None:
+        self._make_user(name="cmd", customer_id="cus_cmd")
+        mock_list.return_value = self._listing(self._invoice(invoice_id="in_cmd", customer_id="cus_cmd"))
+        out = StringIO()
+        call_command("reconcile_stripe", "--dry-run", "--days", "30", stdout=out)
+        self.assertIn("would_grant: 1", out.getvalue())
+        self.assertEqual(ProcessedPayment.objects.count(), 0)
+        now = int(timezone.now().timestamp())
+        self.assertAlmostEqual(mock_list.call_args.kwargs["created"]["gte"], now - 30 * 86400, delta=5)
+
+    def test_management_command_rejects_non_positive_days(self) -> None:
+        with self.assertRaises(CommandError):
+            call_command("reconcile_stripe", "--days", "0")
+
+    def test_reconcile_task_has_time_limits(self) -> None:
+        from .tasks import reconcile_stripe_subscriptions
+
+        self.assertEqual(reconcile_stripe_subscriptions.soft_time_limit, 240)
+        self.assertEqual(reconcile_stripe_subscriptions.time_limit, 300)
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
+class ReconcileStuckEventsTests(TestCase):
+    def _event(self, *, evt_id: str, status: str, age: timedelta, payload: dict | None) -> None:
+        StripeEvent.objects.create(
+            stripe_event_id=evt_id, event_type="payment_intent.succeeded", status=status,
+            payload=payload if payload is not None else {},
+        )
+        StripeEvent.objects.filter(stripe_event_id=evt_id).update(received_at=timezone.now() - age)
+
+    @patch("fragrance.tasks.process_stripe_event.delay")
+    def test_only_stuck_events_in_window_are_requeued(self, mock_delay) -> None:
+        from .billing import reconcile_subscriptions
+
+        payload = {"data": {"object": {"id": "pi_x"}}}
+        self._event(evt_id="evt_recv", status="received", age=timedelta(hours=1), payload=payload)
+        self._event(evt_id="evt_fail", status="failed", age=timedelta(hours=5), payload=payload)
+        self._event(evt_id="evt_fresh", status="received", age=timedelta(minutes=2), payload=payload)
+        self._event(evt_id="evt_old", status="failed", age=timedelta(days=5), payload=payload)
+        self._event(evt_id="evt_done", status="processed", age=timedelta(hours=2), payload=payload)
+        self._event(evt_id="evt_nopayload", status="failed", age=timedelta(hours=2), payload=None)
+
+        with self.assertLogs("fragrance.billing", level="WARNING"):
+            summary = reconcile_subscriptions()
+
+        queued = sorted(call.kwargs["stripe_event_id"] for call in mock_delay.call_args_list)
+        self.assertEqual(queued, ["evt_fail", "evt_recv"])
+        self.assertEqual(summary["events_requeued"], 2)
+        self.assertEqual(summary["events_skipped_no_payload"], 1)
+
+    @patch("fragrance.billing.reconcile_subscriptions")
+    def test_celery_task_delegates(self, mock_reconcile) -> None:
+        from .tasks import reconcile_stripe_subscriptions
+
+        mock_reconcile.return_value = {"grants": 0}
+        reconcile_stripe_subscriptions()
+        mock_reconcile.assert_called_once_with(dry_run=False)
+
+
+class NightlyHousekeepingTests(TestCase):
+    def test_old_payloads_are_emptied_rows_kept_recent_untouched(self) -> None:
+        from .tasks import prune_stripe_event_payloads
+
+        payload = {"data": {"object": {"id": "pi_x"}}}
+        for evt_id in ("evt_old", "evt_recent"):
+            StripeEvent.objects.create(
+                stripe_event_id=evt_id, event_type="payment_intent.succeeded",
+                status="processed", payload=payload,
+            )
+        StripeEvent.objects.filter(stripe_event_id="evt_old").update(
+            received_at=timezone.now() - timedelta(days=91)
+        )
+
+        self.assertEqual(prune_stripe_event_payloads(), 1)
+
+        old = StripeEvent.objects.get(stripe_event_id="evt_old")
+        self.assertEqual(old.payload, {})
+        self.assertEqual(old.event_type, "payment_intent.succeeded")
+        self.assertEqual(StripeEvent.objects.get(stripe_event_id="evt_recent").payload, payload)
+        self.assertEqual(prune_stripe_event_payloads(), 0)
+
+    def test_replay_guard_survives_pruning(self) -> None:
+        from django.db import IntegrityError, transaction
+
+        from .tasks import prune_stripe_event_payloads
+
+        StripeEvent.objects.create(stripe_event_id="evt_guard", event_type="charge.dispute.created", payload={"a": 1})
+        StripeEvent.objects.filter(stripe_event_id="evt_guard").update(
+            received_at=timezone.now() - timedelta(days=120)
+        )
+        prune_stripe_event_payloads()
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            StripeEvent.objects.create(stripe_event_id="evt_guard", event_type="charge.dispute.created")
+        self.assertEqual(StripeEvent.objects.filter(stripe_event_id="evt_guard").count(), 1)
+
+    def test_flush_expired_tokens_deletes_expired_outstanding_only(self) -> None:
+        from rest_framework_simplejwt.token_blacklist.models import OutstandingToken
+
+        from .tasks import flush_expired_jwt_tokens
+
+        user = User.objects.create_user(username="tok", password="pw12345!")
+        expired = RefreshToken.for_user(user)
+        expired_jti = expired["jti"]
+        OutstandingToken.objects.filter(jti=expired_jti).update(expires_at=timezone.now() - timedelta(days=1))
+        live_jti = RefreshToken.for_user(user)["jti"]
+
+        flush_expired_jwt_tokens()
+
+        self.assertFalse(OutstandingToken.objects.filter(jti=expired_jti).exists())
+        self.assertTrue(OutstandingToken.objects.filter(jti=live_jti).exists())
+
+
+class StaleInFlightRunTests(TestCase):
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="stale", password="pw12345!")
+        active_subscription_for(self.user)
+
+    def _stranded(self, *, hours_ago: float, run_status: str = "running") -> RecommendationRun:
+        run = RecommendationRun.objects.create(user=self.user, status=run_status)
+        RecommendationRun.objects.filter(pk=run.pk).update(
+            triggered_at=timezone.now() - timedelta(hours=hours_ago)
+        )
+        return run
+
+    def test_run_older_than_bound_no_longer_blocks_trigger(self) -> None:
+        self._stranded(hours_ago=3)
+        # The stale row is neither in flight nor (once reaped) quota-consuming;
+        # un-reaped it still counts toward the quota, so use a staff user for
+        # the pure in-flight check below and the reaper test for the quota one.
+        staff = User.objects.create_user(username="stale-staff", password="pw12345!", is_staff=True)
+        RecommendationRun.objects.create(user=staff, status="running")
+        RecommendationRun.objects.filter(user=staff).update(
+            triggered_at=timezone.now() - timedelta(hours=3)
+        )
+        self.assertEqual(start_recommendation_run(user=staff, source="test").status, "pending")
+
+    def test_run_younger_than_bound_still_blocks(self) -> None:
+        staff = User.objects.create_user(username="fresh-staff", password="pw12345!", is_staff=True)
+        RecommendationRun.objects.create(user=staff, status="running")
+        RecommendationRun.objects.filter(user=staff).update(
+            triggered_at=timezone.now() - timedelta(hours=1)
+        )
+        with self.assertRaises(RunInProgress):
+            start_recommendation_run(user=staff, source="test")
+
+    def test_reaper_fails_only_stale_rows(self) -> None:
+        from .tasks import STALE_RUN_ERROR_MESSAGE, reap_stale_runs
+
+        stale_running = self._stranded(hours_ago=3, run_status="running")
+        stale_pending = self._stranded(hours_ago=5, run_status="pending")
+        fresh = self._stranded(hours_ago=1, run_status="running")
+        old_done = self._stranded(hours_ago=9, run_status="done")
+
+        self.assertEqual(reap_stale_runs(), 2)
+
+        for run in (stale_running, stale_pending):
+            run.refresh_from_db()
+            self.assertEqual(run.status, "failed")
+            self.assertEqual(run.error_message, STALE_RUN_ERROR_MESSAGE)
+        fresh.refresh_from_db()
+        old_done.refresh_from_db()
+        self.assertEqual(fresh.status, "running")
+        self.assertEqual(old_done.status, "done")
+        self.assertEqual(reap_stale_runs(), 0)
+
+    def test_reaped_run_does_not_count_toward_quota(self) -> None:
+        from .tasks import reap_stale_runs
+
+        self._stranded(hours_ago=3, run_status="running")
+        with self.assertRaises(QuotaExceeded):
+            start_recommendation_run(user=self.user, source="test")
+        reap_stale_runs()
+        self.assertEqual(quota_snapshot(user=self.user, subscription=self.user.subscription)["runs_used"], 0)
+        self.assertEqual(start_recommendation_run(user=self.user, source="test").status, "pending")
+
+    def test_snapshot_can_trigger_agrees_with_chokepoint(self) -> None:
+        staff = User.objects.create_user(username="agree-staff", password="pw12345!", is_staff=True)
+        for hours_ago, expected in ((1, False), (3, True)):
+            RecommendationRun.objects.filter(user=staff).delete()
+            RecommendationRun.objects.create(user=staff, status="running")
+            RecommendationRun.objects.filter(user=staff).update(
+                triggered_at=timezone.now() - timedelta(hours=hours_ago)
+            )
+            snapshot = quota_snapshot(user=staff, subscription=None)
+            self.assertEqual(snapshot["can_trigger"], expected)
+            try:
+                start_recommendation_run(user=staff, source="test")
+                started = True
+            except RunInProgress:
+                started = False
+            self.assertEqual(started, expected)
+
+    def test_reaper_is_registered_in_beat_schedule(self) -> None:
+        from config.celery import app
+
+        entry = app.conf.beat_schedule["system-reap-stale-runs"]
+        self.assertEqual(entry["task"], "fragrance.tasks.reap_stale_runs")
+
+    def test_monthly_run_has_time_limits(self) -> None:
+        self.assertEqual(monthly_fragrance_run.soft_time_limit, 1200)
+        self.assertEqual(monthly_fragrance_run.time_limit, 1500)
+
+    def test_soft_time_limit_fails_the_run_without_retry(self) -> None:
+        from celery.exceptions import SoftTimeLimitExceeded
+
+        run = RecommendationRun.objects.create(user=self.user, status="pending")
+        with patch(
+            "fragrance.tasks.registry.get_active_config", side_effect=SoftTimeLimitExceeded()
+        ), patch.object(monthly_fragrance_run, "retry") as retry:
+            monthly_fragrance_run(user_id=self.user.id, run_id=run.id)
+        retry.assert_not_called()
+        run.refresh_from_db()
+        self.assertEqual(run.status, "failed")
+        self.assertTrue(run.error_message)
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
+class GrantPeriodAllowRevokedTests(TestCase):
+    def setUp(self) -> None:
+        Plan.objects.create(
+            name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
+            amount_cents=400, billing_interval="month", access_days_granted=30,
+        )
+        user = User.objects.create_user(username="disputed", email="disputed@example.com")
+        BetaSignup.objects.create(
+            email="disputed@example.com", normalized_email="disputed@example.com",
+            status="converted", invited_user=user,
+        )
+        self.subscription = Subscription.objects.create(
+            user=user, stripe_customer_id="cus_disp", status="revoked"
+        )
+        self.invoice = _fake_invoice(
+            invoice_id="in_disp", customer_id="cus_disp", subscription_id="sub_disp", amount_paid=400,
+            lines=[_fake_line(price_id="price_mo", period_end=int(timezone.now().timestamp()) + 30 * 86400)],
+        )
+
+    def test_revoked_is_not_regranted_when_disallowed(self) -> None:
+        from .billing import _grant_period_for_invoice
+
+        self.assertFalse(_grant_period_for_invoice(invoice=self.invoice, allow_revoked=False))
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "revoked")
+        self.assertIsNone(self.subscription.access_expires_at)
+        self.assertEqual(ProcessedPayment.objects.count(), 0)
+
+    def test_revoked_customer_can_resubscribe_by_default(self) -> None:
+        from .billing import _grant_period_for_invoice
+
+        self.assertTrue(_grant_period_for_invoice(invoice=self.invoice))
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "active")
+        self.assertEqual(ProcessedPayment.objects.count(), 1)
+
+    def test_reconcile_passes_allow_revoked_false(self) -> None:
+        from .billing import reconcile_subscriptions
+
+        Subscription.objects.filter(pk=self.subscription.pk).update(status="active")
+        listing = SimpleNamespace(auto_paging_iter=lambda: iter([self.invoice]))
+        with patch("fragrance.billing.stripe.Invoice.list", return_value=listing), patch(
+            "fragrance.billing._grant_period_for_invoice", return_value=True
+        ) as grant:
+            reconcile_subscriptions()
+        self.assertIs(grant.call_args.kwargs["allow_revoked"], False)
+
+    def test_dispute_landing_mid_reconcile_is_not_overwritten(self) -> None:
+        from .billing import reconcile_subscriptions
+
+        Subscription.objects.filter(pk=self.subscription.pk).update(status="active")
+
+        def _revoke_then_yield():
+            # The customer is a candidate when the listing starts; the dispute
+            # revoke lands before the grant reaches the row lock.
+            Subscription.objects.filter(pk=self.subscription.pk).update(status="revoked")
+            yield self.invoice
+
+        listing = SimpleNamespace(auto_paging_iter=_revoke_then_yield)
+        with patch("fragrance.billing.stripe.Invoice.list", return_value=listing):
+            reconcile_subscriptions()
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "revoked")
+        self.assertEqual(ProcessedPayment.objects.count(), 0)
+
+
+class FragranceConfigScheduleValidationTests(TestCase):
+    url = "/api/v1/config/"
+
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="sched", password="pw12345!")
+        active_subscription_for(self.user)
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def _put(self, **fields: int) -> object:
+        return self.client.patch(self.url, fields, format="json")
+
+    def test_out_of_range_values_are_rejected(self) -> None:
+        for field, bad in (
+            ("run_hour", 24), ("run_hour", 99), ("run_hour", -1),
+            ("run_day_of_week", 7), ("run_day_of_week", -1),
+            ("run_day_of_month", 0), ("run_day_of_month", 32),
+            ("run_month", 0), ("run_month", 13),
+        ):
+            with self.subTest(field=field, value=bad):
+                response = self._put(**{field: bad})
+                self.assertEqual(response.status_code, 400)
+                self.assertIn(field, response.json())
+
+    def test_boundary_values_are_accepted(self) -> None:
+        for field, good in (
+            ("run_hour", 0), ("run_hour", 23),
+            ("run_day_of_week", 0), ("run_day_of_week", 6),
+            ("run_day_of_month", 1), ("run_day_of_month", 31),
+            ("run_month", 1), ("run_month", 12),
+        ):
+            with self.subTest(field=field, value=good):
+                response = self._put(**{field: good})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()[field], good)
+
+    def test_rejected_value_is_not_persisted(self) -> None:
+        self._put(run_hour=99)
+        self.assertNotEqual(FragranceConfig.objects.get(user=self.user).run_hour, 99)
+
+    def test_existing_default_config_still_saves(self) -> None:
+        response = self._put(recipient_email="ok@example.com", run_hour=9, run_day_of_week=1, run_day_of_month=1, run_month=1)
+        self.assertEqual(response.status_code, 200)

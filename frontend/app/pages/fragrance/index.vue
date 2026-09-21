@@ -9,15 +9,22 @@
         </p>
       </div>
       <v-spacer />
-      <v-btn
-        color="primary"
-        variant="flat"
-        prepend-icon="mdi-plus"
-        rounded="lg"
-        @click="openCreate()"
+      <LapsedGate
+        :locked="isLapsed"
+        label="Add fragrance"
+        reason="Adding fragrances needs an active subscription."
       >
-        Add fragrance
-      </v-btn>
+        <v-btn
+          color="primary"
+          variant="flat"
+          prepend-icon="mdi-plus"
+          rounded="lg"
+          :disabled="isLapsed"
+          @click="openCreate()"
+        >
+          Add fragrance
+        </v-btn>
+      </LapsedGate>
     </div>
 
     <!-- Filtering tabs -->
@@ -106,20 +113,46 @@
 
             <v-card-actions class="px-4 pb-4 pt-0">
               <v-spacer />
-              <v-btn
-                icon="mdi-pencil-outline"
-                size="small"
-                variant="text"
-                color="secondary"
-                @click="openEdit(item)"
-              />
-              <v-btn
-                icon="mdi-delete-outline"
-                size="small"
-                variant="text"
-                color="error"
-                @click="confirmDelete(item)"
-              />
+              <v-tooltip
+                text="Editing needs an active subscription."
+                location="top"
+                open-on-hover
+                :disabled="!isLapsed"
+              >
+                <template #activator="{ props: tipProps }">
+                  <span v-bind="tipProps" class="d-inline-block">
+                    <v-btn
+                      icon="mdi-pencil-outline"
+                      size="small"
+                      variant="text"
+                      color="secondary"
+                      :aria-label="`Edit ${item.name}`"
+                      :disabled="isLapsed"
+                      @click="openEdit(item)"
+                    />
+                  </span>
+                </template>
+              </v-tooltip>
+              <v-tooltip
+                text="Deleting needs an active subscription."
+                location="top"
+                open-on-hover
+                :disabled="!isLapsed"
+              >
+                <template #activator="{ props: tipProps }">
+                  <span v-bind="tipProps" class="d-inline-block">
+                    <v-btn
+                      icon="mdi-delete-outline"
+                      size="small"
+                      variant="text"
+                      color="error"
+                      :aria-label="`Delete ${item.name}`"
+                      :disabled="isLapsed"
+                      @click="confirmDelete(item)"
+                    />
+                  </span>
+                </template>
+              </v-tooltip>
             </v-card-actions>
           </v-card>
         </v-col>
@@ -131,7 +164,28 @@
         key="empty"
         class="d-flex flex-column align-center justify-center text-center py-16"
       >
-        <template v-if="!activeTab">
+        <template v-if="!activeTab && isLapsed">
+          <v-icon
+            icon="mdi-spray"
+            size="64"
+            class="text-medium-emphasis mb-4"
+          />
+          <p class="text-body-1 text-medium-emphasis mb-1">
+            Your collection is empty.
+          </p>
+          <p class="text-body-2 text-medium-emphasis mb-6">
+            Adding fragrances needs an active subscription.
+          </p>
+          <v-btn
+            color="primary"
+            variant="flat"
+            rounded="lg"
+            to="/billing"
+          >
+            View plans
+          </v-btn>
+        </template>
+        <template v-else-if="!activeTab">
           <v-icon
             icon="mdi-spray"
             size="64"
@@ -171,6 +225,7 @@
           </p>
           <div class="d-flex ga-3">
             <v-btn
+              v-if="!isLapsed"
               color="primary"
               variant="flat"
               prepend-icon="mdi-plus"
@@ -215,6 +270,7 @@
             @update:model-value="importReset()"
           />
           <AppAlert v-model="importError" class="mt-4" />
+          <AppAlert v-model="importReadOnly" type="info" class="mt-4" />
         </v-card-text>
         <v-card-actions class="px-6 pb-6 pt-4">
           <v-spacer />
@@ -283,6 +339,7 @@
               hide-details="auto"
             />
           </v-form>
+          <AppAlert v-model="readOnlyNotice" type="info" class="mt-4" />
         </v-card-text>
         <v-card-actions class="px-6 pb-6 pt-4">
           <v-spacer />
@@ -314,6 +371,7 @@
           <p class="text-body-2 text-medium-emphasis mt-3">
             This will permanently remove the fragrance from your collection.
           </p>
+          <AppAlert v-model="deleteReadOnlyNotice" type="info" class="mt-4" />
         </v-card-text>
         <v-card-actions class="px-6 pb-6 pt-0">
           <v-spacer />
@@ -336,10 +394,12 @@
 <script setup lang="ts">
 import { useFragrance, type Fragrance, type FragranceInput } from '~/composables/useFragrance'
 import { useImport } from '~/composables/useImport'
+import { isSubscriptionRequired } from '~/composables/useApi'
 import { statusColor } from '~/utils/rating'
 
 const { fragrances, loading, hasLoaded, error, fetchFragrances, createFragrance, updateFragrance, deleteFragrance, invalidatePending } = useFragrance()
-const { loading: importLoading, error: importError, result: importResult, importCollection, reset: importReset } = useImport()
+const { isLapsed } = useSubscription()
+const { loading: importLoading, error: importError, readOnly: importReadOnly, result: importResult, importCollection, reset: importReset } = useImport()
 
 // --- Import ---
 const importDialog = ref(false)
@@ -355,7 +415,7 @@ function closeImportDialog(): void {
 
 async function runImport(): Promise<void> {
   const file = importFile.value
-  if (!file) return
+  if (!file || isLapsed.value) return
   await importCollection(file)
   if (importResult.value) {
     const { created, updated, skipped } = importResult.value
@@ -409,13 +469,20 @@ const draft = reactive<FragranceInput>({ name: '', house: '', status: 'own', not
 
 const required = (v: string) => !!v || 'Required'
 
+const readOnlyNotice = ref<string | null>(null)
+const deleteReadOnlyNotice = ref<string | null>(null)
+
 function openCreate(status?: 'own' | 'like' | 'dislike'): void {
+  if (isLapsed.value) return
+  readOnlyNotice.value = null
   editTarget.value = null
   Object.assign(draft, { name: '', house: '', status: status ?? 'own', notes: '' })
   dialog.value = true
 }
 
 function openEdit(item: Fragrance): void {
+  if (isLapsed.value) return
+  readOnlyNotice.value = null
   editTarget.value = item
   Object.assign(draft, { name: item.name, house: item.house, status: item.status, notes: item.notes })
   dialog.value = true
@@ -461,6 +528,9 @@ async function save(): Promise<void> {
     // never runs once superseded. If one was stranded, re-fetch the active tab so
     // the grid settles on genuinely correct data instead of freezing mid-dim.
     if (strandedFetch) await fetchFragrances(activeTabStatus.value)
+  } catch (err: unknown) {
+    if (!isSubscriptionRequired(err)) throw err
+    readOnlyNotice.value = READ_ONLY_WRITE_NOTICE
   } finally {
     saving.value = false
   }
@@ -472,6 +542,8 @@ const deleting = ref(false)
 const deleteTarget = ref<Fragrance | null>(null)
 
 function confirmDelete(item: Fragrance): void {
+  if (isLapsed.value) return
+  deleteReadOnlyNotice.value = null
   deleteTarget.value = item
   deleteDialog.value = true
 }
@@ -488,6 +560,9 @@ async function doDelete(): Promise<void> {
     // See save()'s comment: a fetch stranded by invalidatePending() never clears
     // loading/hasLoaded on its own, so re-fetch the active tab to resettle the grid.
     if (strandedFetch) await fetchFragrances(activeTabStatus.value)
+  } catch (err: unknown) {
+    if (!isSubscriptionRequired(err)) throw err
+    deleteReadOnlyNotice.value = READ_ONLY_WRITE_NOTICE
   } finally {
     deleting.value = false
   }

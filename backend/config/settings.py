@@ -230,6 +230,9 @@ REST_FRAMEWORK = {
         # "Refresh" button resets the frontend's pollCount, so an honest retry
         # restarts the budget and must not be throttled mid-payment.
         "billing-session": "30/min",
+        # The layout refetches subscription state on mount, on leaving
+        # /billing*, and after every 402; /api/ has no nginx limit_req.
+        "billing-status": "60/min",
     },
     # DRF's default SimpleMetadata answers OPTIONS for any caller, including
     # AllowAny views, by cloning the request per unsafe method and including
