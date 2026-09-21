@@ -8,6 +8,14 @@ If you made this change, no action is needed.{% else %}The email address on your
 
 Password reset emails will now go to the new address, not this one.
 
-If this wasn't you, contact us right away at {{ support_email }}.{% endif %}
+{% if revert_url %}If this wasn't you, open this link to restore your previous email address and sign out all sessions:
+
+{{ revert_url }}
+
+The link works once and expires in 7 days. After using it, reset your password.
+
+If the link doesn't work, contact us right away at {{ support_email }}.{% else %}If this wasn't you, contact us right away at {{ support_email }}.{% endif %}
+
+If you made this change, no action is needed.{% endif %}
 
 — Fragrances{% endautoescape %}

@@ -224,6 +224,7 @@ def send_account_email_change_notice(
     old_email: str,
     new_email: str,
     is_new_address: bool,
+    revert_token: str = '',
 ) -> None:
     """
     One half of the notice sent after billing.sync_customer_email changes
@@ -231,8 +232,9 @@ def send_account_email_change_notice(
     new (a confirmation), so a failed delivery to one retries without
     re-sending the other. Addresses are passed in rather than re-read: the
     task must describe the change that was made, even if the row changes
-    again before the worker runs. No token or link is included -- the mail
-    only informs, it cannot be used to act on the account.
+    again before the worker runs. Only the old-address warning carries a
+    revert_token (rendered as a link to the frontend's revert page, which POSTs
+    it); the new-address confirmation never does, and the token is never logged.
     """
     username = User.objects.filter(pk=user_id).values_list('username', flat=True).first()
     if username is None:
@@ -243,6 +245,11 @@ def send_account_email_change_notice(
         'new_email': new_email,
         'is_new_address': is_new_address,
         'support_email': settings.SUPPORT_EMAIL,
+        'revert_url': (
+            f"{settings.FRONTEND_URL}/auth/revert-email?token={revert_token}"
+            if revert_token and not is_new_address
+            else ''
+        ),
     }
     try:
         message = EmailMultiAlternatives(
@@ -253,6 +260,40 @@ def send_account_email_change_notice(
         )
         message.attach_alternative(
             render_to_string(template_name='fragrance/email_changed_notice.html', context=context),
+            'text/html',
+        )
+        message.send(fail_silently=False)
+    except Exception as exc:
+        if self.request.retries >= self.max_retries:
+            raise
+        raise self.retry(exc=exc, countdown=300)
+
+
+@shared_task(bind=True, max_retries=5)
+def send_email_reverted_notice(self: 'send_email_reverted_notice', user_id: int, recipient: str) -> None:
+    """
+    Sent to the restored address after billing.revert_customer_email: tells the
+    owner the email was put back, all sessions were signed out, and to reset
+    the password now. Carries no token; the only link is the plain
+    forgot-password page.
+    """
+    username = User.objects.filter(pk=user_id).values_list('username', flat=True).first()
+    if username is None:
+        return
+    context = {
+        'username': username,
+        'forgot_password_url': f"{settings.FRONTEND_URL}/auth/forgot-password",
+        'support_email': settings.SUPPORT_EMAIL,
+    }
+    try:
+        message = EmailMultiAlternatives(
+            subject='Your Fragrances account email was restored',
+            body=render_to_string(template_name='fragrance/email_reverted_notice.txt', context=context),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[recipient],
+        )
+        message.attach_alternative(
+            render_to_string(template_name='fragrance/email_reverted_notice.html', context=context),
             'text/html',
         )
         message.send(fail_silently=False)

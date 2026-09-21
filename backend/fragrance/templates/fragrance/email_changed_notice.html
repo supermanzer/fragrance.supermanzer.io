@@ -11,7 +11,13 @@
     {% else %}
     <p>The email address on your Fragrances account was changed to <strong>{{ new_email }}</strong> through billing management.</p>
     <p>Password reset emails will now go to the new address, not this one.</p>
+    {% if revert_url %}
+    <p>If this wasn't you, <a href="{{ revert_url }}">click here to restore your previous email address and sign out all sessions</a>. The link works once and expires in 7 days. After using it, reset your password.</p>
+    <p>If the link doesn't work, contact us right away at <a href="mailto:{{ support_email }}">{{ support_email }}</a>.</p>
+    {% else %}
     <p>If this wasn't you, contact us right away at <a href="mailto:{{ support_email }}">{{ support_email }}</a>.</p>
+    {% endif %}
+    <p>If you made this change, no action is needed.</p>
     {% endif %}
     <p>&mdash; Fragrances</p>
   </div>

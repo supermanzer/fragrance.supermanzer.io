@@ -242,6 +242,8 @@ REST_FRAMEWORK = {
     # beta-signup endpoint additionally carries its own scoped DRF throttle.
     "DEFAULT_THROTTLE_RATES": {
         "beta-signup": "5/min",
+        # Public, unauthenticated; /api/v1/auth/ has nginx zone=auth in front.
+        "revert-email": "10/min",
         "checkout": "10/min",
         # Above 18/min (one full success-page poll budget) with headroom: the
         # "Refresh" button resets the frontend's pollCount, so an honest retry

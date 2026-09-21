@@ -1154,6 +1154,7 @@ def sync_customer_email(*, customer: dict, previous_attributes: dict | None) -> 
 
     new_email = (customer.get("email") or "").strip()
 
+    from .services import generate_email_revert_token
     from .tasks import send_account_email_change_notice
 
     with transaction.atomic():
@@ -1193,12 +1194,17 @@ def sync_customer_email(*, customer: dict, previous_attributes: dict | None) -> 
         logger.info("synced email for user %s from stripe customer %s", user.pk, customer_id)
 
         if old_email:
+            # Minted here, in the same transaction as the change it undoes, and
+            # handed to the old-address notice only -- never the new address's.
             send_account_email_change_notice.delay(
                 user_id=user.pk,
                 recipient=old_email,
                 old_email=old_email,
                 new_email=new_email,
                 is_new_address=False,
+                revert_token=generate_email_revert_token(
+                    user_id=user.pk, old_email=old_email, new_email=new_email
+                ),
             )
         send_account_email_change_notice.delay(
             user_id=user.pk,
@@ -1207,6 +1213,105 @@ def sync_customer_email(*, customer: dict, previous_attributes: dict | None) -> 
             new_email=new_email,
             is_new_address=True,
         )
+    return True
+
+
+def blacklist_all_refresh_tokens(*, user: User) -> int:
+    """
+    Blacklists every outstanding, not-yet-blacklisted simplejwt refresh token
+    of `user`. Must run inside transaction.atomic(). Locks the user's
+    OutstandingToken rows first: AtomicTokenRefreshSerializer holds that same
+    row lock while it rotates, so an in-flight refresh either finishes (and
+    its freshly minted successor is picked up by the second, separate
+    statement below) or blocks until this transaction commits and then sees
+    its token blacklisted. Already-blacklisted rows are skipped and conflicts
+    ignored (BlacklistedToken.token is unique), so a concurrent blacklist is
+    harmless.
+    """
+    from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
+
+    list(OutstandingToken.objects.select_for_update().filter(user=user).values_list("pk", flat=True))
+    pending = list(OutstandingToken.objects.filter(user=user, blacklistedtoken__isnull=True))
+    BlacklistedToken.objects.bulk_create(
+        [BlacklistedToken(token=outstanding) for outstanding in pending], ignore_conflicts=True
+    )
+    return len(pending)
+
+
+def revert_customer_email(*, token: object) -> bool:
+    """
+    Consumes the "this wasn't me" token from the old-address notice. Returns
+    False for every rejection reason alike (the view maps that to one 400 body)
+    and True once the token was honoured.
+
+    Single-use without a table: valid only while User.email still equals the
+    token's new address, so a revert (email is now the old address) or any
+    later change kills it. Staff/superusers are never touched, mirroring
+    sync_customer_email. The password is deliberately not modified.
+
+    In one transaction, under the user row lock: restore User.email and
+    blacklist every refresh token. If another account has taken the old
+    address in the meantime the email is left alone (User.email is not
+    unique, and a duplicate would let one owner receive the other's reset
+    links) but the sessions are still killed; that path pushes nothing to
+    Stripe and mails nobody, since the old address now belongs to someone
+    else. After commit, best-effort: push the old address back to the Stripe
+    Customer (the resulting customer.updated is a no-op in
+    sync_customer_email) and queue the confirmation notice. Neither can fail
+    the request. Log lines carry ids only.
+    """
+    from .services import verify_email_revert_token
+    from .tasks import send_email_reverted_notice
+
+    payload = verify_email_revert_token(token=token)
+    if payload is None:
+        return False
+    old_email = payload["old"].strip()
+    new_email = payload["new"]
+    if not old_email:
+        return False
+
+    with transaction.atomic():
+        user = User.objects.select_for_update().filter(pk=payload["uid"]).first()
+        if user is None or is_exempt(user=user):
+            return False
+        if _normalized_email(email=user.email) != _normalized_email(email=new_email):
+            return False
+
+        conflict = User.objects.filter(email__iexact=old_email).exclude(pk=user.pk).exists()
+        if not conflict:
+            user.email = old_email
+            user.save(update_fields=["email"])
+        revoked = blacklist_all_refresh_tokens(user=user)
+        customer_id = (
+            Subscription.objects.filter(user_id=user.pk).values_list("stripe_customer_id", flat=True).first() or ""
+        )
+
+    if conflict:
+        logger.warning(
+            "email revert for user %s: old address now belongs to another account; "
+            "email left unchanged, %s refresh token(s) revoked",
+            user.pk,
+            revoked,
+        )
+        return True
+    logger.info("reverted email for user %s; %s refresh token(s) revoked", user.pk, revoked)
+
+    if customer_id:
+        try:
+            _configure_stripe()
+            stripe.Customer.modify(customer_id, email=old_email)
+        except Exception as exc:
+            logger.error(
+                "could not restore email on stripe customer %s for user %s: %s",
+                customer_id,
+                user.pk,
+                sanitize_sdk_error_message(exc),
+            )
+    try:
+        send_email_reverted_notice.delay(user_id=user.pk, recipient=old_email)
+    except Exception:
+        logger.error("could not enqueue email-restored notice for user %s; broker unavailable", user.pk)
     return True
 
 

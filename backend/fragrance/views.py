@@ -21,7 +21,7 @@ from django.views.decorators.http import require_POST
 from kombu.exceptions import OperationalError
 from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import NotFound
+from rest_framework.exceptions import NotFound, ParseError
 from rest_framework.parsers import MultiPartParser
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -365,6 +365,40 @@ class PasswordResetConfirmView(generics.GenericAPIView):
         user.set_password(serializer.validated_data['new_password'])
         user.save()
         return Response({'detail': 'Password has been reset successfully.'})
+
+
+_REVERT_EMAIL_INVALID_RESPONSE = {"detail": "This link is invalid or has expired."}
+
+
+class RevertEmailView(APIView):
+    """
+    POST {"token"} from the "this wasn't me" link in the old-address notice.
+    POST-only on purpose: mail scanners prefetch links with GET, and a state
+    change on GET would fire the revert for them (GET is 405). Every failure
+    -- bad body, bad/expired signature, unknown user, email no longer equal to
+    the token's new address, staff account -- returns the same 400 body, so
+    the endpoint is not an oracle. See billing.revert_customer_email.
+    """
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes: list = []
+    throttle_classes = [BetaSignupThrottle]
+    throttle_scope = "revert-email"
+
+    def post(self, request: Request) -> Response:
+        try:
+            data = request.data
+        except ParseError:
+            data = None
+        token = data.get("token") if isinstance(data, dict) else None
+        if not billing.revert_customer_email(token=token):
+            return Response(_REVERT_EMAIL_INVALID_RESPONSE, status=status.HTTP_400_BAD_REQUEST)
+        return Response(
+            {
+                "detail": "Your previous email address was restored and all sessions were signed out. "
+                "Reset your password now."
+            }
+        )
 
 
 class FragranceConfigView(generics.RetrieveUpdateAPIView):

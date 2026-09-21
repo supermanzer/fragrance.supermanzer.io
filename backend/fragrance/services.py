@@ -367,6 +367,44 @@ def verify_beta_invite_token(*, token: str) -> dict | None:
     return payload
 
 
+EMAIL_REVERT_SALT = "email-revert"
+EMAIL_REVERT_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
+EMAIL_REVERT_MAX_TOKEN_LENGTH = 2048
+
+
+def generate_email_revert_token(*, user_id: int, old_email: str, new_email: str) -> str:
+    """
+    Signs the "this wasn't me" link put in the old-address notice. The signed
+    addresses are what make the token single-use without a table: it is only
+    honoured while User.email still equals `new`, see billing.revert_customer_email.
+    """
+    return signing.dumps({"uid": user_id, "old": old_email, "new": new_email}, salt=EMAIL_REVERT_SALT)
+
+
+def verify_email_revert_token(*, token: object) -> dict | None:
+    """
+    Returns {"uid": int, "old": str, "new": str} or None for a missing,
+    non-string, oversized, tampered, expired or malformed token. Callers must
+    treat None as one undifferentiated "invalid or expired" outcome.
+    """
+    if not isinstance(token, str) or not token or len(token) > EMAIL_REVERT_MAX_TOKEN_LENGTH:
+        return None
+    try:
+        payload = signing.loads(token, salt=EMAIL_REVERT_SALT, max_age=EMAIL_REVERT_MAX_AGE)
+    except (signing.BadSignature, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if (
+        not isinstance(payload.get("uid"), int)
+        or isinstance(payload.get("uid"), bool)
+        or not isinstance(payload.get("old"), str)
+        or not isinstance(payload.get("new"), str)
+    ):
+        return None
+    return payload
+
+
 class BetaInviteTokenError(Exception):
     """Base for resolve_beta_invite_signup rejections."""
 

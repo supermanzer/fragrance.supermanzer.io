@@ -24,6 +24,7 @@ from fragrance.views import (
     ChangePasswordView,
     PasswordResetConfirmView,
     PasswordResetRequestView,
+    RevertEmailView,
 )
 
 urlpatterns = [
@@ -34,5 +35,6 @@ urlpatterns = [
     path('api/v1/auth/password/change/', ChangePasswordView.as_view(), name='password_change'),
     path('api/v1/auth/password/reset/', PasswordResetRequestView.as_view(), name='password_reset'),
     path('api/v1/auth/password/reset/confirm/', PasswordResetConfirmView.as_view(), name='password_reset_confirm'),
+    path('api/v1/auth/revert-email/', RevertEmailView.as_view(), name='revert_email'),
     path('api/v1/', include('fragrance.urls')),
 ]
