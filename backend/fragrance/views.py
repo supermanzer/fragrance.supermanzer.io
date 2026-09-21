@@ -1,3 +1,4 @@
+import json
 import codecs
 import csv
 import io
@@ -857,7 +858,10 @@ def stripe_webhook(request: HttpRequest) -> HttpResponse:
                 stripe_event_id=event["id"],
                 event_type=event["type"],
                 stripe_created=datetime.fromtimestamp(event["created"], tz=dt_timezone.utc),
-                payload=event.to_dict(),
+                # The signature-verified request body, parsed as plain JSON. NOT event.to_dict():
+                # the SDK parses Stripe's `*_decimal` string fields into Decimal, which a JSONField
+                # cannot store (a 500 on real price.*/invoice.* events, retried by Stripe for 3 days).
+                payload=json.loads(payload),
             )
     except IntegrityError:
         # Already seen -- Stripe explicitly does not guarantee once-only

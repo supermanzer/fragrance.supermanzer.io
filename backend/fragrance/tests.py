@@ -4507,6 +4507,32 @@ class StripeWebhookViewTests(TestCase):
         self.assertTrue(StripeEvent.objects.filter(stripe_event_id="evt_test_1").exists())
         mock_delay.assert_called_once_with(stripe_event_id="evt_test_1")
 
+    @patch("fragrance.tasks.process_stripe_event.delay")
+    def test_event_with_decimal_typed_field_is_stored_not_500(self, mock_delay) -> None:
+        # Regression, found by the sandbox walkthrough: the stripe SDK parses Stripe's `*_decimal`
+        # string fields (Price.unit_amount_decimal, invoice line amounts, ...) into Python Decimal,
+        # and `event.to_dict()` keeps them. StripeEvent.payload is a JSONField, so storing
+        # `event.to_dict()` raised "Decimal is not JSON serializable" and returned a 500 for any
+        # real event carrying such a field, which Stripe then retries for three days. The mocks
+        # never caught it because no fake event had a decimal-typed field. We now store the
+        # signature-verified request body as JSON, which is lossless and needs no SDK conversion.
+        body = json.dumps({
+            "id": "evt_decimal_1", "object": "event", "type": "price.created",
+            "created": 1758300000,
+            "data": {"object": {
+                "id": "price_dec_1", "object": "price", "currency": "usd",
+                "unit_amount": 400, "unit_amount_decimal": "400",
+                "recurring": {"interval": "month"},
+            }},
+        }).encode()
+
+        response = self._signed_post(self.slash_url, body)
+
+        self.assertEqual(response.status_code, 200)
+        stored = StripeEvent.objects.get(stripe_event_id="evt_decimal_1")
+        self.assertEqual(stored.payload["data"]["object"]["unit_amount_decimal"], "400")
+        mock_delay.assert_called_once_with(stripe_event_id="evt_decimal_1")
+
     def test_tampered_body_returns_400(self) -> None:
         body = json.dumps({
             "id": "evt_bad", "object": "event", "type": "payment_intent.succeeded",
