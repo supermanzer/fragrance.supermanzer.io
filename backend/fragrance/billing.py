@@ -43,7 +43,8 @@ import stripe
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.cache import cache
-from django.core.exceptions import ImproperlyConfigured
+from django.core.exceptions import ImproperlyConfigured, ValidationError
+from django.core.validators import validate_email
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
@@ -155,6 +156,10 @@ class CheckoutError(Exception):
 
 class SubscriptionAlreadyActiveError(CheckoutError):
     """Raised when the requesting user already has active access -- checkout is a 409."""
+
+
+class TermsUrlNotConfiguredError(CheckoutError):
+    """STRIPE_REQUIRE_TOS_CONSENT is on but the Stripe account has no Terms URL."""
 
 
 class UnknownPlanError(CheckoutError):
@@ -317,6 +322,12 @@ def _reusable_open_session_url(
       paywall before finishing checkout): expire it so it can't be
       completed against stale pricing, then fall through to minting a new
       one.
+    - Open but created under the other STRIPE_REQUIRE_TOS_CONSENT setting
+      (e.g. before the flag existed): expire it the same way. A reused
+      session would otherwise skip the Terms checkbox, or keep demanding
+      one the operator has switched off. The session's own
+      `consent_collection` is the record of what it was created with, so no
+      extra metadata marker is needed.
     - Anything else (complete, expired): nothing to reuse.
     """
     session_id = subscription.last_checkout_session_id
@@ -336,9 +347,14 @@ def _reusable_open_session_url(
     # the same "validate the price, not a proxy for it" reasoning the plan
     # applies everywhere else in this file.
     metadata = _metadata_dict(existing)
+    consent_collection = getattr(existing, "consent_collection", None)
+    has_tos_consent = (
+        getattr(consent_collection, "terms_of_service", None) == "required"
+    )
     if (
         metadata.get("plan_slug") == plan.slug
         and metadata.get("price_id") == plan.stripe_price_id
+        and has_tos_consent == settings.STRIPE_REQUIRE_TOS_CONSENT
     ):
         return existing.url
     stripe.checkout.Session.expire(session_id)
@@ -365,7 +381,7 @@ def create_checkout_session(*, user: User, plan_slug: str) -> str:
 
     customer_id = _get_or_create_customer(user=user, subscription=subscription)
 
-    session = stripe.checkout.Session.create(
+    session_params: dict[str, Any] = dict(
         mode="subscription",
         line_items=[{"price": plan.stripe_price_id, "quantity": 1}],
         customer=customer_id,
@@ -383,6 +399,20 @@ def create_checkout_session(*, user: User, plan_slug: str) -> str:
         success_url=f"{settings.FRONTEND_URL}/billing/success?session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=f"{settings.FRONTEND_URL}/billing",
     )
+    if settings.STRIPE_REQUIRE_TOS_CONSENT:
+        session_params["consent_collection"] = {"terms_of_service": "required"}
+    try:
+        session = stripe.checkout.Session.create(**session_params)
+    except stripe.InvalidRequestError as exc:
+        if settings.STRIPE_REQUIRE_TOS_CONSENT and "terms of service" in str(exc).lower():
+            logger.error(
+                "checkout failed: STRIPE_REQUIRE_TOS_CONSENT is on but the Stripe account has no "
+                "Terms of Service URL. Set it in the Stripe Dashboard (Settings > Business > Public "
+                "details) for this mode, or set STRIPE_REQUIRE_TOS_CONSENT=False. Stripe said: %s",
+                sanitize_sdk_error_message(exc),
+            )
+            raise TermsUrlNotConfiguredError() from exc
+        raise
 
     subscription.status = "checkout_started"
     subscription.last_checkout_session_id = session.id
@@ -772,6 +802,13 @@ def fulfill_checkout_session(*, session_id: str, user: User) -> dict:
         )
         raise SessionOwnershipError()
 
+    consent = getattr(session, "consent", None)
+    if getattr(consent, "terms_of_service", None) == "accepted":
+        # Not persisted (no model for it); the log line is the only record.
+        logger.info(
+            "checkout session %s: user %s accepted the terms of service", session_id, user.id
+        )
+
     subscription, _ = Subscription.objects.get_or_create(user=user)
     granted = False
     invoice = getattr(session, "invoice", None)
@@ -1080,6 +1117,97 @@ def revoke_for_dispute(*, dispute: dict) -> None:
         customer_id,
         ", ".join(cancelled) or "(none live)",
     )
+
+
+def _normalized_email(*, email: str | None) -> str:
+    return (email or "").strip().lower()
+
+
+def sync_customer_email(*, customer: dict, previous_attributes: dict | None) -> bool:
+    """
+    customer.updated handler, invoked from tasks.process_stripe_event with the
+    stored `data.object` (a plain dict) and `data.previous_attributes`. Mirrors
+    an email edited in the Stripe Customer Portal onto User.email, since
+    PasswordResetRequestView keys on it. Returns True only when User.email
+    was actually changed.
+
+    Resolves the account by Subscription.stripe_customer_id and nothing else
+    (never by email). Idempotent: once User.email equals the Stripe value a
+    replay is a no-op, so the notices go out exactly once. Never pushes
+    anything back to Stripe. Log lines carry ids only, never addresses.
+
+    The notices are queued inside the transaction on purpose: if the broker
+    is down the exception rolls the email change back and process_stripe_event
+    retries the whole thing, instead of committing a change nobody is told
+    about. The tasks are handed the addresses, not a DB read, so a worker
+    that runs before commit still sends the right thing.
+    """
+    customer_id = customer.get("id") or ""
+    if not customer_id:
+        logger.warning("customer.updated had no customer id; nothing to sync")
+        return False
+    # previous_attributes names only the fields that changed. Present and
+    # without `email` means some other field changed -- not our concern. Absent
+    # or empty (a replayed/reconciled payload) falls through to a value compare.
+    if previous_attributes and "email" not in previous_attributes:
+        return False
+
+    new_email = (customer.get("email") or "").strip()
+
+    from .tasks import send_account_email_change_notice
+
+    with transaction.atomic():
+        subscription = Subscription.objects.filter(stripe_customer_id=customer_id).first()
+        if subscription is None:
+            logger.info("customer.updated for %s has no local Subscription; ignoring", customer_id)
+            return False
+        user = User.objects.select_for_update().get(pk=subscription.user_id)
+        if is_exempt(user=user):
+            logger.info("customer.updated for exempt user %s; email not synced", user.pk)
+            return False
+        if _normalized_email(email=new_email) == _normalized_email(email=user.email):
+            return False
+        if not new_email:
+            logger.warning("customer.updated for user %s carried an empty email; skipping", user.pk)
+            return False
+        try:
+            validate_email(new_email)
+        except ValidationError:
+            logger.warning("customer.updated for user %s carried an invalid email; skipping", user.pk)
+            return False
+        if len(new_email) > User._meta.get_field("email").max_length:
+            logger.warning("customer.updated for user %s carried an over-long email; skipping", user.pk)
+            return False
+        # User.email is not unique. Creating a second holder would make password
+        # reset mail every holder and let one account's owner receive another's link.
+        if User.objects.filter(email__iexact=new_email).exclude(pk=user.pk).exists():
+            logger.warning(
+                "customer.updated for user %s wanted an email another account already uses; skipping",
+                user.pk,
+            )
+            return False
+
+        old_email = user.email
+        user.email = new_email
+        user.save(update_fields=["email"])
+        logger.info("synced email for user %s from stripe customer %s", user.pk, customer_id)
+
+        if old_email:
+            send_account_email_change_notice.delay(
+                user_id=user.pk,
+                recipient=old_email,
+                old_email=old_email,
+                new_email=new_email,
+                is_new_address=False,
+            )
+        send_account_email_change_notice.delay(
+            user_id=user.pk,
+            recipient=new_email,
+            old_email=old_email,
+            new_email=new_email,
+            is_new_address=True,
+        )
+    return True
 
 
 DISPUTE_LIVE_SUBSCRIPTION_STATUSES = frozenset({"active", "past_due", "unpaid", "trialing", "incomplete"})

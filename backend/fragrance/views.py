@@ -728,6 +728,12 @@ class BillingCheckoutView(generics.GenericAPIView):
                 {"detail": "Checkout is temporarily unavailable."},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
+        except billing.TermsUrlNotConfiguredError:
+            # Already logged with the fix by billing.create_checkout_session.
+            return Response(
+                {"detail": "Could not start checkout. Please try again shortly."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
         except stripe.StripeError as exc:
             logger.error("stripe checkout session creation failed: %s", sanitize_sdk_error_message(exc))
             return Response(

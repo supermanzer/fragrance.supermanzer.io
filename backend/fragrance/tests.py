@@ -3643,6 +3643,7 @@ class BillingCheckoutViewTests(TestCase):
         mock_retrieve.return_value = SimpleNamespace(
             status="open", url="https://checkout.stripe.com/cs_existing",
             metadata={"plan_slug": "beta-monthly", "price_id": "price_mo"},
+            consent_collection=SimpleNamespace(terms_of_service="required"),
         )
 
         response = self.client.post(self.url, {"slug": "beta-monthly"})
@@ -3666,6 +3667,7 @@ class BillingCheckoutViewTests(TestCase):
             "id": "cs_real_obj", "object": "checkout.session", "status": "open", "mode": "subscription",
             "url": "https://checkout.stripe.com/cs_real_obj",
             "metadata": {"plan_slug": "beta-monthly", "price_id": "price_mo"},
+            "consent_collection": {"terms_of_service": "required"},
         }, "sk_test_dummy")
         self.assertFalse(hasattr(real.metadata, "get") and isinstance(real.metadata, dict))
         mock_retrieve.return_value = real

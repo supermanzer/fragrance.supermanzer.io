@@ -12,7 +12,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
-from django.core.mail import EmailMessage, send_mail
+from django.core.mail import EmailMessage, EmailMultiAlternatives, send_mail
 from django.db.models import Max
 from django.template.loader import render_to_string
 from django.utils import timezone
@@ -44,13 +44,17 @@ from .services import (
 # Used only by process_stripe_event.
 STRIPE_UNSETTLED_RETRY_COUNTDOWNS = (30, 60, 120)
 
-# The only two event types the endpoint is configured for in the Stripe
+# The only event types the endpoint is configured for in the Stripe
 # Dashboard -- kept here, not in views.stripe_webhook, since this is the
 # point that decides whether to act, not just whether to store. Anything
 # else that reaches this task (a Dashboard misconfiguration, or an event
 # type added there without a matching handler) is a documented no-op, not
 # an error: the StripeEvent row is still marked 'processed'.
-STRIPE_HANDLED_EVENT_TYPES = {"payment_intent.succeeded", "charge.dispute.created"}
+STRIPE_HANDLED_EVENT_TYPES = {
+    "payment_intent.succeeded",
+    "charge.dispute.created",
+    "customer.updated",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +217,52 @@ def send_password_reset_email(self: 'send_password_reset_email', user_id: int) -
 
 
 @shared_task(bind=True, max_retries=5)
+def send_account_email_change_notice(
+    self: 'send_account_email_change_notice',
+    user_id: int,
+    recipient: str,
+    old_email: str,
+    new_email: str,
+    is_new_address: bool,
+) -> None:
+    """
+    One half of the notice sent after billing.sync_customer_email changes
+    User.email: queued once for the old address (a warning) and once for the
+    new (a confirmation), so a failed delivery to one retries without
+    re-sending the other. Addresses are passed in rather than re-read: the
+    task must describe the change that was made, even if the row changes
+    again before the worker runs. No token or link is included -- the mail
+    only informs, it cannot be used to act on the account.
+    """
+    username = User.objects.filter(pk=user_id).values_list('username', flat=True).first()
+    if username is None:
+        return
+    context = {
+        'username': username,
+        'old_email': old_email,
+        'new_email': new_email,
+        'is_new_address': is_new_address,
+        'support_email': settings.SUPPORT_EMAIL,
+    }
+    try:
+        message = EmailMultiAlternatives(
+            subject='Your Fragrances account email was changed',
+            body=render_to_string(template_name='fragrance/email_changed_notice.txt', context=context),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[recipient],
+        )
+        message.attach_alternative(
+            render_to_string(template_name='fragrance/email_changed_notice.html', context=context),
+            'text/html',
+        )
+        message.send(fail_silently=False)
+    except Exception as exc:
+        if self.request.retries >= self.max_retries:
+            raise
+        raise self.retry(exc=exc, countdown=300)
+
+
+@shared_task(bind=True, max_retries=5)
 def send_recommendation_email(self: 'send_recommendation_email', user_id: int, run_id: int) -> None:
     """Sends the recommendation email for a completed run. Retried independently of generation."""
     try:
@@ -354,7 +404,12 @@ def process_stripe_event(self: 'process_stripe_event', stripe_event_id: str) -> 
     a directly-passed payload, so retries replay from committed state
     instead of a stale in-memory dict.
     """
-    from .billing import InvoiceNotSettledError, fulfill_payment_intent, revoke_for_dispute
+    from .billing import (
+        InvoiceNotSettledError,
+        fulfill_payment_intent,
+        revoke_for_dispute,
+        sync_customer_email,
+    )
 
     try:
         event_row = StripeEvent.objects.get(stripe_event_id=stripe_event_id)
@@ -368,6 +423,11 @@ def process_stripe_event(self: 'process_stripe_event', stripe_event_id: str) -> 
             fulfill_payment_intent(payment_intent_id=data_object.get('id', ''))
         elif event_row.event_type == 'charge.dispute.created':
             revoke_for_dispute(dispute=data_object)
+        elif event_row.event_type == 'customer.updated':
+            sync_customer_email(
+                customer=data_object,
+                previous_attributes=event_row.payload.get('data', {}).get('previous_attributes'),
+            )
         elif event_row.event_type not in STRIPE_HANDLED_EVENT_TYPES:
             pass  # unsubscribed event type reached the endpoint anyway -- ignored, not an error
         event_row.status = 'processed'

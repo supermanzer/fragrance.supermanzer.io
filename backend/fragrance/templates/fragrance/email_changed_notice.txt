@@ -1,0 +1,13 @@
+{% autoescape off %}Hi {{ username }},
+
+{% if is_new_address %}The email address on your Fragrances account is now this one. It was changed from {{ old_email }} to {{ new_email }} through billing management.
+
+Password reset emails will be sent to this address from now on.
+
+If you made this change, no action is needed.{% else %}The email address on your Fragrances account was changed to {{ new_email }} through billing management.
+
+Password reset emails will now go to the new address, not this one.
+
+If this wasn't you, contact us right away at {{ support_email }}.{% endif %}
+
+— Fragrances{% endautoescape %}

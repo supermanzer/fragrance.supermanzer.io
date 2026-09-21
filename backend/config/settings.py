@@ -166,6 +166,11 @@ STRIPE_API_VERSION = "2026-08-26.dahlia"
 # configuration, which is more permissive than ours (name/address/phone edits),
 # so the portal endpoint refuses (503) when this is empty unless DEBUG is on.
 STRIPE_PORTAL_CONFIGURATION_ID = config("STRIPE_PORTAL_CONFIGURATION_ID", default="")
+# Adds consent_collection={"terms_of_service": "required"} to Checkout Sessions. Stripe
+# rejects Session.create while no Terms URL is set in Dashboard > Settings > Business >
+# Public details (not API-settable on our own account), so this is a flag: set it to
+# False until that URL exists. See billing.create_checkout_session.
+STRIPE_REQUIRE_TOS_CONSENT = config("STRIPE_REQUIRE_TOS_CONSENT", default=True, cast=bool)
 
 # Celery async task worker(s)
 # https://docs.celeryq.dev/en/latest/django/first-steps-with-django.html
@@ -210,6 +215,10 @@ DEFAULT_FROM_EMAIL = config(
     "DEFAULT_FROM_EMAIL", default="noreply@supermanzer.io"
 )
 SERVER_EMAIL = config("DEFAULT_FROM_EMAIL", default="noreply@supermanzer.io")
+# Shown in account-security notices ("if this wasn't you, contact us"). DEFAULT_FROM_EMAIL
+# is a noreply address, so this is separate. The default is a placeholder: confirm it is a
+# mailbox someone reads, or set SUPPORT_EMAIL.
+SUPPORT_EMAIL = config("SUPPORT_EMAIL", default="support@supermanzer.io")
 ANYMAIL = {
     "POSTMARK_SERVER_TOKEN": config("POSTMARK_SERVER_TOKEN"),
 }
