@@ -7,6 +7,7 @@ Implements Celery tasks for Fragrance Recommendation Runs
 import logging
 from datetime import timedelta
 
+import stripe
 from celery import shared_task
 from celery.exceptions import SoftTimeLimitExceeded
 from django.conf import settings
@@ -27,7 +28,15 @@ from .ai_providers.registry import (
     NoActiveAIModelConfigError,
 )
 from .llm import generate_email_content, generate_preference_profile, select_candidates
-from .models import BetaSignup, Fragrance, FragranceConfig, PreferenceProfile, RecommendationRun, StripeEvent
+from .models import (
+    BetaSignup,
+    Fragrance,
+    FragranceConfig,
+    PreferenceProfile,
+    RecommendationRun,
+    StripeEvent,
+    Subscription,
+)
 from .search import run_discovery_searches, verify_candidates
 from .permissions import SubscriptionRequired
 from .services import (
@@ -298,6 +307,48 @@ def send_email_reverted_notice(self: 'send_email_reverted_notice', user_id: int,
         )
         message.send(fail_silently=False)
     except Exception as exc:
+        if self.request.retries >= self.max_retries:
+            raise
+        raise self.retry(exc=exc, countdown=300)
+
+
+@shared_task(bind=True, max_retries=5)
+def restore_stripe_customer_email(
+    self: 'restore_stripe_customer_email', user_id: int, customer_id: str, email: str
+) -> None:
+    """
+    Pushes the address restored by billing.revert_customer_email back onto the
+    Stripe Customer, so Stripe stops holding the attacker's address. Safe to
+    retry or replay: it does nothing if the customer already has the address.
+    Unlike the notice tasks this deliberately re-reads the DB at run time: a
+    later legitimate email change must never be overwritten with a stale
+    address, so it skips unless User.email still equals `email` and the
+    customer is still this user's Subscription customer. Logs carry ids only.
+    """
+    from .billing import _configure_stripe, _normalized_email
+
+    current = User.objects.filter(pk=user_id).values_list('email', flat=True).first()
+    if current is None or _normalized_email(email=current) != _normalized_email(email=email):
+        logger.info('skipping stripe email restore for user %s: local email changed since the revert', user_id)
+        return
+    if not Subscription.objects.filter(user_id=user_id, stripe_customer_id=customer_id).exists():
+        logger.warning('skipping stripe email restore for user %s: customer %s is not theirs', user_id, customer_id)
+        return
+    try:
+        _configure_stripe()
+        customer = stripe.Customer.retrieve(customer_id)
+        if _normalized_email(email=getattr(customer, 'email', None)) == _normalized_email(email=email):
+            logger.info('stripe customer %s already has the restored email for user %s', customer_id, user_id)
+            return
+        stripe.Customer.modify(customer_id, email=email)
+        logger.info('restored email on stripe customer %s for user %s', customer_id, user_id)
+    except Exception as exc:
+        logger.error(
+            'could not restore email on stripe customer %s for user %s: %s',
+            customer_id,
+            user_id,
+            sanitize_sdk_error_message(exc),
+        )
         if self.request.retries >= self.max_retries:
             raise
         raise self.retry(exc=exc, countdown=300)

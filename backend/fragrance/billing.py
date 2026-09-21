@@ -31,7 +31,7 @@ just entered from the invoice side rather than through a PaymentIntent.
 import logging
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta
@@ -1131,6 +1131,13 @@ def sync_customer_email(*, customer: dict, previous_attributes: dict | None) -> 
     PasswordResetRequestView keys on it. Returns True only when User.email
     was actually changed.
 
+    Acts only on an event whose `previous_attributes` is a non-empty mapping
+    containing `email`, i.e. one that really changed the email. Absent, empty,
+    or email-less previous_attributes is a no-op with no value comparison:
+    otherwise, if restoring the old address on the Stripe customer after a
+    revert failed, any later customer.updated would re-sync the attacker's
+    address onto the user.
+
     Resolves the account by Subscription.stripe_customer_id and nothing else
     (never by email). Idempotent: once User.email equals the Stripe value a
     replay is a no-op, so the notices go out exactly once. Never pushes
@@ -1146,10 +1153,8 @@ def sync_customer_email(*, customer: dict, previous_attributes: dict | None) -> 
     if not customer_id:
         logger.warning("customer.updated had no customer id; nothing to sync")
         return False
-    # previous_attributes names only the fields that changed. Present and
-    # without `email` means some other field changed -- not our concern. Absent
-    # or empty (a replayed/reconciled payload) falls through to a value compare.
-    if previous_attributes and "email" not in previous_attributes:
+    if not isinstance(previous_attributes, Mapping) or "email" not in previous_attributes:
+        logger.info("customer.updated for %s did not change the email; nothing to sync", customer_id)
         return False
 
     new_email = (customer.get("email") or "").strip()
@@ -1255,13 +1260,14 @@ def revert_customer_email(*, token: object) -> bool:
     unique, and a duplicate would let one owner receive the other's reset
     links) but the sessions are still killed; that path pushes nothing to
     Stripe and mails nobody, since the old address now belongs to someone
-    else. After commit, best-effort: push the old address back to the Stripe
-    Customer (the resulting customer.updated is a no-op in
-    sync_customer_email) and queue the confirmation notice. Neither can fail
-    the request. Log lines carry ids only.
+    else. After commit, best-effort: queue tasks.restore_stripe_customer_email
+    (pushes the old address back to the Stripe Customer, with retries; the
+    resulting customer.updated is a no-op in sync_customer_email) and the
+    confirmation notice. A queueing failure cannot fail the request. Log lines
+    carry ids only.
     """
     from .services import verify_email_revert_token
-    from .tasks import send_email_reverted_notice
+    from .tasks import restore_stripe_customer_email, send_email_reverted_notice
 
     payload = verify_email_revert_token(token=token)
     if payload is None:
@@ -1299,15 +1305,9 @@ def revert_customer_email(*, token: object) -> bool:
 
     if customer_id:
         try:
-            _configure_stripe()
-            stripe.Customer.modify(customer_id, email=old_email)
-        except Exception as exc:
-            logger.error(
-                "could not restore email on stripe customer %s for user %s: %s",
-                customer_id,
-                user.pk,
-                sanitize_sdk_error_message(exc),
-            )
+            restore_stripe_customer_email.delay(user_id=user.pk, customer_id=customer_id, email=old_email)
+        except Exception:
+            logger.error("could not enqueue stripe email restore for user %s; broker unavailable", user.pk)
     try:
         send_email_reverted_notice.delay(user_id=user.pk, recipient=old_email)
     except Exception:

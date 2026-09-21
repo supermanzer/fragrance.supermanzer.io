@@ -146,11 +146,39 @@ class SyncCustomerEmailTests(_EmailSyncBase):
         self.assertEqual(self._email(), "alice@old.example")
         self.mock_delay.assert_not_called()
 
-    def test_absent_previous_attributes_falls_back_to_value_comparison(self) -> None:
+    def test_absent_empty_or_emailless_previous_attributes_are_noops(self) -> None:
+        # Stripe's email differs from User.email in every case; still nothing may change.
+        cases = {"absent": None, "empty": {}, "no_email_key": {"name": "Old Name"}}
+        for name, previous in cases.items():
+            with self.subTest(case=name):
+                _store_customer_updated(
+                    event_id=f"evt_{name}", customer_id="cus_alice", email="attacker@evil.example",
+                    previous=previous,
+                )
+                with self.assertLogs("fragrance.billing", level=logging.INFO) as logs:
+                    process_stripe_event(stripe_event_id=f"evt_{name}")
+                self.assertEqual(self._email(), "alice@old.example")
+                self.assertEqual(StripeEvent.objects.get(stripe_event_id=f"evt_{name}").status, "processed")
+                self.assertNotIn("evil.example", "\n".join(logs.output).lower())
+        self.mock_delay.assert_not_called()
+
+    def test_post_revert_stripe_still_holding_attacker_address_is_not_resynced(self) -> None:
+        # Revert restored User.email, but the push to Stripe failed: Stripe still
+        # has the attacker's address. A later unrelated update must not re-sync it.
         _store_customer_updated(
-            event_id="evt_noprev", customer_id="cus_alice", email="alice@new.example", previous=None
+            event_id="evt_postrevert", customer_id="cus_alice", email="attacker@evil.example",
+            previous={"default_source": None},
         )
-        process_stripe_event(stripe_event_id="evt_noprev")
+        process_stripe_event(stripe_event_id="evt_postrevert")
+        _store_customer_updated(
+            event_id="evt_postrevert2", customer_id="cus_alice", email="attacker@evil.example", previous={},
+        )
+        process_stripe_event(stripe_event_id="evt_postrevert2")
+        self.assertEqual(self._email(), "alice@old.example")
+        self.mock_delay.assert_not_called()
+
+    def test_real_email_change_with_previous_email_still_syncs(self) -> None:
+        self._process(event_id="evt_real", email="alice@new.example", previous={"email": "alice@old.example"})
         self.assertEqual(self._email(), "alice@new.example")
         self.assertEqual(self.mock_delay.call_count, 2)
 

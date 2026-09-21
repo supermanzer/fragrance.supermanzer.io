@@ -2,8 +2,8 @@
 Tests for the "this wasn't me" email revert: the signed link in the old-address
 notice, POST /api/v1/auth/revert-email/, and billing.revert_customer_email.
 
-Stripe objects are real SDK objects via `construct_from`; only the network call
-(`stripe.Customer.modify`) is patched.
+Stripe objects are real SDK objects via `construct_from`; only the network calls
+(`stripe.Customer.retrieve`/`modify`) are patched.
 """
 
 import logging
@@ -28,7 +28,14 @@ from .services import (
     generate_email_revert_token,
     verify_email_revert_token,
 )
-from .tasks import process_stripe_event, send_account_email_change_notice, send_email_reverted_notice
+from celery.exceptions import Retry
+
+from .tasks import (
+    process_stripe_event,
+    restore_stripe_customer_email,
+    send_account_email_change_notice,
+    send_email_reverted_notice,
+)
 from .views import FailOpenScopedRateThrottle
 
 _KEY = "sk_test_dummy"
@@ -62,6 +69,12 @@ class _RevertBase(TestCase):
         modify = patch("fragrance.billing.stripe.Customer.modify", return_value=_customer(email=OLD))
         self.mock_modify = modify.start()
         self.addCleanup(modify.stop)
+        retrieve = patch("fragrance.billing.stripe.Customer.retrieve", return_value=_customer(email=NEW))
+        self.mock_retrieve = retrieve.start()
+        self.addCleanup(retrieve.stop)
+        restore = patch("fragrance.tasks.restore_stripe_customer_email.delay")
+        self.mock_restore = restore.start()
+        self.addCleanup(restore.stop)
         notice = patch("fragrance.tasks.send_email_reverted_notice.delay")
         self.mock_notice = notice.start()
         self.addCleanup(notice.stop)
@@ -243,7 +256,7 @@ class DuplicateAddressTests(_RevertBase):
         self.assertEqual(self._email(), NEW)
         self.assertEqual(User.objects.filter(email__iexact=OLD).count(), 1)
         self.assertTrue(BlacklistedToken.objects.filter(token__jti=refresh["jti"]).exists())
-        self.mock_modify.assert_not_called()
+        self.mock_restore.assert_not_called()
         self.mock_notice.assert_not_called()
         joined = "\n".join(logs.output).lower()
         self.assertNotIn("old.example", joined)
@@ -258,30 +271,26 @@ class DuplicateAddressTests(_RevertBase):
 
 
 class StripePushAndNoticeTests(_RevertBase):
-    def test_stripe_is_pushed_the_old_email_after_commit(self) -> None:
+    def test_stripe_restore_is_queued_with_ids_and_the_old_email(self) -> None:
         self.assertEqual(self._post().status_code, 200)
-        self.mock_modify.assert_called_once_with("cus_alice", email=OLD)
+        self.mock_restore.assert_called_once_with(user_id=self.user.pk, customer_id="cus_alice", email=OLD)
+        self.mock_modify.assert_not_called()
 
-    def test_stripe_failure_does_not_fail_the_request_and_is_sanitized(self) -> None:
-        self.mock_modify.side_effect = stripe.APIConnectionError("boom secret-detail")
+    def test_stripe_restore_queue_failure_does_not_fail_the_request(self) -> None:
+        self.mock_restore.side_effect = OSError("broker down secret-detail")
         with self.assertLogs("fragrance.billing", level=logging.ERROR) as logs:
             response = self._post()
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self._email(), OLD)
-        self.assertNotIn("secret-detail", "\n".join(logs.output))
-        self.assertNotIn("old.example", "\n".join(logs.output))
-
-    def test_unconfigured_stripe_does_not_fail_the_request(self) -> None:
-        with override_settings(STRIPE_SECRET_KEY=""):
-            with self.assertLogs("fragrance.billing", level=logging.ERROR):
-                response = self._post()
-        self.assertEqual(response.status_code, 200)
-        self.mock_modify.assert_not_called()
+        self.mock_notice.assert_called_once()
+        joined = "\n".join(logs.output)
+        self.assertNotIn("secret-detail", joined)
+        self.assertNotIn("old.example", joined)
 
     def test_user_without_a_stripe_customer_skips_the_push(self) -> None:
         Subscription.objects.filter(user=self.user).update(stripe_customer_id="")
         self.assertEqual(self._post().status_code, 200)
-        self.mock_modify.assert_not_called()
+        self.mock_restore.assert_not_called()
 
     def test_broker_failure_does_not_fail_the_request(self) -> None:
         self.mock_notice.side_effect = OSError("broker down")
@@ -297,7 +306,7 @@ class StripePushAndNoticeTests(_RevertBase):
     def test_failed_revert_queues_and_pushes_nothing(self) -> None:
         self._post(token="junk")
         self.mock_notice.assert_not_called()
-        self.mock_modify.assert_not_called()
+        self.mock_restore.assert_not_called()
 
     def test_customer_updated_after_the_push_is_a_noop(self) -> None:
         self._post()
@@ -407,3 +416,100 @@ class NoticeLinkTests(TestCase):
         self.assertNotIn("revert_token", by_recipient["dave@new.example"])
         payload = verify_email_revert_token(token=by_recipient["dave@old.example"]["revert_token"])
         self.assertEqual(payload, {"uid": user.pk, "old": "dave@old.example", "new": "dave@new.example"})
+
+
+class RestoreStripeCustomerEmailTaskTests(_RevertBase):
+    def setUp(self) -> None:
+        super().setUp()
+        # Post-revert state: the DB holds the restored address, Stripe the attacker's.
+        self.user.email = OLD
+        self.user.save()
+
+    def _run(self, *, retries: int = 0, email: str = OLD, customer_id: str = "cus_alice") -> None:
+        restore_stripe_customer_email.push_request(retries=retries)
+        try:
+            restore_stripe_customer_email(user_id=self.user.pk, customer_id=customer_id, email=email)
+        finally:
+            restore_stripe_customer_email.pop_request()
+
+    def test_modifies_stripe_when_customer_still_has_the_attacker_address(self) -> None:
+        self._run()
+        self.mock_retrieve.assert_called_once_with("cus_alice")
+        self.mock_modify.assert_called_once_with("cus_alice", email=OLD)
+
+    def test_skips_when_stripe_already_matches_case_insensitively(self) -> None:
+        self.mock_retrieve.return_value = _customer(email=OLD.upper())
+        self._run()
+        self.mock_modify.assert_not_called()
+
+    def test_skips_when_user_email_changed_since(self) -> None:
+        self.user.email = "later@legit.example"
+        self.user.save()
+        with self.assertLogs("fragrance.tasks", level=logging.INFO) as logs:
+            self._run()
+        self.mock_retrieve.assert_not_called()
+        self.mock_modify.assert_not_called()
+        self.assertNotIn("legit.example", "\n".join(logs.output))
+
+    def test_skips_for_deleted_user_and_foreign_customer(self) -> None:
+        self._run(customer_id="cus_someone_else")
+        self.mock_modify.assert_not_called()
+        user_id = self.user.pk
+        self.user.delete()
+        restore_stripe_customer_email(user_id=user_id, customer_id="cus_alice", email=OLD)
+        self.mock_modify.assert_not_called()
+
+    def test_stripe_error_schedules_a_300s_retry_and_logs_sanitized_ids_only(self) -> None:
+        self.mock_modify.side_effect = stripe.APIConnectionError("boom secret-detail")
+        with patch.object(restore_stripe_customer_email, "retry", side_effect=Retry()) as retry:
+            with self.assertLogs("fragrance.tasks", level=logging.ERROR) as logs:
+                with self.assertRaises(Retry):
+                    self._run()
+        self.assertEqual(retry.call_args.kwargs["countdown"], 300)
+        joined = "\n".join(logs.output)
+        self.assertNotIn("secret-detail", joined)
+        self.assertNotIn("old.example", joined)
+        self.assertNotIn("evil.example", joined)
+        self.assertIn("cus_alice", joined)
+
+    def test_retrieve_error_also_retries(self) -> None:
+        self.mock_retrieve.side_effect = stripe.APIConnectionError("boom")
+        with patch.object(restore_stripe_customer_email, "retry", side_effect=Retry()) as retry:
+            with self.assertRaises(Retry):
+                self._run()
+        retry.assert_called_once()
+
+    def test_stops_retrying_at_max_retries(self) -> None:
+        self.mock_modify.side_effect = stripe.APIConnectionError("boom")
+        with patch.object(restore_stripe_customer_email, "retry") as retry:
+            with self.assertRaises(stripe.APIConnectionError):
+                self._run(retries=restore_stripe_customer_email.max_retries)
+        retry.assert_not_called()
+        self.assertEqual(restore_stripe_customer_email.max_retries, 5)
+
+    def test_unconfigured_stripe_retries_without_calling_stripe(self) -> None:
+        with override_settings(STRIPE_SECRET_KEY=""):
+            with patch.object(restore_stripe_customer_email, "retry", side_effect=Retry()):
+                with self.assertRaises(Retry):
+                    self._run()
+        self.mock_modify.assert_not_called()
+
+    def test_our_own_restore_echo_is_a_noop_for_the_sync(self) -> None:
+        # customer.updated produced by the restore: previous.email = attacker, email = OLD = User.email.
+        with patch("fragrance.tasks.send_account_email_change_notice.delay") as delay:
+            StripeEvent.objects.create(
+                stripe_event_id="evt_restore_echo",
+                event_type="customer.updated",
+                stripe_created=timezone.now(),
+                payload={
+                    "id": "evt_restore_echo",
+                    "type": "customer.updated",
+                    "data": {
+                        "object": {"id": "cus_alice", "object": "customer", "email": OLD},
+                        "previous_attributes": {"email": NEW},
+                    },
+                },
+            )
+            process_stripe_event(stripe_event_id="evt_restore_echo")
+        delay.assert_not_called()
+        self.assertEqual(self._email(), OLD)
