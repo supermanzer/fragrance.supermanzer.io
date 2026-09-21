@@ -2,7 +2,8 @@ import importlib
 import json
 import re
 import threading
-from datetime import timedelta
+from datetime import datetime, timedelta
+from datetime import timezone as dt_timezone
 from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -11,6 +12,7 @@ import anthropic
 import httpx
 import openai
 import redis
+import stripe
 from django.apps import apps as django_apps
 from django.conf import settings
 from django.contrib.auth.models import User
@@ -62,13 +64,37 @@ from .models import (
     BetaSignup,
     Fragrance,
     FragranceConfig,
+    Plan,
     PreferenceProfile,
+    ProcessedPayment,
     Recommendation,
     RecommendationRun,
+    StripeEvent,
+    Subscription,
 )
-from .services import generate_recommendation_token, normalize_email
-from .tasks import monthly_fragrance_run, render_and_send_email
-from .views import BetaSignupThrottle
+from .services import (
+    BETA_INVITE_MAX_AGE,
+    derive_unique_username,
+    generate_beta_invite_token,
+    generate_recommendation_token,
+    normalize_email,
+    verify_beta_invite_token,
+)
+from .billing import (
+    SessionNotFoundError,
+    SessionOwnershipError,
+    fulfill_checkout_session,
+    fulfill_payment_intent,
+    revoke_for_dispute,
+)
+from .tasks import (
+    monthly_fragrance_run,
+    process_stripe_event,
+    render_and_send_email,
+    send_beta_invite_email,
+    send_password_reset_email,
+)
+from .views import BetaSignupThrottle, FailOpenScopedRateThrottle
 
 # Migration module filenames start with digits, which aren't valid dotted-
 # import identifiers — importlib is how Django's own migration loader
@@ -2567,6 +2593,80 @@ class CacheIsolationTests(SimpleTestCase):
         self.assertIsInstance(caches["default"], LocMemCache)
 
 
+def _run_reset_task_inline():
+    """Patches .delay to run the task eagerly, so tests can inspect the mail it sends."""
+    return patch(
+        "fragrance.tasks.send_password_reset_email.delay",
+        side_effect=lambda **kwargs: send_password_reset_email.apply(kwargs=kwargs),
+    )
+
+
+class PasswordResetUnusablePasswordTests(TestCase):
+    """
+    Regression coverage for the load-bearing behaviour documented on
+    PasswordResetRequestView: approved-but-not-yet-converted beta users are
+    created via set_unusable_password() (BetaSignupAdmin.approve_signups),
+    and Django's own PasswordResetForm.get_users() filters such accounts
+    out. This project's PasswordResetRequestView deliberately does its own
+    User.objects.get(email=...) lookup instead, which is the only reason
+    "forgot password" can recover one of these accounts -- and the new
+    /beta/accept copy (see BetaAcceptViewTests) now actively points users
+    down this path when their invite link is dead or expired.
+    """
+
+    def test_django_password_reset_form_excludes_unusable_password_users(self) -> None:
+        # Empirical proof of the gap this project's custom view exists to
+        # close -- if a future Django release changes get_users()'s
+        # filtering, this is the test that should catch it.
+        from django.contrib.auth.forms import PasswordResetForm
+
+        User.objects.create_user(username="nopass", email="nopass@example.com", password=None)
+        user = User.objects.get(username="nopass")
+        self.assertFalse(user.has_usable_password())
+
+        form = PasswordResetForm(data={"email": "nopass@example.com"})
+        self.assertTrue(form.is_valid())
+        self.assertEqual(list(form.get_users(email="nopass@example.com")), [])
+
+    def test_reset_request_reaches_unusable_password_user_and_token_validates(self) -> None:
+        user = User.objects.create_user(
+            username="approved_not_converted", email="approved@example.com", password=None
+        )
+        self.assertFalse(user.has_usable_password())
+
+        with _run_reset_task_inline():
+            response = self.client.post(
+                "/api/v1/auth/password/reset/", {"email": "approved@example.com"}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+
+        # Asserts a literal "&", not "&amp;": render_to_string HTML-escapes
+        # by default (Django's autoescaping applies to the template engine,
+        # not the .txt extension), which silently breaks this link's second
+        # query param for every real mail client -- password_reset_email.txt
+        # wraps its body in {% autoescape off %} specifically to prevent
+        # that. This assertion is what stops that fix from being "tidied"
+        # away without anyone noticing the link breaks again.
+        self.assertNotIn("&amp;", mail.outbox[0].body)
+        match = re.search(r"uid=([^&\s]+)&token=([^&\s]+)", mail.outbox[0].body)
+        self.assertIsNotNone(match)
+        uid, token = match.group(1), match.group(2)
+
+        confirm_response = self.client.post(
+            "/api/v1/auth/password/reset/confirm/",
+            {
+                "uid": uid,
+                "token": token,
+                "new_password": "Str0ng-Passw0rd!",
+                "new_password_confirm": "Str0ng-Passw0rd!",
+            },
+        )
+        self.assertEqual(confirm_response.status_code, 200)
+        user.refresh_from_db()
+        self.assertTrue(user.check_password("Str0ng-Passw0rd!"))
+
+
 class BetaSignupViewTests(TestCase):
     """
     Covers the public waitlist endpoint's core anti-abuse contract: a
@@ -2792,4 +2892,1672 @@ class RegisterRouteRemovedTests(TestCase):
             {"username": "sneaky", "email": "sneaky@example.com", "password": "pw12345!"},
         )
         self.assertEqual(response.status_code, 404)
+
+
+class DeriveUniqueUsernameTests(TestCase):
+    def test_simple_email_produces_local_part_username(self) -> None:
+        self.assertEqual(derive_unique_username(email="ryan@example.com"), "ryan")
+
+    def test_collision_appends_numeric_suffix(self) -> None:
+        User.objects.create_user(username="ryan", email="ryan@gmail.com", password="pw12345!")
+        self.assertEqual(derive_unique_username(email="ryan@example.com"), "ryan_2")
+
+    def test_multiple_collisions_increment_suffix(self) -> None:
+        User.objects.create_user(username="ryan", email="a@gmail.com", password="pw12345!")
+        User.objects.create_user(username="ryan_2", email="b@example.com", password="pw12345!")
+        self.assertEqual(derive_unique_username(email="ryan@another.com"), "ryan_3")
+
+    def test_symbols_only_local_part_falls_back_to_user(self) -> None:
+        self.assertEqual(derive_unique_username(email="+++@example.com"), "user")
+
+    def test_two_distinct_addresses_reducing_to_the_same_local_part_get_distinct_usernames(
+        self,
+    ) -> None:
+        first = derive_unique_username(email="ryan@gmail.com")
+        User.objects.create_user(username=first, email="ryan@gmail.com", password="pw12345!")
+        second = derive_unique_username(email="ryan@example.com")
+        self.assertNotEqual(first, second)
+
+
+class BetaInviteTokenTests(TestCase):
+    def _signup_with_user(self) -> tuple[BetaSignup, User]:
+        user = User.objects.create_user(username="invitee", email="invitee@example.com")
+        signup = BetaSignup.objects.create(
+            email="invitee@example.com",
+            normalized_email="invitee@example.com",
+            status="approved",
+            invited_user=user,
+        )
+        return signup, user
+
+    def test_round_trips(self) -> None:
+        signup, user = self._signup_with_user()
+        token = generate_beta_invite_token(signup=signup)
+        payload = verify_beta_invite_token(token=token)
+        self.assertEqual(payload["sid"], signup.id)
+        self.assertEqual(payload["uid"], user.id)
+
+    def test_tampered_token_rejected(self) -> None:
+        signup, _ = self._signup_with_user()
+        token = generate_beta_invite_token(signup=signup)
+        tampered = token[:-1] + ("a" if token[-1] != "a" else "b")
+        self.assertIsNone(verify_beta_invite_token(token=tampered))
+
+    def test_expired_token_rejected(self) -> None:
+        signup, _ = self._signup_with_user()
+        token = generate_beta_invite_token(signup=signup)
+        with patch("fragrance.services.BETA_INVITE_MAX_AGE", -1):
+            self.assertIsNone(verify_beta_invite_token(token=token))
+
+    def test_malformed_token_rejected(self) -> None:
+        self.assertIsNone(verify_beta_invite_token(token="not-a-real-token"))
+
+    def test_empty_token_rejected(self) -> None:
+        self.assertIsNone(verify_beta_invite_token(token=""))
+
+    def test_max_age_is_fourteen_days(self) -> None:
+        self.assertEqual(BETA_INVITE_MAX_AGE, 60 * 60 * 24 * 14)
+
+
+class PlanModelTests(TestCase):
+    def test_quota_fields_are_independent_of_billing_interval(self) -> None:
+        monthly = Plan.objects.create(
+            name="Beta Monthly",
+            slug="test-monthly",
+            stripe_price_id="price_test_monthly",
+            amount_cents=400,
+            billing_interval="month",
+            access_days_granted=30,
+        )
+        annual = Plan.objects.create(
+            name="Beta Annual",
+            slug="test-annual",
+            stripe_price_id="price_test_annual",
+            amount_cents=4400,
+            billing_interval="year",
+            access_days_granted=365,
+        )
+        # Usage terms must not follow billing terms -- an annual subscriber
+        # gets one run per 30 days, not twelve on the first of January.
+        self.assertEqual(monthly.quota_period_days, annual.quota_period_days)
+        self.assertEqual(monthly.max_runs_per_quota_period, annual.max_runs_per_quota_period)
+        self.assertNotEqual(monthly.access_days_granted, annual.access_days_granted)
+        self.assertNotEqual(monthly.billing_interval, annual.billing_interval)
+
+
+class SubscriptionHasActiveAccessTests(TestCase):
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(
+            username="subscriber", email="subscriber@example.com", password="pw12345!"
+        )
+
+    def test_null_access_expires_at_is_false_even_when_status_is_active(self) -> None:
+        sub = Subscription.objects.create(user=self.user, status="active", access_expires_at=None)
+        self.assertFalse(sub.has_active_access)
+
+    def test_active_status_and_future_expiry_is_true(self) -> None:
+        sub = Subscription.objects.create(
+            user=self.user,
+            status="active",
+            access_expires_at=timezone.now() + timedelta(days=5),
+        )
+        self.assertTrue(sub.has_active_access)
+
+    def test_active_status_but_past_expiry_is_false(self) -> None:
+        sub = Subscription.objects.create(
+            user=self.user,
+            status="active",
+            access_expires_at=timezone.now() - timedelta(days=1),
+        )
+        self.assertFalse(sub.has_active_access)
+
+    def test_non_active_status_with_future_expiry_is_false(self) -> None:
+        sub = Subscription.objects.create(
+            user=self.user,
+            status="revoked",
+            access_expires_at=timezone.now() + timedelta(days=5),
+        )
+        self.assertFalse(sub.has_active_access)
+
+
+class SeedPlansCommandTests(TestCase):
+    def test_creates_both_plans(self) -> None:
+        out = StringIO()
+        call_command(
+            "seed_plans",
+            "--monthly-price-id=price_mo",
+            "--annual-price-id=price_yr",
+            stdout=out,
+        )
+        monthly = Plan.objects.get(slug="beta-monthly")
+        annual = Plan.objects.get(slug="beta-annual")
+        self.assertEqual(monthly.stripe_price_id, "price_mo")
+        self.assertEqual(annual.stripe_price_id, "price_yr")
+        self.assertEqual(monthly.billing_interval, "month")
+        self.assertEqual(annual.billing_interval, "year")
+        self.assertEqual(monthly.access_days_granted, 30)
+        self.assertEqual(annual.access_days_granted, 365)
+        self.assertEqual(monthly.quota_period_days, 30)
+        self.assertEqual(annual.quota_period_days, 30)
+        self.assertEqual(monthly.max_runs_per_quota_period, 1)
+        self.assertEqual(annual.max_runs_per_quota_period, 1)
+
+    def test_rerun_is_idempotent_and_updates_in_place(self) -> None:
+        call_command("seed_plans", "--monthly-price-id=price_mo", "--annual-price-id=price_yr")
+        call_command("seed_plans", "--monthly-price-id=price_mo2", "--annual-price-id=price_yr2")
+        self.assertEqual(Plan.objects.filter(slug="beta-monthly").count(), 1)
+        self.assertEqual(Plan.objects.filter(slug="beta-annual").count(), 1)
+        self.assertEqual(Plan.objects.get(slug="beta-monthly").stripe_price_id, "price_mo2")
+        self.assertEqual(Plan.objects.get(slug="beta-annual").stripe_price_id, "price_yr2")
+
+    def test_same_price_id_for_both_plans_raises(self) -> None:
+        with self.assertRaises(CommandError):
+            call_command("seed_plans", "--monthly-price-id=same", "--annual-price-id=same")
+
+
+class BetaSignupAdminApproveTests(TestCase):
+    """
+    Covers the approve_signups admin action: guard-on-pending, the
+    duplicate-User-email refusal (the guard against reopening
+    PasswordResetRequestView's MultipleObjectsReturned bug), username
+    collision handling, the Plan-may-not-exist-yet fallback, and that the
+    invite email is queued via transaction.on_commit rather than sent inline.
+    """
+
+    def setUp(self) -> None:
+        self.superuser = User.objects.create_superuser(
+            username="hal", email="hal@example.com", password="hal-9000"
+        )
+        self.client.force_login(self.superuser)
+        self.plan = Plan.objects.create(
+            name="Beta Monthly",
+            slug="beta-monthly",
+            stripe_price_id="price_default_monthly",
+            amount_cents=400,
+            billing_interval="month",
+            access_days_granted=30,
+        )
+
+    def _changelist_url(self) -> str:
+        return reverse("admin:fragrance_betasignup_changelist")
+
+    def _approve(self, pks: list[int]) -> None:
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(
+                self._changelist_url(),
+                {"action": "approve_signups", "_selected_action": [str(pk) for pk in pks]},
+            )
+
+    def test_approve_creates_active_user_with_unusable_password(self) -> None:
+        signup = BetaSignup.objects.create(email="new@example.com", normalized_email="new@example.com")
+        with patch.object(send_beta_invite_email, "delay"):
+            self._approve([signup.pk])
+
+        signup.refresh_from_db()
+        self.assertEqual(signup.status, "approved")
+        self.assertIsNotNone(signup.approved_at)
+        self.assertEqual(signup.approved_by, self.superuser)
+        user = signup.invited_user
+        self.assertIsNotNone(user)
+        self.assertTrue(user.is_active)
+        self.assertFalse(user.has_usable_password())
+
+    def test_approve_creates_subscription_with_default_plan_and_none_status(self) -> None:
+        signup = BetaSignup.objects.create(email="sub@example.com", normalized_email="sub@example.com")
+        with patch.object(send_beta_invite_email, "delay"):
+            self._approve([signup.pk])
+
+        signup.refresh_from_db()
+        sub = Subscription.objects.get(user=signup.invited_user)
+        self.assertEqual(sub.status, "none")
+        self.assertEqual(sub.plan, self.plan)
+
+    def test_approve_with_no_plan_seeded_creates_subscription_with_null_plan(self) -> None:
+        Plan.objects.all().delete()
+        signup = BetaSignup.objects.create(
+            email="noplan@example.com", normalized_email="noplan@example.com"
+        )
+        with patch.object(send_beta_invite_email, "delay"):
+            self._approve([signup.pk])
+
+        signup.refresh_from_db()
+        sub = Subscription.objects.get(user=signup.invited_user)
+        self.assertIsNone(sub.plan)
+        self.assertEqual(sub.status, "none")
+
+    def test_approve_queues_email_rather_than_sending_inline(self) -> None:
+        signup = BetaSignup.objects.create(
+            email="queued@example.com", normalized_email="queued@example.com"
+        )
+        with patch.object(send_beta_invite_email, "delay") as mock_delay:
+            self._approve([signup.pk])
+
+        signup.refresh_from_db()
+        mock_delay.assert_called_once_with(signup_id=signup.id)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_approve_refuses_when_a_user_with_that_email_already_exists(self) -> None:
+        User.objects.create_user(
+            username="existing", email="dupe@example.com", password="pw12345!"
+        )
+        signup = BetaSignup.objects.create(email="dupe@example.com", normalized_email="dupe@example.com")
+        with patch.object(send_beta_invite_email, "delay") as mock_delay:
+            self._approve([signup.pk])
+
+        signup.refresh_from_db()
+        self.assertEqual(signup.status, "pending")
+        self.assertIsNone(signup.invited_user)
+        mock_delay.assert_not_called()
+        self.assertEqual(User.objects.filter(email__iexact="dupe@example.com").count(), 1)
+
+    def test_approve_skips_non_pending_signups(self) -> None:
+        signup = BetaSignup.objects.create(
+            email="already@example.com", normalized_email="already@example.com", status="rejected"
+        )
+        with patch.object(send_beta_invite_email, "delay") as mock_delay:
+            self._approve([signup.pk])
+
+        signup.refresh_from_db()
+        self.assertEqual(signup.status, "rejected")
+        self.assertIsNone(signup.invited_user)
+        mock_delay.assert_not_called()
+
+    def test_approve_username_collision_produces_distinct_usernames(self) -> None:
+        User.objects.create_user(username="ryan", email="ryan@gmail.com", password="pw12345!")
+        signup = BetaSignup.objects.create(email="ryan@example.com", normalized_email="ryan@example.com")
+        with patch.object(send_beta_invite_email, "delay"):
+            self._approve([signup.pk])
+
+        signup.refresh_from_db()
+        self.assertEqual(signup.invited_user.username, "ryan_2")
+
+    def test_approve_continues_past_a_skipped_row_in_the_same_batch(self) -> None:
+        good = BetaSignup.objects.create(email="good@example.com", normalized_email="good@example.com")
+        bad = BetaSignup.objects.create(
+            email="bad@example.com", normalized_email="bad@example.com", status="approved"
+        )
+        with patch.object(send_beta_invite_email, "delay") as mock_delay:
+            self._approve([good.pk, bad.pk])
+
+        good.refresh_from_db()
+        bad.refresh_from_db()
+        self.assertEqual(good.status, "approved")
+        self.assertIsNotNone(good.invited_user)
+        self.assertEqual(bad.status, "approved")  # unchanged, was already approved
+        mock_delay.assert_called_once_with(signup_id=good.id)
+
+
+class BetaSignupAdminRejectTests(TestCase):
+    def setUp(self) -> None:
+        self.superuser = User.objects.create_superuser(
+            username="hal", email="hal@example.com", password="hal-9000"
+        )
+        self.client.force_login(self.superuser)
+
+    def _reject(self, pks: list[int]) -> None:
+        self.client.post(
+            reverse("admin:fragrance_betasignup_changelist"),
+            {"action": "reject_signups", "_selected_action": [str(pk) for pk in pks]},
+        )
+
+    def test_reject_pending_signup(self) -> None:
+        signup = BetaSignup.objects.create(email="r@example.com", normalized_email="r@example.com")
+        self._reject([signup.pk])
+        signup.refresh_from_db()
+        self.assertEqual(signup.status, "rejected")
+
+    def test_reject_skips_non_pending_signup(self) -> None:
+        signup = BetaSignup.objects.create(
+            email="a@example.com", normalized_email="a@example.com", status="approved"
+        )
+        self._reject([signup.pk])
+        signup.refresh_from_db()
+        self.assertEqual(signup.status, "approved")
+
+
+class BetaSignupAdminResendInviteTests(TestCase):
+    """
+    Covers the resend_invite admin action: recovery for a signup whose
+    invite email never arrived (spam filter, bounce, typo) -- previously a
+    dead end short of a Django shell once approve_signups moved the row past
+    'pending'.
+    """
+
+    def setUp(self) -> None:
+        self.superuser = User.objects.create_superuser(
+            username="hal", email="hal@example.com", password="hal-9000"
+        )
+        self.client.force_login(self.superuser)
+
+    def _resend(self, pks: list[int]) -> None:
+        with self.captureOnCommitCallbacks(execute=True):
+            self.client.post(
+                reverse("admin:fragrance_betasignup_changelist"),
+                {"action": "resend_invite", "_selected_action": [str(pk) for pk in pks]},
+            )
+
+    def test_resend_queues_email_for_approved_signup(self) -> None:
+        user = User.objects.create_user(username="resend_me", email="resend@example.com")
+        signup = BetaSignup.objects.create(
+            email="resend@example.com", normalized_email="resend@example.com",
+            status="approved", invited_user=user,
+        )
+        with patch.object(send_beta_invite_email, "delay") as mock_delay:
+            self._resend([signup.pk])
+
+        mock_delay.assert_called_once_with(signup_id=signup.id)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_resend_skips_pending_signup(self) -> None:
+        signup = BetaSignup.objects.create(
+            email="still_pending@example.com", normalized_email="still_pending@example.com",
+        )
+        with patch.object(send_beta_invite_email, "delay") as mock_delay:
+            self._resend([signup.pk])
+        mock_delay.assert_not_called()
+
+    def test_resend_skips_converted_signup(self) -> None:
+        user = User.objects.create_user(username="already_in", email="already_in@example.com")
+        signup = BetaSignup.objects.create(
+            email="already_in@example.com", normalized_email="already_in@example.com",
+            status="converted", invited_user=user,
+        )
+        with patch.object(send_beta_invite_email, "delay") as mock_delay:
+            self._resend([signup.pk])
+        mock_delay.assert_not_called()
+
+    def test_resend_skips_rejected_signup(self) -> None:
+        signup = BetaSignup.objects.create(
+            email="nope@example.com", normalized_email="nope@example.com", status="rejected",
+        )
+        with patch.object(send_beta_invite_email, "delay") as mock_delay:
+            self._resend([signup.pk])
+        mock_delay.assert_not_called()
+
+    def test_resend_actually_sends_a_valid_accept_link(self) -> None:
+        # Unmocked end-to-end run (no captureOnCommitCallbacks needed since
+        # this calls the task body directly, matching how
+        # BetaInviteEmailTaskTests already exercises send_beta_invite_email):
+        # confirms resend_invite's queued call produces a real, verifiable
+        # token, not just that .delay() was called.
+        user = User.objects.create_user(username="fresh_token", email="fresh_token@example.com")
+        signup = BetaSignup.objects.create(
+            email="fresh_token@example.com", normalized_email="fresh_token@example.com",
+            status="approved", invited_user=user,
+        )
+        send_beta_invite_email(signup_id=signup.id)
+
+        self.assertEqual(len(mail.outbox), 1)
+        match = re.search(r"token=([^\s]+)", mail.outbox[0].body)
+        self.assertIsNotNone(match)
+        payload = verify_beta_invite_token(token=match.group(1))
+        self.assertEqual(payload, {"sid": signup.id, "uid": user.id})
+
+
+class BetaAcceptViewTests(TestCase):
+    """
+    Covers POST /api/v1/beta/accept/: token round-trip, single-use
+    enforcement (an already-converted token must be rejected, distinctly
+    from a never-valid one -- 409 "already_used" vs. 400
+    "invalid_or_expired", per the operator-approved 2026-09-20 contract),
+    expired/tampered tokens, and that validate_password() actually runs --
+    slice 1's removed UserRegistrationSerializer skipped validators, and
+    this path must not repeat that.
+    """
+
+    url = "/api/v1/beta/accept/"
+
+    def _approved_signup(self, email: str = "invitee@example.com") -> tuple[BetaSignup, User]:
+        user = User.objects.create_user(username=email.split("@")[0], email=email)
+        signup = BetaSignup.objects.create(
+            email=email, normalized_email=email, status="approved", invited_user=user
+        )
+        return signup, user
+
+    def test_valid_token_sets_password_marks_converted_and_returns_jwt_pair(self) -> None:
+        signup, user = self._approved_signup()
+        token = generate_beta_invite_token(signup=signup)
+
+        response = self.client.post(self.url, {"token": token, "password": "Str0ng-Passw0rd!"})
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIn("access", body)
+        self.assertIn("refresh", body)
+
+        signup.refresh_from_db()
+        self.assertEqual(signup.status, "converted")
+        self.assertIsNotNone(signup.converted_at)
+        user.refresh_from_db()
+        self.assertTrue(user.check_password("Str0ng-Passw0rd!"))
+
+    def test_already_converted_token_returns_409_already_used(self) -> None:
+        signup, _ = self._approved_signup()
+        token = generate_beta_invite_token(signup=signup)
+        first = self.client.post(self.url, {"token": token, "password": "Str0ng-Passw0rd!"})
+        self.assertEqual(first.status_code, 200)
+
+        second = self.client.post(self.url, {"token": token, "password": "An0ther-Passw0rd!"})
+        self.assertEqual(second.status_code, 409)
+        self.assertEqual(second.json(), {"code": "already_used"})
+
+    def test_expired_token_returns_400_invalid_or_expired(self) -> None:
+        signup, _ = self._approved_signup()
+        token = generate_beta_invite_token(signup=signup)
+        with patch("fragrance.services.BETA_INVITE_MAX_AGE", -1):
+            response = self.client.post(self.url, {"token": token, "password": "Str0ng-Passw0rd!"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"code": "invalid_or_expired"})
+
+    def test_tampered_token_returns_400_invalid_or_expired(self) -> None:
+        signup, _ = self._approved_signup()
+        token = generate_beta_invite_token(signup=signup)
+        tampered = token[:-1] + ("a" if token[-1] != "a" else "b")
+        response = self.client.post(self.url, {"token": tampered, "password": "Str0ng-Passw0rd!"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"code": "invalid_or_expired"})
+
+    def test_weak_password_is_rejected_by_validators(self) -> None:
+        signup, user = self._approved_signup()
+        token = generate_beta_invite_token(signup=signup)
+        response = self.client.post(self.url, {"token": token, "password": "12345678"})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("password", response.json())
+        signup.refresh_from_db()
+        self.assertEqual(signup.status, "approved")
+        user.refresh_from_db()
+        self.assertFalse(user.has_usable_password())
+
+    def test_pending_signup_token_returns_400_invalid_or_expired(self) -> None:
+        user = User.objects.create_user(username="pending_invitee", email="pending@example.com")
+        signup = BetaSignup.objects.create(
+            email="pending@example.com",
+            normalized_email="pending@example.com",
+            status="pending",
+            invited_user=user,
+        )
+        token = generate_beta_invite_token(signup=signup)
+        response = self.client.post(self.url, {"token": token, "password": "Str0ng-Passw0rd!"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"code": "invalid_or_expired"})
+
+    def test_missing_token_key_returns_400_with_field_required_error(self) -> None:
+        # A wholly absent "token" key hits DRF's own required-field check
+        # before resolve_beta_invite_signup runs, so this is the one 400
+        # shape that is *not* {"code": "invalid_or_expired"} -- see
+        # BetaAcceptSerializer.token's docstring. Not reachable from the
+        # real frontend form, which always submits a string.
+        response = self.client.post(self.url, {"password": "Str0ng-Passw0rd!"})
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("token", response.json())
+
+    def test_blank_token_returns_400_invalid_or_expired(self) -> None:
+        response = self.client.post(
+            self.url, {"token": "", "password": "Str0ng-Passw0rd!"}
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"code": "invalid_or_expired"})
+
+    def test_unauthenticated_access_is_allowed(self) -> None:
+        signup, _ = self._approved_signup()
+        token = generate_beta_invite_token(signup=signup)
+        response = self.client.post(self.url, {"token": token, "password": "Str0ng-Passw0rd!"})
+        self.assertNotEqual(response.status_code, 401)
         self.assertFalse(User.objects.filter(username="sneaky").exists())
+
+
+class BetaAcceptPreCheckViewTests(TestCase):
+    """Covers GET /api/v1/beta/accept/?token=... -- the pre-submit validity check."""
+
+    url = "/api/v1/beta/accept/"
+
+    def _approved_signup(self, email: str = "precheck@example.com") -> tuple[BetaSignup, User]:
+        user = User.objects.create_user(username=email.split("@")[0], email=email)
+        signup = BetaSignup.objects.create(
+            email=email, normalized_email=email, status="approved", invited_user=user
+        )
+        return signup, user
+
+    def test_valid_token_returns_200_valid_true(self) -> None:
+        signup, _ = self._approved_signup()
+        token = generate_beta_invite_token(signup=signup)
+        response = self.client.get(self.url, {"token": token})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"valid": True})
+
+    def test_valid_token_is_not_consumed_by_the_precheck(self) -> None:
+        signup, _ = self._approved_signup()
+        token = generate_beta_invite_token(signup=signup)
+        self.client.get(self.url, {"token": token})
+        signup.refresh_from_db()
+        self.assertEqual(signup.status, "approved")
+
+        response = self.client.post(self.url, {"token": token, "password": "Str0ng-Passw0rd!"})
+        self.assertEqual(response.status_code, 200)
+
+    def test_converted_token_returns_409_already_used(self) -> None:
+        signup, _ = self._approved_signup()
+        token = generate_beta_invite_token(signup=signup)
+        self.client.post(self.url, {"token": token, "password": "Str0ng-Passw0rd!"})
+
+        response = self.client.get(self.url, {"token": token})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json(), {"code": "already_used"})
+
+    def test_bogus_token_returns_400_invalid_or_expired(self) -> None:
+        response = self.client.get(self.url, {"token": "not-a-real-token"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"code": "invalid_or_expired"})
+
+    def test_missing_token_returns_400_invalid_or_expired(self) -> None:
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"code": "invalid_or_expired"})
+
+    def test_unauthenticated_access_is_allowed(self) -> None:
+        response = self.client.get(self.url, {"token": "not-a-real-token"})
+        self.assertNotEqual(response.status_code, 401)
+
+
+# ─── Stripe billing (slice 2b) ────────────────────────────────────────────
+#
+# Every stripe-touching test class below carries these three settings so
+# fragrance.billing._configure_stripe()'s fail-fast guard doesn't fire --
+# mirrors how the rest of this file scopes settings overrides to the tests
+# that actually need them.
+_STRIPE_TEST_SETTINGS = {
+    "STRIPE_SECRET_KEY": "sk_test_dummy",
+    "STRIPE_WEBHOOK_SECRET": "whsec_test_dummy",
+    "STRIPE_API_VERSION": "2026-08-26.dahlia",
+}
+
+
+def _fake_line(*, price_id: str | None, period_end: int | None) -> SimpleNamespace:
+    """A minimal stand-in for an InvoiceLineItem, walked the same defensive way billing._match_plan_line does."""
+    pricing = SimpleNamespace(price_details=SimpleNamespace(price=price_id)) if price_id else None
+    period = SimpleNamespace(end=period_end) if period_end is not None else None
+    return SimpleNamespace(pricing=pricing, period=period)
+
+
+def _fake_invoice(
+    *,
+    invoice_id: str,
+    customer_id: str,
+    subscription_id: str | None,
+    amount_paid: int,
+    lines: list,
+    parent_type: str = "subscription_details",
+    status: str = "paid",
+    amount_remaining: int = 0,
+) -> SimpleNamespace:
+    if parent_type == "subscription_details":
+        parent = SimpleNamespace(
+            type="subscription_details",
+            subscription_details=SimpleNamespace(subscription=subscription_id),
+        )
+    else:
+        parent = SimpleNamespace(type=parent_type, subscription_details=None)
+    return SimpleNamespace(
+        id=invoice_id,
+        customer=customer_id,
+        amount_paid=amount_paid,
+        status=status,
+        amount_remaining=amount_remaining,
+        parent=parent,
+        lines=SimpleNamespace(data=lines),
+    )
+
+
+def _fake_invoice_payment(*, invoice: SimpleNamespace) -> SimpleNamespace:
+    return SimpleNamespace(invoice=invoice)
+
+
+def _fake_payment_intent(*, pi_id: str, status: str, customer: str | None) -> SimpleNamespace:
+    return SimpleNamespace(id=pi_id, status=status, customer=customer)
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
+class BillingCheckoutViewTests(TestCase):
+    url = "/api/v1/billing/checkout/"
+
+    def setUp(self) -> None:
+        self.monthly = Plan.objects.create(
+            name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
+            amount_cents=400, currency="usd", billing_interval="month", access_days_granted=30,
+        )
+        self.annual = Plan.objects.create(
+            name="Beta Annual", slug="beta-annual", stripe_price_id="price_yr",
+            amount_cents=4400, currency="usd", billing_interval="year", access_days_granted=365,
+        )
+        self.user = User.objects.create_user(
+            username="checkoutuser", email="checkoutuser@example.com", password="pw12345!"
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_get_returns_active_plans_without_price_id(self) -> None:
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        # Wrapped in an object rather than returned as a bare array: the frontend
+        # composable reads `response.plans`, and an object can carry metadata later
+        # without a breaking change.
+        plans = response.json()["plans"]
+        slugs = {plan["slug"] for plan in plans}
+        self.assertEqual(slugs, {"beta-monthly", "beta-annual"})
+        for plan in plans:
+            self.assertNotIn("stripe_price_id", plan)
+
+    def test_unauthenticated_get_returns_401(self) -> None:
+        response = APIClient().get(self.url)
+        self.assertEqual(response.status_code, 401)
+
+    def test_unauthenticated_post_returns_401(self) -> None:
+        response = APIClient().post(self.url, {"slug": "beta-monthly"})
+        self.assertEqual(response.status_code, 401)
+
+    @patch("fragrance.billing.stripe.checkout.Session.create")
+    @patch("fragrance.billing.stripe.Customer.create")
+    def test_post_creates_checkout_session(self, mock_customer_create, mock_session_create) -> None:
+        mock_customer_create.return_value = SimpleNamespace(id="cus_new_1")
+        mock_session_create.return_value = SimpleNamespace(id="cs_new_1", url="https://checkout.stripe.com/cs_new_1")
+
+        response = self.client.post(self.url, {"slug": "beta-monthly"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["url"], "https://checkout.stripe.com/cs_new_1")
+        call_kwargs = mock_session_create.call_args.kwargs
+        self.assertEqual(call_kwargs["mode"], "subscription")
+        self.assertEqual(call_kwargs["line_items"], [{"price": "price_mo", "quantity": 1}])
+        self.assertEqual(call_kwargs["client_reference_id"], str(self.user.id))
+        self.assertEqual(call_kwargs["subscription_data"]["metadata"]["user_id"], str(self.user.id))
+        subscription = Subscription.objects.get(user=self.user)
+        self.assertEqual(subscription.status, "checkout_started")
+        self.assertEqual(subscription.last_checkout_session_id, "cs_new_1")
+        self.assertEqual(subscription.stripe_customer_id, "cus_new_1")
+
+    @patch("fragrance.billing.stripe.checkout.Session.create")
+    @patch("fragrance.billing.stripe.Customer.create")
+    def test_post_ignores_client_supplied_price_id(self, mock_customer_create, mock_session_create) -> None:
+        mock_customer_create.return_value = SimpleNamespace(id="cus_new_2")
+        mock_session_create.return_value = SimpleNamespace(id="cs_new_2", url="https://checkout.stripe.com/cs_new_2")
+
+        self.client.post(self.url, {"slug": "beta-monthly", "price_id": "price_evil_free_tier"})
+
+        call_kwargs = mock_session_create.call_args.kwargs
+        self.assertEqual(call_kwargs["line_items"], [{"price": "price_mo", "quantity": 1}])
+
+    def test_post_unknown_slug_returns_400(self) -> None:
+        response = self.client.post(self.url, {"slug": "does-not-exist"})
+        self.assertEqual(response.status_code, 400)
+
+    def test_post_inactive_slug_returns_400(self) -> None:
+        self.monthly.is_active = False
+        self.monthly.save(update_fields=["is_active"])
+        response = self.client.post(self.url, {"slug": "beta-monthly"})
+        self.assertEqual(response.status_code, 400)
+
+    def test_post_already_active_returns_409(self) -> None:
+        Subscription.objects.create(
+            user=self.user, status="active", access_expires_at=timezone.now() + timedelta(days=10)
+        )
+        response = self.client.post(self.url, {"slug": "beta-monthly"})
+        self.assertEqual(response.status_code, 409)
+
+    @patch("fragrance.billing.stripe.checkout.Session.create")
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_post_reuses_open_session_for_same_plan(self, mock_retrieve, mock_create) -> None:
+        Subscription.objects.create(
+            user=self.user, stripe_customer_id="cus_existing", last_checkout_session_id="cs_existing"
+        )
+        mock_retrieve.return_value = SimpleNamespace(
+            status="open", url="https://checkout.stripe.com/cs_existing",
+            metadata={"plan_slug": "beta-monthly", "price_id": "price_mo"},
+        )
+
+        response = self.client.post(self.url, {"slug": "beta-monthly"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["url"], "https://checkout.stripe.com/cs_existing")
+        mock_create.assert_not_called()
+
+    @patch("fragrance.billing.stripe.checkout.Session.expire")
+    @patch("fragrance.billing.stripe.checkout.Session.create")
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_post_expires_open_session_for_different_plan(
+        self, mock_retrieve, mock_create, mock_expire
+    ) -> None:
+        Subscription.objects.create(
+            user=self.user, stripe_customer_id="cus_existing_2", last_checkout_session_id="cs_existing_2"
+        )
+        mock_retrieve.return_value = SimpleNamespace(
+            status="open", url="https://checkout.stripe.com/cs_existing_2",
+            metadata={"plan_slug": "beta-annual", "price_id": "price_yr"},
+        )
+        mock_create.return_value = SimpleNamespace(id="cs_new_3", url="https://checkout.stripe.com/cs_new_3")
+
+        response = self.client.post(self.url, {"slug": "beta-monthly"})
+
+        self.assertEqual(response.status_code, 200)
+        mock_expire.assert_called_once_with("cs_existing_2")
+        mock_create.assert_called_once()
+
+    @patch("fragrance.billing.stripe.checkout.Session.expire")
+    @patch("fragrance.billing.stripe.checkout.Session.create")
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_post_expires_open_session_when_price_id_changed_under_same_slug(
+        self, mock_retrieve, mock_create, mock_expire
+    ) -> None:
+        """
+        A stale open session for the *same slug* but an old Price (the
+        operator re-ran seed_plans with a new --monthly-price-id) must be
+        expired, not reused -- reuse must key on price, not just slug, or a
+        user could complete checkout against a retired Price.
+        """
+        Subscription.objects.create(
+            user=self.user, stripe_customer_id="cus_existing_3", last_checkout_session_id="cs_existing_3"
+        )
+        mock_retrieve.return_value = SimpleNamespace(
+            status="open", url="https://checkout.stripe.com/cs_existing_3",
+            metadata={"plan_slug": "beta-monthly", "price_id": "price_mo_RETIRED"},
+        )
+        mock_create.return_value = SimpleNamespace(id="cs_new_4", url="https://checkout.stripe.com/cs_new_4")
+
+        response = self.client.post(self.url, {"slug": "beta-monthly"})
+
+        self.assertEqual(response.status_code, 200)
+        mock_expire.assert_called_once_with("cs_existing_3")
+        mock_create.assert_called_once()
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
+class BillingConfigurationTests(TestCase):
+    """Fail-fast guard for missing Stripe credentials, mirroring the ANTHROPIC_API_KEY precedent."""
+
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="noconfig", email="noconfig@example.com")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+        Plan.objects.create(
+            name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
+            amount_cents=400, billing_interval="month", access_days_granted=30,
+        )
+
+    @override_settings(STRIPE_SECRET_KEY="")
+    def test_checkout_returns_503_when_stripe_not_configured(self) -> None:
+        response = self.client.post("/api/v1/billing/checkout/", {"slug": "beta-monthly"})
+        self.assertEqual(response.status_code, 503)
+
+
+class BillingSubscriptionViewTests(TestCase):
+    """
+    Covers GET /api/v1/billing/subscription/ -- the already-active read used
+    by the /billing paywall page. No Stripe calls here (unlike
+    BillingSessionView), so no _STRIPE_TEST_SETTINGS override is needed.
+    """
+
+    url = "/api/v1/billing/subscription/"
+
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="subview", email="subview@example.com")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_unauthenticated_returns_401(self) -> None:
+        response = APIClient().get(self.url)
+        self.assertEqual(response.status_code, 401)
+
+    def test_no_subscription_row_yet_returns_none_status_and_creates_one(self) -> None:
+        self.assertFalse(Subscription.objects.filter(user=self.user).exists())
+        response = self.client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {"status": "none", "plan": None, "access_expires_at": None, "has_active_access": False},
+        )
+        self.assertTrue(Subscription.objects.filter(user=self.user).exists())
+
+    def test_active_subscription_reports_plan_and_access(self) -> None:
+        plan = Plan.objects.create(
+            name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
+            amount_cents=400, billing_interval="month", access_days_granted=30,
+        )
+        expiry = timezone.now() + timedelta(days=10)
+        Subscription.objects.create(
+            user=self.user, plan=plan, status="active", access_expires_at=expiry
+        )
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "active")
+        self.assertEqual(body["plan"], {"slug": "beta-monthly", "name": "Beta Monthly"})
+        self.assertTrue(body["has_active_access"])
+
+    def test_scopes_to_the_requesting_user(self) -> None:
+        other = User.objects.create_user(username="otheruser", email="other@example.com")
+        Subscription.objects.create(
+            user=other, status="active", access_expires_at=timezone.now() + timedelta(days=10)
+        )
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "none")
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
+class FulfillPaymentIntentTests(TestCase):
+    """
+    One test per rejection branch of the payment_intent.succeeded validation
+    chain (fragrance.billing.fulfill_payment_intent / _grant_period_for_invoice),
+    since each branch is an authorization decision.
+    """
+
+    def setUp(self) -> None:
+        self.plan = Plan.objects.create(
+            name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
+            amount_cents=400, billing_interval="month", access_days_granted=30,
+        )
+        self.user = User.objects.create_user(username="payer", email="payer@example.com")
+        BetaSignup.objects.create(
+            email="payer@example.com", normalized_email="payer@example.com",
+            status="converted", invited_user=self.user,
+        )
+        self.subscription = Subscription.objects.create(user=self.user, stripe_customer_id="cus_test_1")
+
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_status_not_succeeded_grants_nothing(self, mock_retrieve) -> None:
+        mock_retrieve.return_value = _fake_payment_intent(
+            pi_id="pi_1", status="requires_action", customer="cus_test_1"
+        )
+        self.assertEqual(fulfill_payment_intent(payment_intent_id="pi_1"), 0)
+        self.subscription.refresh_from_db()
+        self.assertIsNone(self.subscription.access_expires_at)
+
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_null_customer_grants_nothing(self, mock_retrieve) -> None:
+        mock_retrieve.return_value = _fake_payment_intent(pi_id="pi_1", status="succeeded", customer=None)
+        self.assertEqual(fulfill_payment_intent(payment_intent_id="pi_1"), 0)
+
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_unknown_customer_grants_nothing(self, mock_retrieve) -> None:
+        mock_retrieve.return_value = _fake_payment_intent(
+            pi_id="pi_1", status="succeeded", customer="cus_unknown"
+        )
+        self.assertEqual(fulfill_payment_intent(payment_intent_id="pi_1"), 0)
+
+    @patch("fragrance.billing.stripe.InvoicePayment.list")
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_empty_invoice_payment_list_grants_nothing(self, mock_retrieve, mock_list) -> None:
+        mock_retrieve.return_value = _fake_payment_intent(
+            pi_id="pi_1", status="succeeded", customer="cus_test_1"
+        )
+        mock_list.return_value.auto_paging_iter.return_value = iter([])
+        self.assertEqual(fulfill_payment_intent(payment_intent_id="pi_1"), 0)
+
+    @patch("fragrance.billing.stripe.InvoicePayment.list")
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_non_subscription_invoice_parent_grants_nothing(self, mock_retrieve, mock_list) -> None:
+        mock_retrieve.return_value = _fake_payment_intent(
+            pi_id="pi_1", status="succeeded", customer="cus_test_1"
+        )
+        invoice = _fake_invoice(
+            invoice_id="in_1", customer_id="cus_test_1", subscription_id=None,
+            amount_paid=400, lines=[_fake_line(price_id="price_mo", period_end=None)],
+            parent_type="quote_details",
+        )
+        mock_list.return_value.auto_paging_iter.return_value = iter([_fake_invoice_payment(invoice=invoice)])
+        self.assertEqual(fulfill_payment_intent(payment_intent_id="pi_1"), 0)
+        self.assertEqual(ProcessedPayment.objects.count(), 0)
+
+    @patch("fragrance.billing.stripe.InvoicePayment.list")
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_unknown_price_id_grants_nothing(self, mock_retrieve, mock_list) -> None:
+        mock_retrieve.return_value = _fake_payment_intent(
+            pi_id="pi_1", status="succeeded", customer="cus_test_1"
+        )
+        invoice = _fake_invoice(
+            invoice_id="in_1", customer_id="cus_test_1", subscription_id="sub_1",
+            amount_paid=400, lines=[_fake_line(price_id="price_totally_unknown", period_end=None)],
+        )
+        mock_list.return_value.auto_paging_iter.return_value = iter([_fake_invoice_payment(invoice=invoice)])
+        self.assertEqual(fulfill_payment_intent(payment_intent_id="pi_1"), 0)
+
+    @patch("fragrance.billing.stripe.InvoicePayment.list")
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_unapproved_user_grants_nothing(self, mock_retrieve, mock_list) -> None:
+        unapproved = User.objects.create_user(username="unapproved", email="unapproved@example.com")
+        Subscription.objects.create(user=unapproved, stripe_customer_id="cus_unapproved")
+        BetaSignup.objects.create(
+            email="unapproved@example.com", normalized_email="unapproved@example.com", status="pending"
+        )
+        mock_retrieve.return_value = _fake_payment_intent(
+            pi_id="pi_2", status="succeeded", customer="cus_unapproved"
+        )
+        invoice = _fake_invoice(
+            invoice_id="in_2", customer_id="cus_unapproved", subscription_id="sub_2",
+            amount_paid=400, lines=[_fake_line(price_id="price_mo", period_end=None)],
+        )
+        mock_list.return_value.auto_paging_iter.return_value = iter([_fake_invoice_payment(invoice=invoice)])
+        self.assertEqual(fulfill_payment_intent(payment_intent_id="pi_2"), 0)
+
+    @patch("fragrance.billing.stripe.InvoicePayment.list")
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_all_checks_pass_grants_one_period_and_persists_subscription_id(
+        self, mock_retrieve, mock_list
+    ) -> None:
+        mock_retrieve.return_value = _fake_payment_intent(
+            pi_id="pi_3", status="succeeded", customer="cus_test_1"
+        )
+        period_end = int(timezone.now().timestamp()) + 30 * 86400
+        invoice = _fake_invoice(
+            invoice_id="in_3", customer_id="cus_test_1", subscription_id="sub_3",
+            amount_paid=400, lines=[_fake_line(price_id="price_mo", period_end=period_end)],
+        )
+        mock_list.return_value.auto_paging_iter.return_value = iter([_fake_invoice_payment(invoice=invoice)])
+
+        granted = fulfill_payment_intent(payment_intent_id="pi_3")
+
+        self.assertEqual(granted, 1)
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "active")
+        self.assertEqual(self.subscription.stripe_subscription_id, "sub_3")
+        expected = datetime.fromtimestamp(period_end, tz=dt_timezone.utc) + timedelta(days=2)
+        self.assertEqual(self.subscription.access_expires_at, expected)
+        self.assertEqual(ProcessedPayment.objects.filter(stripe_invoice_id="in_3").count(), 1)
+
+    @patch("fragrance.billing.stripe.InvoicePayment.list")
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_falls_back_to_access_days_granted_when_period_end_absent(
+        self, mock_retrieve, mock_list
+    ) -> None:
+        mock_retrieve.return_value = _fake_payment_intent(
+            pi_id="pi_4", status="succeeded", customer="cus_test_1"
+        )
+        invoice = _fake_invoice(
+            invoice_id="in_4", customer_id="cus_test_1", subscription_id="sub_4",
+            amount_paid=400, lines=[_fake_line(price_id="price_mo", period_end=None)],
+        )
+        mock_list.return_value.auto_paging_iter.return_value = iter([_fake_invoice_payment(invoice=invoice)])
+        before = timezone.now()
+
+        fulfill_payment_intent(payment_intent_id="pi_4")
+
+        self.subscription.refresh_from_db()
+        self.assertGreaterEqual(
+            self.subscription.access_expires_at, before + timedelta(days=30) - timedelta(seconds=5)
+        )
+        self.assertLessEqual(
+            self.subscription.access_expires_at, before + timedelta(days=30) + timedelta(seconds=5)
+        )
+
+    @patch("fragrance.billing.stripe.InvoicePayment.list")
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_two_invoices_grant_two_periods(self, mock_retrieve, mock_list) -> None:
+        mock_retrieve.return_value = _fake_payment_intent(
+            pi_id="pi_5", status="succeeded", customer="cus_test_1"
+        )
+        now_ts = int(timezone.now().timestamp())
+        invoice_a = _fake_invoice(
+            invoice_id="in_5a", customer_id="cus_test_1", subscription_id="sub_5",
+            amount_paid=400, lines=[_fake_line(price_id="price_mo", period_end=now_ts + 30 * 86400)],
+        )
+        invoice_b = _fake_invoice(
+            invoice_id="in_5b", customer_id="cus_test_1", subscription_id="sub_5",
+            amount_paid=400, lines=[_fake_line(price_id="price_mo", period_end=now_ts + 60 * 86400)],
+        )
+        mock_list.return_value.auto_paging_iter.return_value = iter(
+            [_fake_invoice_payment(invoice=invoice_a), _fake_invoice_payment(invoice=invoice_b)]
+        )
+
+        granted = fulfill_payment_intent(payment_intent_id="pi_5")
+
+        self.assertEqual(granted, 2)
+        self.assertEqual(ProcessedPayment.objects.count(), 2)
+        self.subscription.refresh_from_db()
+        expected = datetime.fromtimestamp(now_ts + 60 * 86400, tz=dt_timezone.utc) + timedelta(days=2)
+        self.assertEqual(self.subscription.access_expires_at, expected)
+
+    @patch("fragrance.billing.stripe.InvoicePayment.list")
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_same_invoice_processed_twice_grants_once(self, mock_retrieve, mock_list) -> None:
+        mock_retrieve.return_value = _fake_payment_intent(
+            pi_id="pi_6", status="succeeded", customer="cus_test_1"
+        )
+        period_end = int(timezone.now().timestamp()) + 30 * 86400
+        invoice = _fake_invoice(
+            invoice_id="in_6", customer_id="cus_test_1", subscription_id="sub_6",
+            amount_paid=400, lines=[_fake_line(price_id="price_mo", period_end=period_end)],
+        )
+        mock_list.return_value.auto_paging_iter.side_effect = [
+            iter([_fake_invoice_payment(invoice=invoice)]),
+            iter([_fake_invoice_payment(invoice=invoice)]),
+        ]
+
+        first = fulfill_payment_intent(payment_intent_id="pi_6")
+        second = fulfill_payment_intent(payment_intent_id="pi_6")
+
+        self.assertEqual(first, 1)
+        self.assertEqual(second, 0)
+        self.assertEqual(ProcessedPayment.objects.filter(stripe_invoice_id="in_6").count(), 1)
+        self.subscription.refresh_from_db()
+        expected = datetime.fromtimestamp(period_end, tz=dt_timezone.utc) + timedelta(days=2)
+        self.assertEqual(self.subscription.access_expires_at, expected)
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
+class FulfillCheckoutSessionTests(TestCase):
+    def setUp(self) -> None:
+        self.plan = Plan.objects.create(
+            name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
+            amount_cents=400, billing_interval="month", access_days_granted=30,
+        )
+        self.user = User.objects.create_user(username="sessionuser", email="sessionuser@example.com")
+        BetaSignup.objects.create(
+            email="sessionuser@example.com", normalized_email="sessionuser@example.com",
+            status="approved", invited_user=self.user,
+        )
+        self.subscription = Subscription.objects.create(user=self.user, stripe_customer_id="cus_session_1")
+
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_client_reference_id_mismatch_raises_ownership_error(self, mock_retrieve) -> None:
+        mock_retrieve.return_value = SimpleNamespace(
+            client_reference_id="999999", customer="cus_session_1", invoice=None, subscription=None,
+        )
+        with self.assertRaises(SessionOwnershipError):
+            fulfill_checkout_session(session_id="cs_test_1", user=self.user)
+
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_unknown_session_id_raises_not_found(self, mock_retrieve) -> None:
+        mock_retrieve.side_effect = stripe.InvalidRequestError("no such session", None)
+        with self.assertRaises(SessionNotFoundError):
+            fulfill_checkout_session(session_id="cs_bogus", user=self.user)
+
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_grants_period_from_session_invoice(self, mock_retrieve) -> None:
+        period_end = int(timezone.now().timestamp()) + 30 * 86400
+        invoice = _fake_invoice(
+            invoice_id="in_session_1", customer_id="cus_session_1", subscription_id="sub_session_1",
+            amount_paid=400, lines=[_fake_line(price_id="price_mo", period_end=period_end)],
+        )
+        mock_retrieve.return_value = SimpleNamespace(
+            client_reference_id=str(self.user.id), customer="cus_session_1",
+            invoice=invoice, subscription="sub_session_1",
+        )
+
+        result = fulfill_checkout_session(session_id="cs_test_2", user=self.user)
+
+        self.assertTrue(result["granted"])
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(result["plan"], {"slug": "beta-monthly", "name": "Beta Monthly"})
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.stripe_subscription_id, "sub_session_1")
+
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    @patch("fragrance.billing.stripe.InvoicePayment.list")
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_same_invoice_via_webhook_and_success_page_grants_once(
+        self, mock_pi_retrieve, mock_list, mock_session_retrieve
+    ) -> None:
+        period_end = int(timezone.now().timestamp()) + 30 * 86400
+        invoice = _fake_invoice(
+            invoice_id="in_dual_1", customer_id="cus_session_1", subscription_id="sub_dual_1",
+            amount_paid=400, lines=[_fake_line(price_id="price_mo", period_end=period_end)],
+        )
+        mock_pi_retrieve.return_value = _fake_payment_intent(
+            pi_id="pi_dual", status="succeeded", customer="cus_session_1"
+        )
+        mock_list.return_value.auto_paging_iter.return_value = iter([_fake_invoice_payment(invoice=invoice)])
+        mock_session_retrieve.return_value = SimpleNamespace(
+            client_reference_id=str(self.user.id), customer="cus_session_1",
+            invoice=invoice, subscription="sub_dual_1",
+        )
+
+        fulfill_payment_intent(payment_intent_id="pi_dual")
+        self.subscription.refresh_from_db()
+        first_expiry = self.subscription.access_expires_at
+
+        fulfill_checkout_session(session_id="cs_dual", user=self.user)
+        self.subscription.refresh_from_db()
+
+        self.assertEqual(self.subscription.access_expires_at, first_expiry)
+        self.assertEqual(ProcessedPayment.objects.filter(stripe_invoice_id="in_dual_1").count(), 1)
+
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_open_unpaid_invoice_grants_nothing(self, mock_retrieve) -> None:
+        period_end = int(timezone.now().timestamp()) + 30 * 86400
+        invoice = _fake_invoice(
+            invoice_id="in_unpaid_1", customer_id="cus_session_1", subscription_id="sub_unpaid_1",
+            amount_paid=0, status="open", amount_remaining=400,
+            lines=[_fake_line(price_id="price_mo", period_end=period_end)],
+        )
+        mock_retrieve.return_value = SimpleNamespace(
+            client_reference_id=str(self.user.id), customer="cus_session_1",
+            invoice=invoice, subscription="sub_unpaid_1", payment_status="paid",
+        )
+
+        result = fulfill_checkout_session(session_id="cs_unpaid_inv", user=self.user)
+
+        self.assertFalse(result["granted"])
+        self.subscription.refresh_from_db()
+        self.assertIsNone(self.subscription.access_expires_at)
+        self.assertFalse(self.subscription.has_active_access)
+        self.assertNotEqual(self.subscription.status, "active")
+        self.assertEqual(ProcessedPayment.objects.count(), 0)
+
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_unpaid_session_grants_nothing(self, mock_retrieve) -> None:
+        period_end = int(timezone.now().timestamp()) + 30 * 86400
+        invoice = _fake_invoice(
+            invoice_id="in_unpaid_2", customer_id="cus_session_1", subscription_id="sub_unpaid_2",
+            amount_paid=400, lines=[_fake_line(price_id="price_mo", period_end=period_end)],
+        )
+        mock_retrieve.return_value = SimpleNamespace(
+            client_reference_id=str(self.user.id), customer="cus_session_1",
+            invoice=invoice, subscription="sub_unpaid_2", payment_status="unpaid",
+        )
+
+        result = fulfill_checkout_session(session_id="cs_unpaid_sess", user=self.user)
+
+        self.assertFalse(result["granted"])
+        self.subscription.refresh_from_db()
+        self.assertIsNone(self.subscription.access_expires_at)
+        self.assertEqual(ProcessedPayment.objects.count(), 0)
+
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_paid_session_grants_exactly_one_period(self, mock_retrieve) -> None:
+        period_end = int(timezone.now().timestamp()) + 30 * 86400
+        invoice = _fake_invoice(
+            invoice_id="in_paid_1", customer_id="cus_session_1", subscription_id="sub_paid_1",
+            amount_paid=400, lines=[_fake_line(price_id="price_mo", period_end=period_end)],
+        )
+        mock_retrieve.return_value = SimpleNamespace(
+            client_reference_id=str(self.user.id), customer="cus_session_1",
+            invoice=invoice, subscription="sub_paid_1", payment_status="paid",
+        )
+
+        fulfill_checkout_session(session_id="cs_paid", user=self.user)
+        self.subscription.refresh_from_db()
+        first_expiry = self.subscription.access_expires_at
+        fulfill_checkout_session(session_id="cs_paid", user=self.user)
+        self.subscription.refresh_from_db()
+
+        self.assertIsNotNone(first_expiry)
+        self.assertEqual(self.subscription.access_expires_at, first_expiry)
+        self.assertEqual(ProcessedPayment.objects.filter(stripe_invoice_id="in_paid_1").count(), 1)
+
+    @patch("fragrance.billing.stripe.InvoicePayment.list")
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_webhook_path_refuses_unpaid_invoice_too(self, mock_pi_retrieve, mock_list) -> None:
+        period_end = int(timezone.now().timestamp()) + 30 * 86400
+        invoice = _fake_invoice(
+            invoice_id="in_wh_open", customer_id="cus_session_1", subscription_id="sub_wh_open",
+            amount_paid=0, status="open", amount_remaining=400,
+            lines=[_fake_line(price_id="price_mo", period_end=period_end)],
+        )
+        mock_pi_retrieve.return_value = _fake_payment_intent(
+            pi_id="pi_wh_open", status="succeeded", customer="cus_session_1"
+        )
+        mock_list.return_value.auto_paging_iter.return_value = iter([_fake_invoice_payment(invoice=invoice)])
+
+        self.assertEqual(fulfill_payment_intent(payment_intent_id="pi_wh_open"), 0)
+        self.subscription.refresh_from_db()
+        self.assertIsNone(self.subscription.access_expires_at)
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
+class BillingSessionViewTests(TestCase):
+    """
+    HTTP-layer coverage for GET /api/v1/billing/session/<id>/, complementing
+    FulfillCheckoutSessionTests (which calls billing.fulfill_checkout_session
+    directly): confirms the view returns the same
+    {status, plan, access_expires_at, has_active_access} shape as
+    BillingSubscriptionView, plus "granted", and that ownership/not-found
+    both collapse to an identical 404.
+    """
+
+    url_tpl = "/api/v1/billing/session/{}/"
+
+    def setUp(self) -> None:
+        self.plan = Plan.objects.create(
+            name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
+            amount_cents=400, billing_interval="month", access_days_granted=30,
+        )
+        self.user = User.objects.create_user(username="sessionview", email="sessionview@example.com")
+        BetaSignup.objects.create(
+            email="sessionview@example.com", normalized_email="sessionview@example.com",
+            status="approved", invited_user=self.user,
+        )
+        self.subscription = Subscription.objects.create(user=self.user, stripe_customer_id="cus_view_1")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_unauthenticated_returns_401(self) -> None:
+        response = APIClient().get(self.url_tpl.format("cs_anything"))
+        self.assertEqual(response.status_code, 401)
+
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_unknown_session_returns_404(self, mock_retrieve) -> None:
+        mock_retrieve.side_effect = stripe.InvalidRequestError("no such session", None)
+        response = self.client.get(self.url_tpl.format("cs_bogus"))
+        self.assertEqual(response.status_code, 404)
+
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_other_users_session_returns_404_not_403(self, mock_retrieve) -> None:
+        mock_retrieve.return_value = SimpleNamespace(
+            client_reference_id="999999", customer="cus_view_1", invoice=None, subscription=None,
+        )
+        response = self.client.get(self.url_tpl.format("cs_not_mine"))
+        self.assertEqual(response.status_code, 404)
+
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_success_returns_shared_subscription_shape_plus_granted(self, mock_retrieve) -> None:
+        period_end = int(timezone.now().timestamp()) + 30 * 86400
+        invoice = _fake_invoice(
+            invoice_id="in_view_1", customer_id="cus_view_1", subscription_id="sub_view_1",
+            amount_paid=400, lines=[_fake_line(price_id="price_mo", period_end=period_end)],
+        )
+        mock_retrieve.return_value = SimpleNamespace(
+            client_reference_id=str(self.user.id), customer="cus_view_1",
+            invoice=invoice, subscription="sub_view_1",
+        )
+
+        response = self.client.get(self.url_tpl.format("cs_view_1"))
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(
+            set(body.keys()), {"status", "plan", "access_expires_at", "has_active_access", "granted"}
+        )
+        self.assertTrue(body["granted"])
+        self.assertEqual(body["status"], "active")
+        self.assertEqual(body["plan"], {"slug": "beta-monthly", "name": "Beta Monthly"})
+        self.assertTrue(body["has_active_access"])
+
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_active_access_short_circuits_without_calling_stripe(self, mock_retrieve) -> None:
+        self.subscription.status = "active"
+        self.subscription.plan = self.plan
+        self.subscription.access_expires_at = timezone.now() + timedelta(days=10)
+        self.subscription.save()
+
+        response = self.client.get(self.url_tpl.format("cs_already_active"))
+
+        mock_retrieve.assert_not_called()
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(
+            set(body.keys()), {"status", "plan", "access_expires_at", "has_active_access", "granted"}
+        )
+        self.assertTrue(body["has_active_access"])
+        self.assertFalse(body["granted"])
+
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_throttled_after_scope_limit(self, mock_retrieve) -> None:
+        from django.core.cache import cache
+        cache.clear()
+        mock_retrieve.side_effect = stripe.InvalidRequestError("no such session", None)
+        codes = [self.client.get(self.url_tpl.format("cs_x")).status_code for _ in range(31)]
+        self.assertEqual(codes[:30], [404] * 30)
+        self.assertEqual(codes[30], 429)
+        cache.clear()
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
+class BillingThrottleFailOpenTests(TestCase):
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="failopen", password="pw12345!")
+        Subscription.objects.create(user=self.user, stripe_customer_id="cus_failopen")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+        self.plan = Plan.objects.create(
+            name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_fo",
+            amount_cents=400, currency="usd", billing_interval="month", access_days_granted=30,
+        )
+
+    def _down(self):
+        return patch.object(
+            FailOpenScopedRateThrottle,
+            "cache",
+            **{"get.side_effect": redis.exceptions.ConnectionError("redis is down")},
+        )
+
+    def test_checkout_get_served_and_warns_when_cache_down(self) -> None:
+        with self._down(), self.assertLogs("fragrance.views", level="WARNING") as logs:
+            response = self.client.get("/api/v1/billing/checkout/")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(any("throttle cache unavailable" in m for m in logs.output))
+
+    @patch("fragrance.billing.stripe.checkout.Session.create")
+    def test_checkout_post_not_500_when_cache_down(self, mock_create) -> None:
+        mock_create.return_value = type("S", (), {"url": "https://stripe.test/x", "id": "cs_1"})()
+        with self._down(), self.assertLogs("fragrance.views", level="WARNING") as logs:
+            response = self.client.post(
+                "/api/v1/billing/checkout/", {"plan": "beta-monthly"}, format="json"
+            )
+        self.assertNotEqual(response.status_code, 500)
+        self.assertTrue(any("throttle cache unavailable" in m for m in logs.output))
+
+    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
+    def test_session_not_500_when_cache_down(self, mock_retrieve) -> None:
+        mock_retrieve.side_effect = stripe.InvalidRequestError("no such session", None)
+        with self._down(), self.assertLogs("fragrance.views", level="WARNING") as logs:
+            response = self.client.get("/api/v1/billing/session/cs_x/")
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(any("throttle cache unavailable" in m for m in logs.output))
+
+
+class PasswordResetEmailLookupTests(TestCase):
+    url = "/api/v1/auth/password/reset/"
+
+    def test_case_insensitive_email_match_sends_mail(self) -> None:
+        User.objects.create_user(username="dave", email="Dave@example.com")
+        mail.outbox.clear()
+        with _run_reset_task_inline():
+            response = APIClient().post(self.url, {"email": "dave@example.com"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_duplicate_emails_do_not_500(self) -> None:
+        User.objects.create_user(username="dup1", email="dup@example.com")
+        User.objects.create_user(username="dup2", email="dup@example.com")
+        mail.outbox.clear()
+        with _run_reset_task_inline():
+            response = APIClient().post(self.url, {"email": "dup@example.com"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 2)
+
+
+class PasswordResetQueuedTests(TestCase):
+    url = "/api/v1/auth/password/reset/"
+
+    def _post(self, email: str):
+        return APIClient().post(self.url, {"email": email}, format="json")
+
+    def test_zero_one_and_many_matches_return_identical_response(self) -> None:
+        User.objects.create_user(username="one", email="one@example.com")
+        User.objects.create_user(username="m1", email="many@example.com")
+        User.objects.create_user(username="m2", email="Many@example.com")
+        with patch("fragrance.tasks.send_password_reset_email.delay"):
+            none = self._post("nobody@example.com")
+            one = self._post("one@example.com")
+            many = self._post("many@example.com")
+        self.assertEqual(none.status_code, 200)
+        self.assertEqual(one.status_code, 200)
+        self.assertEqual(many.status_code, 200)
+        self.assertEqual(none.content, one.content)
+        self.assertEqual(none.content, many.content)
+
+    def test_mail_is_queued_per_account_not_sent_inline(self) -> None:
+        u1 = User.objects.create_user(username="q1", email="q@example.com")
+        u2 = User.objects.create_user(username="q2", email="Q@example.com")
+        mail.outbox.clear()
+        with patch("fragrance.tasks.send_password_reset_email.delay") as mock_delay:
+            response = self._post("q@example.com")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 0)
+        self.assertEqual(mock_delay.call_count, 2)
+        self.assertEqual(
+            [c.kwargs for c in mock_delay.call_args_list],
+            [{"user_id": u1.pk}, {"user_id": u2.pk}],
+        )
+
+    def test_no_match_enqueues_nothing(self) -> None:
+        with patch("fragrance.tasks.send_password_reset_email.delay") as mock_delay:
+            self._post("ghost@example.com")
+        mock_delay.assert_not_called()
+
+    def test_broker_failure_still_returns_uniform_response(self) -> None:
+        from kombu.exceptions import OperationalError
+
+        User.objects.create_user(username="b1", email="b@example.com")
+        with patch("fragrance.tasks.send_password_reset_email.delay") as mock_delay:
+            mock_delay.side_effect = OperationalError("broker down")
+            with self.assertLogs("fragrance.views", level="ERROR"):
+                response = self._post("b@example.com")
+            control = self._post("ghost@example.com")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, control.content)
+
+    def test_task_sends_mail_with_uid_and_token_in_query_string(self) -> None:
+        from urllib.parse import parse_qs, urlparse
+
+        user = User.objects.create_user(username="t1", email="t@example.com", password=None)
+        self.assertFalse(user.has_usable_password())
+        mail.outbox.clear()
+        send_password_reset_email.apply(kwargs={"user_id": user.pk})
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, ["t@example.com"])
+        url = re.search(r"https?://\S+", mail.outbox[0].body).group(0)
+        query = parse_qs(urlparse(url).query)
+        self.assertIn("uid", query)
+        self.assertIn("token", query)
+
+    def test_task_with_missing_user_sends_nothing(self) -> None:
+        mail.outbox.clear()
+        send_password_reset_email.apply(kwargs={"user_id": 999999})
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_task_retries_on_send_failure(self) -> None:
+        user = User.objects.create_user(username="r1", email="r@example.com")
+        with patch("fragrance.tasks.send_mail", side_effect=RuntimeError("smtp down")):
+            with patch.object(send_password_reset_email, "retry", side_effect=RuntimeError("retried")) as mock_retry:
+                result = send_password_reset_email.apply(kwargs={"user_id": user.pk})
+        self.assertTrue(result.failed())
+        mock_retry.assert_called_once()
+
+    def test_unknown_email_returns_same_response_and_sends_nothing(self) -> None:
+        mail.outbox.clear()
+        response = APIClient().post(self.url, {"email": "nobody@example.com"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 0)
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
+class RevokeForDisputeTests(TestCase):
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="disputeduser", email="disputeduser@example.com")
+        self.subscription = Subscription.objects.create(
+            user=self.user, stripe_customer_id="cus_dispute_1", status="active",
+            access_expires_at=timezone.now() + timedelta(days=20),
+        )
+
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_resolvable_dispute_revokes_immediately(self, mock_retrieve) -> None:
+        mock_retrieve.return_value = _fake_payment_intent(
+            pi_id="pi_dispute", status="succeeded", customer="cus_dispute_1"
+        )
+        before = timezone.now()
+
+        revoke_for_dispute(dispute={"payment_intent": "pi_dispute"})
+
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "revoked")
+        self.assertGreaterEqual(self.subscription.access_expires_at, before)
+
+    def test_missing_payment_intent_revokes_nothing(self) -> None:
+        revoke_for_dispute(dispute={})
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "active")
+        self.assertIsNotNone(self.subscription.access_expires_at)
+
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_unknown_customer_revokes_nothing(self, mock_retrieve) -> None:
+        mock_retrieve.return_value = _fake_payment_intent(pi_id="pi_x", status="succeeded", customer="cus_unknown")
+        revoke_for_dispute(dispute={"payment_intent": "pi_x"})
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "active")
+
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_unresolvable_charge_revokes_nothing(self, mock_retrieve) -> None:
+        mock_retrieve.side_effect = stripe.InvalidRequestError("no such payment_intent", None)
+        revoke_for_dispute(dispute={"payment_intent": "pi_missing"})
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "active")
+
+    @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
+    def test_expanded_payment_intent_object_is_normalized_to_its_id(self, mock_retrieve) -> None:
+        """
+        Dispute.payment_intent is Optional[ExpandableField["PaymentIntent"]]
+        -- if the event ever arrives with that field expanded, it's a nested
+        object, not a bare id string. PaymentIntent.retrieve must still be
+        called with the id, not the dict.
+        """
+        mock_retrieve.return_value = _fake_payment_intent(
+            pi_id="pi_dispute", status="succeeded", customer="cus_dispute_1"
+        )
+
+        revoke_for_dispute(dispute={"payment_intent": {"id": "pi_dispute", "object": "payment_intent"}})
+
+        mock_retrieve.assert_called_once_with("pi_dispute")
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "revoked")
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
+class StripeWebhookViewTests(TestCase):
+    slash_url = "/api/v1/billing/webhook/stripe/"
+    noslash_url = "/api/v1/billing/webhook/stripe"
+
+    def _signed_post(self, url: str, body: bytes, secret: str = "whsec_test_dummy"):
+        sig = stripe.WebhookSignature.generate_signature_header(payload=body.decode(), secret=secret)
+        return self.client.post(url, data=body, content_type="application/json", HTTP_STRIPE_SIGNATURE=sig)
+
+    @patch("fragrance.tasks.process_stripe_event.delay")
+    def test_valid_signature_creates_event_and_queues_processing(self, mock_delay) -> None:
+        body = json.dumps({
+            "id": "evt_test_1", "object": "event", "type": "payment_intent.succeeded",
+            "created": 1758300000, "data": {"object": {"id": "pi_1", "status": "succeeded"}},
+        }).encode()
+
+        response = self._signed_post(self.slash_url, body)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(StripeEvent.objects.filter(stripe_event_id="evt_test_1").exists())
+        mock_delay.assert_called_once_with(stripe_event_id="evt_test_1")
+
+    def test_tampered_body_returns_400(self) -> None:
+        body = json.dumps({
+            "id": "evt_bad", "object": "event", "type": "payment_intent.succeeded",
+            "created": 1758300000, "data": {"object": {}},
+        }).encode()
+        sig = stripe.WebhookSignature.generate_signature_header(payload=body.decode(), secret="whsec_test_dummy")
+        tampered_body = body.replace(b"evt_bad", b"evt_evil!")
+
+        response = self.client.post(
+            self.slash_url, data=tampered_body, content_type="application/json", HTTP_STRIPE_SIGNATURE=sig
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(StripeEvent.objects.filter(stripe_event_id="evt_evil").exists())
+
+    def test_wrong_secret_returns_400(self) -> None:
+        body = json.dumps({
+            "id": "evt_wrong_secret", "object": "event", "type": "payment_intent.succeeded",
+            "created": 1758300000, "data": {"object": {}},
+        }).encode()
+        response = self._signed_post(self.slash_url, body, secret="whsec_totally_different")
+        self.assertEqual(response.status_code, 400)
+
+    @patch("fragrance.tasks.process_stripe_event.delay")
+    def test_replayed_event_id_returns_200_without_second_queue(self, mock_delay) -> None:
+        body = json.dumps({
+            "id": "evt_replay", "object": "event", "type": "payment_intent.succeeded",
+            "created": 1758300000, "data": {"object": {"id": "pi_1"}},
+        }).encode()
+
+        first = self._signed_post(self.slash_url, body)
+        second = self._signed_post(self.slash_url, body)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(StripeEvent.objects.filter(stripe_event_id="evt_replay").count(), 1)
+        mock_delay.assert_called_once_with(stripe_event_id="evt_replay")
+
+    @patch("fragrance.tasks.process_stripe_event.delay")
+    def test_unsubscribed_event_type_returns_200_and_is_stored(self, mock_delay) -> None:
+        body = json.dumps({
+            "id": "evt_unsub", "object": "event", "type": "customer.created",
+            "created": 1758300000, "data": {"object": {"id": "cus_1"}},
+        }).encode()
+
+        response = self._signed_post(self.slash_url, body)
+
+        self.assertEqual(response.status_code, 200)
+        event_row = StripeEvent.objects.get(stripe_event_id="evt_unsub")
+        self.assertEqual(event_row.event_type, "customer.created")
+        mock_delay.assert_called_once()
+
+    def test_both_url_spellings_reach_view_without_redirect(self) -> None:
+        body_slash = json.dumps({
+            "id": "evt_slash", "object": "event", "type": "customer.created",
+            "created": 1758300000, "data": {"object": {}},
+        }).encode()
+        body_noslash = json.dumps({
+            "id": "evt_noslash", "object": "event", "type": "customer.created",
+            "created": 1758300000, "data": {"object": {}},
+        }).encode()
+
+        with patch("fragrance.tasks.process_stripe_event.delay"):
+            response_slash = self._signed_post(self.slash_url, body_slash)
+            response_noslash = self._signed_post(self.noslash_url, body_noslash)
+
+        self.assertEqual(response_slash.status_code, 200)
+        self.assertEqual(response_noslash.status_code, 200)
+
+    def test_get_not_allowed(self) -> None:
+        response = self.client.get(self.slash_url)
+        self.assertEqual(response.status_code, 405)
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
+class ProcessStripeEventTaskTests(TestCase):
+    def test_missing_event_row_is_a_noop(self) -> None:
+        process_stripe_event(stripe_event_id="evt_missing")  # must not raise
+
+    @patch("fragrance.billing.fulfill_payment_intent")
+    def test_payment_intent_succeeded_dispatches_to_fulfillment(self, mock_fulfill) -> None:
+        StripeEvent.objects.create(
+            stripe_event_id="evt_pi", event_type="payment_intent.succeeded",
+            payload={"data": {"object": {"id": "pi_dispatch"}}},
+        )
+        process_stripe_event(stripe_event_id="evt_pi")
+        mock_fulfill.assert_called_once_with(payment_intent_id="pi_dispatch")
+        row = StripeEvent.objects.get(stripe_event_id="evt_pi")
+        self.assertEqual(row.status, "processed")
+        self.assertIsNotNone(row.processed_at)
+
+    @patch("fragrance.billing.revoke_for_dispute")
+    def test_charge_dispute_created_dispatches_to_revocation(self, mock_revoke) -> None:
+        StripeEvent.objects.create(
+            stripe_event_id="evt_dispute", event_type="charge.dispute.created",
+            payload={"data": {"object": {"payment_intent": "pi_d"}}},
+        )
+        process_stripe_event(stripe_event_id="evt_dispute")
+        mock_revoke.assert_called_once_with(dispute={"payment_intent": "pi_d"})
+        self.assertEqual(StripeEvent.objects.get(stripe_event_id="evt_dispute").status, "processed")
+
+    def test_unhandled_event_type_is_a_noop_and_marked_processed(self) -> None:
+        StripeEvent.objects.create(
+            stripe_event_id="evt_other", event_type="customer.created",
+            payload={"data": {"object": {}}},
+        )
+        process_stripe_event(stripe_event_id="evt_other")
+        self.assertEqual(StripeEvent.objects.get(stripe_event_id="evt_other").status, "processed")
+
+
+class SanitizeStripeErrorMessageTests(TestCase):
+    def test_stripe_error_is_sanitized(self) -> None:
+        from fragrance.ai_providers.base import sanitize_sdk_error_message
+
+        exc = stripe.InvalidRequestError("super secret internal detail sk_live_abc123", None)
+        message = sanitize_sdk_error_message(exc)
+        self.assertNotIn("sk_live_abc123", message)
+
+    def test_non_sdk_exception_passes_through_unchanged(self) -> None:
+        from fragrance.ai_providers.base import sanitize_sdk_error_message
+
+        exc = ValueError("plain application error")
+        self.assertEqual(sanitize_sdk_error_message(exc), "plain application error")

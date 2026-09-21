@@ -7,9 +7,10 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.core import signing
 from django.db import IntegrityError, transaction
+from django.utils.text import slugify
 from rest_framework.request import Request
 
-from .models import FRAGRANCE_STATUSES, Fragrance, Recommendation
+from .models import FRAGRANCE_STATUSES, BetaSignup, Fragrance, Recommendation
 
 REQUIRED_COLUMNS = {"fragrance", "status", "house", "notes"}
 
@@ -289,3 +290,119 @@ def hash_signup_ip(*, ip: str) -> str:
     return hmac.new(
         key=settings.SECRET_KEY.encode(), msg=ip.encode(), digestmod=hashlib.sha256
     ).hexdigest()
+
+
+_MAX_USERNAME_LENGTH = 150
+
+
+def derive_unique_username(*, email: str) -> str:
+    """
+    Derives a unique Django username from an email's local part.
+
+    Two different addresses can reduce to the same local part (ryan@gmail.com
+    and ryan@example.com both slugify to "ryan"), so this always checks for an
+    existing row and appends a numeric suffix on collision. The base is
+    truncated up front to leave room for that suffix, rather than truncating
+    the final candidate -- truncating after appending could silently reproduce
+    a collision by chopping the suffix back off.
+    """
+    local = email.split("@", 1)[0]
+    base = slugify(local).replace("-", "_") or "user"
+    base = base[: _MAX_USERNAME_LENGTH - 5]
+
+    candidate = base
+    suffix = 1
+    while User.objects.filter(username=candidate).exists():
+        suffix += 1
+        candidate = f"{base}_{suffix}"[:_MAX_USERNAME_LENGTH]
+    return candidate
+
+
+BETA_INVITE_SALT = "beta-invite"
+BETA_INVITE_MAX_AGE = 60 * 60 * 24 * 14  # 14 days
+
+
+def generate_beta_invite_token(*, signup: BetaSignup) -> str:
+    """
+    Signs a payload identifying which BetaSignup/User an invite-accept link
+    represents. Deliberately not Django's PasswordResetTokenGenerator --
+    PASSWORD_RESET_TIMEOUT is 1 hour, and raising it globally to suit a
+    14-day invite window would weaken actual password resets.
+    """
+    payload = {"sid": signup.id, "uid": signup.invited_user_id}
+    return signing.dumps(payload, salt=BETA_INVITE_SALT)
+
+
+def verify_beta_invite_token(*, token: str) -> dict | None:
+    """
+    Decodes and verifies a beta-invite token. Returns the payload dict on
+    success, or None if the token is missing, tampered, expired, or
+    malformed -- callers should treat None as a generic "invalid or expired
+    link" so a bad token carries no signal about whether a matching signup
+    exists, matching verify_recommendation_token's rule.
+    """
+    if not token:
+        return None
+    try:
+        payload = signing.loads(token, salt=BETA_INVITE_SALT, max_age=BETA_INVITE_MAX_AGE)
+    except (signing.BadSignature, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if {"sid", "uid"} - payload.keys():
+        return None
+    return payload
+
+
+class BetaInviteTokenError(Exception):
+    """Base for resolve_beta_invite_signup rejections."""
+
+
+class BetaInviteTokenInvalidError(BetaInviteTokenError):
+    """
+    Token missing/tampered/expired, unknown signup, wrong status (anything
+    other than 'approved' or 'converted'), or invited_user missing/inactive/
+    mismatched. Maps to 400 {"code": "invalid_or_expired"}.
+    """
+
+
+class BetaInviteTokenAlreadyUsedError(BetaInviteTokenError):
+    """
+    Signup status is already 'converted'. The only rejection reason this
+    project's BetaAcceptView tells the caller apart from a generic invalid
+    link: a signed invite token is not something a third party can guess or
+    type in the way an email address can, so holding one already proves
+    receipt of the one email it was sent in, and "already used" leaks
+    nothing that holder didn't already have. Maps to 409
+    {"code": "already_used"}.
+    """
+
+
+def resolve_beta_invite_signup(*, token: str) -> BetaSignup:
+    """
+    Decodes a beta-invite token and resolves it to a still-invitable
+    BetaSignup. Shared by BetaAcceptView's GET pre-check and its POST
+    serializer so both paths agree on exactly what counts as invalid vs.
+    already-used.
+    """
+    payload = verify_beta_invite_token(token=token)
+    if payload is None:
+        raise BetaInviteTokenInvalidError()
+    try:
+        signup = BetaSignup.objects.select_related('invited_user').get(pk=payload['sid'])
+    except BetaSignup.DoesNotExist:
+        raise BetaInviteTokenInvalidError()
+
+    if signup.status == 'converted':
+        raise BetaInviteTokenAlreadyUsedError()
+
+    user = signup.invited_user
+    if (
+        signup.status != 'approved'
+        or user is None
+        or user.id != payload['uid']
+        or not user.is_active
+    ):
+        raise BetaInviteTokenInvalidError()
+
+    return signup

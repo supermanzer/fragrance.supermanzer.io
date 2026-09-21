@@ -26,6 +26,13 @@ http {
     # anyway to mine the timing side-channel.
     limit_req_zone $binary_remote_addr zone=beta:10m rate=5r/m;
 
+    # Stripe webhook deliveries. Deliberately generous: Stripe retries with backoff for
+    # three days and treats ANY non-2xx as a delivery failure, so a tight limit here
+    # actively harms us. Note also that real_ip_header CF-Connecting-IP resolves Stripe's
+    # ~15 egress IPs into a handful of buckets, so a per-IP 10r/m zone would throttle
+    # legitimate retry bursts. Signature verification is the control; this is a safety valve.
+    limit_req_zone $binary_remote_addr zone=stripe_wh:10m rate=300r/m;
+
     # nginx answers a tripped limit_req with 503 by default, which a client cannot
     # distinguish from a genuinely broken upstream. 429 is the correct semantics — "you are
     # going too fast", not "we are broken" — and it is what the beta signup page checks for.
@@ -163,6 +170,57 @@ http {
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
             proxy_set_header   X-Forwarded-Proto $scheme;
             client_max_body_size 8k;
+        }
+
+        # Stripe webhook receiver.
+        #
+        # IP allowlist: Stripe publishes its webhook egress addresses (15 of them, verified
+        # 2026-09-20 against both https://docs.stripe.com/ips and
+        # https://stripe.com/files/ips/ips_webhooks.json). Unlike admin_allowlist.d/ these are
+        # public documentation, not the operator's home IP, so they belong in version control
+        # where a fresh clone is correct and changes show up in diffs.
+        #
+        # allow/deny work here only because this block uses proxy_pass (content phase) — a
+        # `return` directive would run in the rewrite phase and bypass the access check entirely.
+        #
+        # FAIL-CLOSED by design. Stripe gives seven days' notice before changing these addresses
+        # via https://groups.google.com/a/lists.stripe.com/g/api-announce — subscribe to it. If
+        # the list changes unnoticed, webhooks 403 silently. Stripe's 72-hour retry window is
+        # currently the ONLY thing bounding the damage: the reconciliation task that is meant to
+        # re-fetch subscription state independently of webhooks is slice 3 and does not exist yet.
+        # Until it does, a delivery outage lasting longer than 72 hours is unrecoverable without
+        # manual intervention, and a lost grant means a paying customer silently loses access.
+        #
+        # The allowlist decides what REACHES Django. Signature verification decides what is
+        # TRUSTED. Neither substitutes for the other.
+        location /api/v1/billing/webhook/ {
+            allow 3.18.12.63;
+            allow 3.69.109.8;
+            allow 3.120.168.93;
+            allow 3.130.192.231;
+            allow 13.235.14.237;
+            allow 13.235.122.149;
+            allow 18.211.135.69;
+            allow 35.154.171.200;
+            allow 35.157.207.129;
+            allow 52.15.183.38;
+            allow 54.88.130.119;
+            allow 54.88.130.237;
+            allow 54.187.174.169;
+            allow 54.187.205.235;
+            allow 54.187.216.72;
+            deny all;
+
+            limit_req zone=stripe_wh burst=100 nodelay;
+            proxy_hide_header  X-Content-Type-Options;
+            proxy_hide_header  Referrer-Policy;
+            set $backend_upstream http://backend:8000;
+            proxy_pass         $backend_upstream;
+            proxy_set_header   Host              $host;
+            proxy_set_header   X-Real-IP         $remote_addr;
+            proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto $scheme;
+            client_max_body_size 1m;
         }
 
         location /${ADMIN_URL_PATH}/ {

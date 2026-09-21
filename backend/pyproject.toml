@@ -19,4 +19,5 @@ dependencies = [
     "python-decouple>=3.8",
     "redis>=6.4.0",
     "requests>=2.34.2",
+    "stripe>=15.6.1",
 ]

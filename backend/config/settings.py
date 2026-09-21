@@ -145,6 +145,20 @@ DASHSCOPE_BASE_URL = config(
     default="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
 )
 
+# Stripe — read with default="" (not the bare config("X") DJANGO_SECRET_KEY
+# uses) for the same reason as the AI provider keys above: the operator has
+# not yet provisioned these on every environment, and a bare config() would
+# crash Django at import time rather than failing at first use inside
+# fragrance.billing._configure_stripe(). STRIPE_API_VERSION is pinned
+# explicitly (default matches the installed stripe==15.6.1 wheel's own
+# _ApiVersion.CURRENT) — the PaymentIntent/Invoice decoupling this project's
+# webhook handler relies on (invoice.parent.subscription_details) is
+# version-dependent, and an unpinned account default could change payload
+# shapes silently.
+STRIPE_SECRET_KEY = config("STRIPE_SECRET_KEY", default="")
+STRIPE_WEBHOOK_SECRET = config("STRIPE_WEBHOOK_SECRET", default="")
+STRIPE_API_VERSION = config("STRIPE_API_VERSION", default="2026-08-26.dahlia")
+
 # Celery async task worker(s)
 # https://docs.celeryq.dev/en/latest/django/first-steps-with-django.html
 _redis_password = config("REDIS_PASSWORD", default="")
@@ -211,6 +225,11 @@ REST_FRAMEWORK = {
     # beta-signup endpoint additionally carries its own scoped DRF throttle.
     "DEFAULT_THROTTLE_RATES": {
         "beta-signup": "5/min",
+        "checkout": "10/min",
+        # Above 18/min (one full success-page poll budget) with headroom: the
+        # "Refresh" button resets the frontend's pollCount, so an honest retry
+        # restarts the budget and must not be throttled mid-payment.
+        "billing-session": "30/min",
     },
     # DRF's default SimpleMetadata answers OPTIONS for any caller, including
     # AllowAny views, by cloning the request per unsafe method and including

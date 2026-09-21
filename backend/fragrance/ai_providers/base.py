@@ -14,6 +14,7 @@ from typing import Protocol, runtime_checkable
 
 import anthropic
 import openai
+import stripe
 
 # Both SDKs default to a 600s read timeout with 2 retries, far exceeding
 # gunicorn's --timeout 120 (docker-compose.yaml). Every provider's client
@@ -26,11 +27,11 @@ PROVIDER_TIMEOUT_SECONDS = 90.0
 
 def sanitize_sdk_error_message(exc: Exception) -> str:
     """
-    Returns a fixed, non-parameterized message for Anthropic/OpenAI SDK
-    APIError exceptions instead of str(exc)/f"{exc}". OpenAI's own 401
+    Returns a fixed, non-parameterized message for Anthropic/OpenAI/Stripe
+    SDK error exceptions instead of str(exc)/f"{exc}". OpenAI's own 401
     response body embeds a vendor-masked fragment of the submitted key (e.g.
     "Incorrect API key provided: sk-****...ZXY"); Anthropic and DashScope
-    don't leak any key material in theirs, but every SDK APIError is treated
+    don't leak any key material in theirs, but every SDK error is treated
     the same way here so this stays the single place that decides what's
     safe to surface, rather than trusting each call site to know which
     vendor's error body leaks what. Non-SDK exceptions (config errors raised
@@ -40,15 +41,19 @@ def sanitize_sdk_error_message(exc: Exception) -> str:
 
     Used everywhere an exception this code doesn't fully control might land
     on a capture surface — a DB field served to the frontend
-    (RecommendationRun.error_message) or command stdout
-    (verify_ai_model.py) — both of which this project has already had one
-    real key-exposure incident against.
+    (RecommendationRun.error_message, StripeEvent.error) or an API response
+    body (BillingCheckoutView, BillingSessionView) — all of which this
+    project has already had one real key-exposure incident against.
+    Note: stripe.StripeError, not stripe.error.StripeError -- the latter is
+    the pre-v8 stripe-python layout and doesn't exist in the pinned version.
     """
     if isinstance(exc, (anthropic.APIError, openai.APIError)):
         return (
             "The configured AI provider rejected the request (authentication "
             "or API error). Check the active family's API key and try again."
         )
+    if isinstance(exc, stripe.StripeError):
+        return "Stripe rejected the request. Check the Stripe configuration and try again."
     return str(exc)
 
 

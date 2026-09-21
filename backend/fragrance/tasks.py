@@ -6,10 +6,14 @@ Implements Celery tasks for Fragrance Recommendation Runs
 
 from celery import shared_task
 from django.conf import settings
-from django.core.mail import EmailMessage
+from django.contrib.auth.models import User
+from django.contrib.auth.tokens import default_token_generator
+from django.core.mail import EmailMessage, send_mail
 from django.db.models import Max
 from django.template.loader import render_to_string
 from django.utils import timezone
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode
 
 from .ai_providers import registry
 from .ai_providers.base import StructuredLLMProvider, sanitize_sdk_error_message
@@ -19,9 +23,17 @@ from .ai_providers.registry import (
     NoActiveAIModelConfigError,
 )
 from .llm import generate_email_content, generate_preference_profile, select_candidates
-from .models import Fragrance, FragranceConfig, PreferenceProfile, RecommendationRun
+from .models import BetaSignup, Fragrance, FragranceConfig, PreferenceProfile, RecommendationRun, StripeEvent
 from .search import run_discovery_searches, verify_candidates
-from .services import generate_recommendation_token
+from .services import generate_beta_invite_token, generate_recommendation_token
+
+# The only two event types the endpoint is configured for in the Stripe
+# Dashboard -- kept here, not in views.stripe_webhook, since this is the
+# point that decides whether to act, not just whether to store. Anything
+# else that reaches this task (a Dashboard misconfiguration, or an event
+# type added there without a matching handler) is a documented no-op, not
+# an error: the StripeEvent row is still marked 'processed'.
+STRIPE_HANDLED_EVENT_TYPES = {"payment_intent.succeeded", "charge.dispute.created"}
 
 RATING_ACTIONS = ('own', 'like', 'dislike')
 
@@ -120,6 +132,68 @@ def _resolve_profile(
 
 
 @shared_task(bind=True, max_retries=5)
+def send_beta_invite_email(self: 'send_beta_invite_email', signup_id: int) -> None:
+    """
+    Sends the beta-invite email for an approved signup. Queued from the admin
+    approve action via transaction.on_commit rather than called synchronously
+    -- a Postmark outage must not 500 the admin approval request the way
+    PasswordResetRequestView's inline, fail_silently=False send would.
+    """
+    signup = BetaSignup.objects.select_related('invited_user').get(id=signup_id)
+    if signup.invited_user is None:
+        return
+    token = generate_beta_invite_token(signup=signup)
+    accept_url = f"{settings.FRONTEND_URL}/beta/accept?token={token}"
+    try:
+        send_mail(
+            subject="You're in — set up your Fragrances account",
+            message=render_to_string(
+                template_name='fragrance/beta_invite_email.txt',
+                context={'accept_url': accept_url},
+            ),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[signup.email],
+            fail_silently=False,
+        )
+    except Exception as exc:
+        if self.request.retries >= self.max_retries:
+            raise
+        raise self.retry(exc=exc, countdown=300)
+
+
+@shared_task(bind=True, max_retries=5)
+def send_password_reset_email(self: 'send_password_reset_email', user_id: int) -> None:
+    """
+    Sends one password-reset email. Takes the user id rather than a token:
+    uid and token are generated here so the reset credential is never
+    serialized into the Redis broker. Queued by PasswordResetRequestView so
+    that view's latency and failure modes don't depend on whether an account
+    matched (an account-enumeration oracle).
+    """
+    user = User.objects.filter(pk=user_id).first()
+    if user is None or not user.email:
+        return
+    uid = urlsafe_base64_encode(force_bytes(user.pk))
+    token = default_token_generator.make_token(user=user)
+    reset_url = f"{settings.FRONTEND_URL}/auth/reset-password?uid={uid}&token={token}"
+    try:
+        send_mail(
+            subject='Reset your password',
+            message=render_to_string(
+                template_name='fragrance/password_reset_email.txt',
+                context={'username': user.username, 'reset_url': reset_url},
+            ),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[user.email],
+            fail_silently=False,
+        )
+    except Exception as exc:
+        if self.request.retries >= self.max_retries:
+            raise
+        raise self.retry(exc=exc, countdown=60 * 2 ** self.request.retries)
+
+
+@shared_task(bind=True, max_retries=5)
 def send_recommendation_email(self: 'send_recommendation_email', user_id: int, run_id: int) -> None:
     """Sends the recommendation email for a completed run. Retried independently of generation."""
     try:
@@ -192,5 +266,47 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
             run.status = 'failed'
             run.error_message = sanitize_sdk_error_message(exc)
             run.save(update_fields=['status', 'error_message'])
+            raise
+        raise self.retry(exc=exc, countdown=300)
+
+
+@shared_task(bind=True, max_retries=3)
+def process_stripe_event(self: 'process_stripe_event', stripe_event_id: str) -> None:
+    """
+    Does the real Stripe work views.stripe_webhook deliberately doesn't:
+    fulfillment (steps 4-6 of the payment_intent.succeeded validation chain)
+    is two to three outbound Stripe calls, and the webhook view must return
+    200 within Checkout's ~10s redirect window regardless. celery-worker has
+    public egress; celery-beat does not, which is why this task is only ever
+    reached via .delay() from the webhook view, never scheduled.
+
+    Reads the event from the already-persisted StripeEvent row rather than
+    a directly-passed payload, so retries replay from committed state
+    instead of a stale in-memory dict.
+    """
+    from .billing import fulfill_payment_intent, revoke_for_dispute
+
+    try:
+        event_row = StripeEvent.objects.get(stripe_event_id=stripe_event_id)
+    except StripeEvent.DoesNotExist:
+        return
+
+    data_object = event_row.payload.get('data', {}).get('object', {})
+
+    try:
+        if event_row.event_type == 'payment_intent.succeeded':
+            fulfill_payment_intent(payment_intent_id=data_object.get('id', ''))
+        elif event_row.event_type == 'charge.dispute.created':
+            revoke_for_dispute(dispute=data_object)
+        elif event_row.event_type not in STRIPE_HANDLED_EVENT_TYPES:
+            pass  # unsubscribed event type reached the endpoint anyway -- ignored, not an error
+        event_row.status = 'processed'
+        event_row.processed_at = timezone.now()
+        event_row.save(update_fields=['status', 'processed_at'])
+    except Exception as exc:
+        event_row.status = 'failed'
+        event_row.error = sanitize_sdk_error_message(exc)
+        event_row.save(update_fields=['status', 'error'])
+        if self.request.retries >= self.max_retries:
             raise
         raise self.retry(exc=exc, countdown=300)

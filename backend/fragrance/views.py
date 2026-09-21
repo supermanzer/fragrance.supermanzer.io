@@ -2,18 +2,22 @@ import codecs
 import csv
 import io
 import logging
+from datetime import datetime
+from datetime import timezone as dt_timezone
 
 import redis
+import stripe
 from django.conf import settings
 from django.contrib.auth.models import User
-from django.contrib.auth.tokens import default_token_generator
-from django.core.mail import send_mail
+from django.core.exceptions import ImproperlyConfigured
+from django.db import IntegrityError, transaction
 from django.db.models import Prefetch
-from django.http import HttpResponse
+from django.http import HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404
-from django.template.loader import render_to_string
-from django.utils.encoding import force_bytes
-from django.utils.http import urlsafe_base64_encode
+from django.utils import timezone
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
+from kombu.exceptions import OperationalError
 from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound
@@ -24,6 +28,8 @@ from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from . import billing
+from .ai_providers.base import sanitize_sdk_error_message
 from .models import (
     BetaSignup,
     Fragrance,
@@ -31,26 +37,34 @@ from .models import (
     PreferenceProfile,
     Recommendation,
     RecommendationRun,
+    StripeEvent,
+    Subscription,
 )
 from .serializers import (
+    BetaAcceptSerializer,
     BetaSignupSerializer,
     ChangePasswordSerializer,
+    CheckoutCreateSerializer,
     FragranceConfigSerializer,
     FragranceSerializer,
     PasswordResetConfirmSerializer,
     PasswordResetRequestSerializer,
+    PlanSerializer,
     PreferenceProfileSerializer,
     RecommendationRatingSerializer,
     RecommendationRunSerializer,
     RecommendationSerializer,
 )
 from .services import (
+    BetaInviteTokenAlreadyUsedError,
+    BetaInviteTokenInvalidError,
     RatingConflict,
     apply_recommendation_rating,
     get_client_ip,
     hash_signup_ip,
     import_collection_from_csv,
     normalize_email,
+    resolve_beta_invite_signup,
     verify_recommendation_token,
 )
 
@@ -72,7 +86,40 @@ _BETA_SIGNUP_RESPONSE = {
 }
 
 
-class BetaSignupThrottle(ScopedRateThrottle):
+class FailOpenScopedRateThrottle(ScopedRateThrottle):
+    """
+    ScopedRateThrottle that fails open on a Redis-backed cache error.
+
+    settings.CACHES["default"] points at Redis so throttles are enforced
+    correctly across gunicorn's multiple worker processes. Django's built-in
+    RedisCache does not swallow connection errors the way django-redis can
+    with IGNORE_EXCEPTIONS -- SimpleRateThrottle.allow_request calls
+    self.cache.get()/.set() with no try/except of its own, so a Redis outage
+    would otherwise 500 every throttled view.
+
+    The trade-off differs per view:
+    - /api/v1/beta/ (public, unauthenticated): nginx `zone=beta` limit_req is
+      the authoritative limiter; this throttle is defense-in-depth and must
+      never be what takes the page down.
+    - Billing checkout / session views: there is NO nginx limit_req on
+      `location /api/`, so during a Redis outage failing open removes the
+      only limiter. That is still the right call: callers are authenticated,
+      approved beta users, and 500ing a customer who has just paid (session
+      confirmation) or is about to pay (checkout) is the worse failure.
+    """
+
+    def allow_request(self, request: Request, view: APIView) -> bool:
+        try:
+            return super().allow_request(request, view)
+        except redis.exceptions.RedisError:
+            logger.warning(
+                "throttle cache unavailable; allowing request without throttling (scope=%s)",
+                getattr(view, "throttle_scope", None),
+            )
+            return True
+
+
+class BetaSignupThrottle(FailOpenScopedRateThrottle):
     """
     Keys the throttle on the same DEBUG-gated proxy-trust resolution as
     services.get_client_ip, rather than the stock BaseThrottle.get_ident.
@@ -90,31 +137,6 @@ class BetaSignupThrottle(ScopedRateThrottle):
 
     def get_ident(self, request: Request) -> str:
         return get_client_ip(request=request)
-
-    def allow_request(self, request: Request, view: generics.GenericAPIView) -> bool:
-        """
-        Fails open on a Redis-backed cache error rather than propagating it.
-
-        settings.CACHES["default"] now points at Redis (see settings.py) so
-        this throttle can be enforced correctly across gunicorn's multiple
-        worker processes. Django's built-in RedisCache does not swallow
-        connection errors the way django-redis can with IGNORE_EXCEPTIONS --
-        SimpleRateThrottle.allow_request calls self.cache.get()/.set() with
-        no try/except of its own. Left uncaught, a Redis outage would 500 this
-        public, unauthenticated signup page. nginx's `zone=beta` limit_req is
-        the authoritative rate limit in production regardless (this DRF
-        throttle is defense-in-depth for the dev/no-nginx path and for
-        per-process dilution) -- defense-in-depth must never be the thing
-        that takes the page down, so an unreachable cache means "don't
-        throttle," not "error."
-        """
-        try:
-            return super().allow_request(request, view)
-        except redis.exceptions.RedisError:
-            logger.warning(
-                "beta signup throttle cache unavailable; allowing request without throttling"
-            )
-            return True
 
 
 class BetaSignupView(generics.GenericAPIView):
@@ -175,6 +197,86 @@ class BetaSignupView(generics.GenericAPIView):
         return Response(_BETA_SIGNUP_RESPONSE, status=status.HTTP_202_ACCEPTED)
 
 
+_BETA_ACCEPT_INVALID_RESPONSE = {"code": "invalid_or_expired"}
+_BETA_ACCEPT_ALREADY_USED_RESPONSE = {"code": "already_used"}
+
+
+class BetaAcceptView(generics.GenericAPIView):
+    """
+    GET is a read-only pre-check so a dead invite link resolves on page load
+    rather than after the user fills in a password form -- it never touches
+    signup.status, only resolve_beta_invite_signup's read path.
+
+    POST sets the password for an admin-approved beta signup and returns a
+    JWT pair, landing the user logged in on the paywall. Single-use: the
+    token itself is re-validated by the serializer, but the status
+    transition here is what actually enforces single-use, under a row lock,
+    so a leaked link replayed concurrently can't succeed twice.
+
+    Both verbs report the same two-way split: 400 "invalid_or_expired" for
+    every rejection reason except one, and 409 "already_used" specifically
+    when the signup has already converted -- see
+    services.resolve_beta_invite_signup and BetaInviteTokenAlreadyUsedError
+    for why that one distinction is safe to surface.
+    """
+
+    permission_classes = [permissions.AllowAny]
+    serializer_class = BetaAcceptSerializer
+
+    def get(self, request, *args, **kwargs):
+        try:
+            resolve_beta_invite_signup(token=request.query_params.get("token", ""))
+        except BetaInviteTokenAlreadyUsedError:
+            return Response(_BETA_ACCEPT_ALREADY_USED_RESPONSE, status=status.HTTP_409_CONFLICT)
+        except BetaInviteTokenInvalidError:
+            return Response(_BETA_ACCEPT_INVALID_RESPONSE, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"valid": True})
+
+    def post(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        try:
+            serializer.is_valid(raise_exception=True)
+        except BetaInviteTokenAlreadyUsedError:
+            return Response(_BETA_ACCEPT_ALREADY_USED_RESPONSE, status=status.HTTP_409_CONFLICT)
+        except BetaInviteTokenInvalidError:
+            return Response(_BETA_ACCEPT_INVALID_RESPONSE, status=status.HTTP_400_BAD_REQUEST)
+        password = serializer.validated_data["password"]
+
+        try:
+            with transaction.atomic():
+                # No select_related("invited_user") here: it's a nullable FK,
+                # and Postgres refuses SELECT ... FOR UPDATE on the nullable
+                # side of an outer join. Fetching it via the accessor below
+                # is a separate, unlocked query -- fine, since only the
+                # BetaSignup row's status transition needs the lock.
+                signup = BetaSignup.objects.select_for_update().get(
+                    pk=serializer.validated_data["signup_id"]
+                )
+                # Re-checked under the lock: a concurrent replay of the same
+                # leaked link may have already converted (or otherwise
+                # changed) this signup between the serializer's read and
+                # this lock being acquired.
+                if signup.status == "converted":
+                    return Response(
+                        _BETA_ACCEPT_ALREADY_USED_RESPONSE, status=status.HTTP_409_CONFLICT
+                    )
+                if signup.status != "approved" or signup.invited_user is None:
+                    return Response(
+                        _BETA_ACCEPT_INVALID_RESPONSE, status=status.HTTP_400_BAD_REQUEST
+                    )
+                user = signup.invited_user
+                user.set_password(password)
+                user.save(update_fields=["password"])
+                signup.status = "converted"
+                signup.converted_at = timezone.now()
+                signup.save(update_fields=["status", "converted_at"])
+        except BetaSignup.DoesNotExist:
+            return Response(_BETA_ACCEPT_INVALID_RESPONSE, status=status.HTTP_400_BAD_REQUEST)
+
+        refresh = RefreshToken.for_user(user)
+        return Response({"access": str(refresh.access_token), "refresh": str(refresh)})
+
+
 class ChangePasswordView(generics.GenericAPIView):
     serializer_class = ChangePasswordSerializer
 
@@ -197,29 +299,51 @@ _RESET_RESPONSE = {'detail': 'If an account with that email exists, a reset link
 
 
 class PasswordResetRequestView(generics.GenericAPIView):
+    """
+    Deliberately does not use django.contrib.auth.forms.PasswordResetForm:
+    that form's get_users() filters out any account with an unusable
+    password (django.contrib.auth.forms, is_active/has_usable_password
+    check), which would silently exclude every approved-but-not-yet-
+    converted beta user -- they're created via set_unusable_password() in
+    BetaSignupAdmin.approve_signups and stay that way until BetaAcceptView
+    sets a real one. The User.objects.filter(email__iexact=...) lookup below has no
+    such filter, and default_token_generator happily generates and
+    validates a token against an unusable password, so this is the only
+    working recovery path for a dead/expired invite link -- the copy on
+    /beta/accept now actively tells users to use this endpoint for exactly
+    that reason. Do not "simplify" this back to PasswordResetForm; doing so
+    would quietly strip every approved-but-not-yet-accepted user of their
+    only way in.
+    """
+
     permission_classes = [permissions.AllowAny]
     serializer_class = PasswordResetRequestSerializer
 
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        try:
-            user = User.objects.get(email=serializer.validated_data['email'])
-        except User.DoesNotExist:
-            return Response(_RESET_RESPONSE)
-        uid = urlsafe_base64_encode(force_bytes(user.pk))
-        token = default_token_generator.make_token(user=user)
-        reset_url = f"{settings.FRONTEND_URL}/auth/reset-password?uid={uid}&token={token}"
-        send_mail(
-            subject='Reset your password',
-            message=render_to_string(
-                template_name='fragrance/password_reset_email.txt',
-                context={'username': user.username, 'reset_url': reset_url},
-            ),
-            from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[user.email],
-            fail_silently=False,
-        )
+        # iexact to match BetaSignupAdmin.approve_signups; filter() rather than
+        # get() because User.email is not unique, and one mail per matching
+        # account (each with its own uid/token) beats a 500 on duplicates.
+        users = User.objects.filter(
+            email__iexact=serializer.validated_data['email']
+        ).order_by('pk')
+        from .tasks import send_password_reset_email
+
+        # Mail is sent from Celery so a Postmark failure or slow round trip
+        # can neither 500 this request nor make its latency depend on whether
+        # (or how many) accounts match -- both would be an enumeration
+        # oracle. Only the user id is queued; the token is minted in the task
+        # so it never sits in the Redis broker. A broker outage is logged and
+        # swallowed for the same reason: the response must stay uniform.
+        for user in users:
+            try:
+                send_password_reset_email.delay(user_id=user.pk)
+            except OperationalError:
+                logger.error(
+                    "could not enqueue password reset email for user_id=%s; broker unavailable",
+                    user.pk,
+                )
         return Response(_RESET_RESPONSE)
 
 
@@ -525,3 +649,180 @@ class RecommendationConfirmView(APIView):
                 "action": fragrance.status,
             }
         )
+
+
+class BillingCheckoutView(generics.GenericAPIView):
+    """
+    GET renders the paywall from one server-owned source (active Plan rows)
+    rather than duplicating prices into the frontend. POST resolves the
+    request's plan slug server-side to a Plan and its stripe_price_id --
+    never a client-supplied price_id, which would let anyone check out
+    against any Price on the account. Default IsAuthenticated (project
+    default), deliberately not subscription-gated: a user must be able to
+    reach checkout precisely because they don't have a subscription yet.
+    """
+
+    serializer_class = CheckoutCreateSerializer
+    throttle_classes = [FailOpenScopedRateThrottle]
+    throttle_scope = "checkout"
+
+    def get(self, request: Request) -> Response:
+        plans = billing.get_active_plans()
+        return Response({"plans": PlanSerializer(plans, many=True).data})
+
+    def post(self, request: Request) -> Response:
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            url = billing.create_checkout_session(
+                user=request.user, plan_slug=serializer.validated_data["slug"]
+            )
+        except billing.SubscriptionAlreadyActiveError:
+            return Response(
+                {"detail": "You already have an active subscription."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        except billing.UnknownPlanError:
+            return Response({"detail": "Unknown plan."}, status=status.HTTP_400_BAD_REQUEST)
+        except ImproperlyConfigured as exc:
+            logger.error("checkout unavailable: %s", exc)
+            return Response(
+                {"detail": "Checkout is temporarily unavailable."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except stripe.StripeError as exc:
+            logger.error("stripe checkout session creation failed: %s", sanitize_sdk_error_message(exc))
+            return Response(
+                {"detail": "Could not start checkout. Please try again shortly."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response({"url": url}, status=status.HTTP_200_OK)
+
+
+class BillingSubscriptionView(generics.GenericAPIView):
+    """
+    Already-active detection for the /billing paywall page: a user who
+    already has a live subscription should never be shown the plan picker.
+    Read-only, unlike BillingSessionView -- it never talks to Stripe, it
+    only reads the local Subscription row (creating one on first touch, the
+    same get_or_create pattern FragranceConfigView uses, so a brand-new
+    approved user reads as {"status": "none", ...} rather than 404).
+
+    Returns the same shape as BillingSessionView (billing.
+    subscription_status_payload) plus that view's own "granted" flag --
+    one shape for both endpoints is easier for the frontend to consume and
+    harder to get wrong.
+    """
+
+    def get(self, request: Request) -> Response:
+        subscription, _ = Subscription.objects.select_related("plan").get_or_create(
+            user=request.user
+        )
+        return Response(billing.subscription_status_payload(subscription=subscription))
+
+
+class BillingSessionView(generics.GenericAPIView):
+    """
+    Success-page fallback: a user who lands on /billing/success before the
+    webhook arrives isn't left staring at a paywall they already paid for.
+    Fulfillment runs through the exact same code path the webhook uses
+    (fragrance.billing._grant_period_for_invoice), so calling this twice, or
+    calling it after the webhook already fired, grants at most one period --
+    see ProcessedPayment's uniqueness on stripe_invoice_id.
+    """
+
+    throttle_classes = [FailOpenScopedRateThrottle]
+    throttle_scope = "billing-session"
+
+    def get(self, request: Request, session_id: str) -> Response:
+        # Local short-circuit: the success page polls this up to 18 times per
+        # load, and once access is granted (typically by the webhook) every
+        # further poll would otherwise cost a Stripe round trip for nothing.
+        subscription = (
+            Subscription.objects.select_related("plan")
+            .filter(user=request.user)
+            .first()
+        )
+        if subscription is not None and subscription.has_active_access:
+            return Response(
+                {
+                    **billing.subscription_status_payload(subscription=subscription),
+                    "granted": False,
+                }
+            )
+        try:
+            result = billing.fulfill_checkout_session(session_id=session_id, user=request.user)
+        except billing.SessionLookupError:
+            # SessionNotFoundError and SessionOwnershipError both land here,
+            # deliberately identical: a session id belonging to someone else
+            # must read the same as one that doesn't exist at all.
+            return Response(
+                {"detail": "Checkout session not found."}, status=status.HTTP_404_NOT_FOUND
+            )
+        except ImproperlyConfigured as exc:
+            logger.error("billing session lookup unavailable: %s", exc)
+            return Response(
+                {"detail": "Billing is temporarily unavailable."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except stripe.StripeError as exc:
+            logger.error("stripe session lookup failed: %s", sanitize_sdk_error_message(exc))
+            return Response(
+                {"detail": "Could not verify checkout session. Please try again shortly."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(result)
+
+
+@csrf_exempt
+@require_POST
+def stripe_webhook(request: HttpRequest) -> HttpResponse:
+    """
+    Plain Django function view, not a DRF APIView: signature verification
+    needs the untouched raw request.body, and staying outside DRF keeps this
+    endpoint clear of DEFAULT_AUTHENTICATION_CLASSES / DEFAULT_PERMISSION_CLASSES.
+    Registered twice in urls.py (with and without a trailing slash) -- see
+    that file for why a slashless POST would otherwise 301 and be treated by
+    Stripe as a delivery failure.
+
+    Never do real work here: checkout blocks up to 10s on this response
+    before redirecting the customer, and Stripe retries non-2xx responses
+    for three days. Idempotency (via StripeEvent) happens synchronously so a
+    replayed delivery is inert even if the queued task never runs; the
+    actual fulfillment work is queued to process_stripe_event and this view
+    returns immediately.
+    """
+    from .tasks import process_stripe_event
+
+    payload = request.body
+    sig_header = request.META.get("HTTP_STRIPE_SIGNATURE", "")
+
+    try:
+        billing._configure_stripe()
+        event = stripe.Webhook.construct_event(payload, sig_header, settings.STRIPE_WEBHOOK_SECRET)
+    except (ValueError, stripe.SignatureVerificationError, ImproperlyConfigured):
+        # Never log the raw body or the Stripe-Signature header here.
+        logger.warning("stripe webhook signature verification failed")
+        return HttpResponse(status=400)
+
+    try:
+        # Nested atomic() -> a savepoint: an IntegrityError from the unique
+        # constraint on stripe_event_id must roll back only this insert, not
+        # whatever transaction this view happens to run inside (e.g. under
+        # ATOMIC_REQUESTS, or Django's TestCase-wrapped test transactions) --
+        # the same reasoning as the nested atomic() in
+        # billing._grant_period_for_invoice and services.apply_recommendation_rating.
+        with transaction.atomic():
+            StripeEvent.objects.create(
+                stripe_event_id=event["id"],
+                event_type=event["type"],
+                stripe_created=datetime.fromtimestamp(event["created"], tz=dt_timezone.utc),
+                payload=event.to_dict(),
+            )
+    except IntegrityError:
+        # Already seen -- Stripe explicitly does not guarantee once-only
+        # delivery. Return 200 immediately without re-queuing processing.
+        return HttpResponse(status=200)
+
+    process_stripe_event.delay(stripe_event_id=event["id"])
+    return HttpResponse(status=200)

@@ -26,9 +26,10 @@
             class="text-body-1 mb-6"
             style="max-width: 520px; line-height: 1.8"
           >
-            Sign in and tell it what's in your collection: what you own, what you like, what missed the
-            mark. Once a month it searches, verifies, and sends five fragrances chosen to push your
-            taste further in the direction it's already heading.
+            Tell it what you own, what you like, what missed the mark. After that, it searches once a
+            month, verifies what it finds, and sends five fragrances chosen to push your taste
+            further in the direction it's already heading. It's a closed beta right now, open by
+            invitation from the waitlist.
           </p>
 
           <div class="d-flex flex-column flex-sm-row ga-3 ga-sm-4">
@@ -187,8 +188,8 @@
         class="text-body-1 mb-6"
         style="max-width: 480px; line-height: 1.8; margin: 0 auto"
       >
-        Two minutes to sign in and start rating fragrances. Your first recommendation letter follows a
-        month later.
+        Join the waitlist below, and an invitation gets you in. A short setup and a small subscription
+        get you started. Your collection does the rest.
       </p>
 
       <div class="d-flex flex-column flex-sm-row justify-sm-center ga-3 ga-sm-4">

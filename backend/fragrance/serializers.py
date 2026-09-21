@@ -6,7 +6,8 @@ from django.utils.encoding import force_str
 from django.utils.http import urlsafe_base64_decode
 from rest_framework import serializers
 
-from .models import FRAGRANCE_STATUSES, FragranceConfig, Fragrance, PreferenceProfile, Recommendation, RecommendationRun
+from .models import FRAGRANCE_STATUSES, FragranceConfig, Fragrance, Plan, PreferenceProfile, Recommendation, RecommendationRun
+from .services import resolve_beta_invite_signup
 
 
 class BetaSignupSerializer(serializers.Serializer):
@@ -15,6 +16,45 @@ class BetaSignupSerializer(serializers.Serializer):
     # frontend form); a bot that fills every input trips it. Non-empty means
     # silently drop the submission, never store it.
     website = serializers.CharField(required=False, allow_blank=True, default='')
+
+
+class BetaAcceptSerializer(serializers.Serializer):
+    """
+    Validates a beta-invite token and the new password, but does not itself
+    mutate anything -- BetaAcceptView performs the actual status transition
+    under a row lock, since single-use enforcement needs to happen at the
+    point of mutation, not at validation time, to be race-safe against a
+    replayed link.
+
+    Token resolution is delegated to services.resolve_beta_invite_signup,
+    which raises BetaInviteTokenInvalidError / BetaInviteTokenAlreadyUsedError
+    rather than serializers.ValidationError -- those propagate out of
+    is_valid() uncaught, and BetaAcceptView translates them into the 400
+    "invalid_or_expired" / 409 "already_used" contract. Only the password
+    field uses DRF's normal ValidationError shape.
+    """
+
+    # allow_blank=True: an empty string must reach resolve_beta_invite_signup
+    # and come back as the standard {"code": "invalid_or_expired"} shape,
+    # the same as GET's request.query_params.get("token", "") -- without it,
+    # DRF's field-level blank check would reject first with a third response
+    # shape ({"token": ["This field may not be blank."]}) not in the
+    # documented contract. A wholly *missing* "token" key still 400s with
+    # that DRF field-required shape; the real frontend form always sends a
+    # string (possibly empty), so that case is unreachable in practice.
+    token = serializers.CharField(allow_blank=True)
+    password = serializers.CharField(write_only=True)
+
+    def validate(self, attrs: dict) -> dict:
+        signup = resolve_beta_invite_signup(token=attrs['token'])
+
+        try:
+            validate_password(password=attrs['password'], user=signup.invited_user)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({'password': list(exc.messages)})
+
+        attrs['signup_id'] = signup.id
+        return attrs
 
 
 class FragranceConfigSerializer(serializers.ModelSerializer):
@@ -102,6 +142,30 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
             raise serializers.ValidationError({'new_password': list(exc.messages)})
         attrs['user'] = user
         return attrs
+
+
+class PlanSerializer(serializers.ModelSerializer):
+    """
+    Deliberately excludes stripe_price_id (and every other internal field):
+    the whole point of the slug indirection in CheckoutCreateSerializer is
+    that a Stripe Price id never leaves the server, so it must not leak back
+    out through the GET that renders the paywall either.
+    """
+
+    class Meta:
+        model = Plan
+        fields = ["slug", "name", "amount_cents", "currency", "billing_interval"]
+
+
+class CheckoutCreateSerializer(serializers.Serializer):
+    """
+    Only a plan slug -- an opaque key into the server-owned Plan table.
+    A client-supplied price_id is never a recognized field here, so DRF
+    silently ignores it rather than accepting it; BillingCheckoutView always
+    resolves the Stripe Price id itself via Plan.objects.get(slug=...).
+    """
+
+    slug = serializers.SlugField()
 
 
 class RecommendationRunSerializer(serializers.ModelSerializer):

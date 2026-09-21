@@ -1,5 +1,6 @@
 from django.contrib.auth.models import User
 from django.db import IntegrityError, models, transaction
+from django.utils import timezone
 
 # Constants
 AI_PROVIDER_FAMILIES = [
@@ -34,6 +35,21 @@ BETA_SIGNUP_STATUSES = [
     ("approved", "Approved"),
     ("converted", "Converted"),
     ("rejected", "Rejected"),
+]
+BILLING_INTERVALS = [
+    ("month", "Month"),
+    ("year", "Year"),
+]
+SUBSCRIPTION_STATUSES = [
+    ("none", "None"),
+    ("checkout_started", "Checkout Started"),
+    ("active", "Active"),
+    ("revoked", "Revoked"),
+]
+STRIPE_EVENT_STATUSES = [
+    ("received", "Received"),
+    ("processed", "Processed"),
+    ("failed", "Failed"),
 ]
 
 
@@ -194,6 +210,122 @@ class BetaSignup(models.Model):
 
     def __str__(self) -> str:
         return f"{self.email} ({self.status})"
+
+
+class Plan(models.Model):
+    """
+    Billing terms and usage terms, deliberately separate. `billing_interval`
+    and `access_days_granted` describe how the customer is charged;
+    `quota_period_days` and `max_runs_per_quota_period` describe how often
+    the pipeline may run. They must stay separate fields: a single period
+    reused for both would let an annual subscriber take twelve runs on the
+    first of January. The quota chokepoint (a later slice) reads
+    `quota_period_days` on every plan and must never look at
+    `billing_interval`.
+    """
+
+    name = models.CharField(max_length=100)
+    slug = models.SlugField(unique=True)
+    stripe_price_id = models.CharField(max_length=255, unique=True)
+    amount_cents = models.PositiveIntegerField()
+    currency = models.CharField(max_length=3, default="usd")
+    billing_interval = models.CharField(max_length=5, choices=BILLING_INTERVALS)
+    # Fallback only for computing access_expires_at when Stripe's own
+    # period_end is unavailable -- prefer the value Stripe supplies.
+    access_days_granted = models.PositiveIntegerField()
+    quota_period_days = models.PositiveIntegerField(default=30)
+    max_runs_per_quota_period = models.PositiveIntegerField(default=1)
+    failed_run_grace = models.PositiveIntegerField(default=1)
+    is_active = models.BooleanField(default=True)
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.slug})"
+
+
+class Subscription(models.Model):
+    """
+    The authorization record -- one per User. Access is granted only by
+    `has_active_access`, a timestamp check, never a boolean: nothing needs to
+    handle cancellation, because a cancelled subscription simply stops
+    producing payments and the window expires on its own.
+
+    The status set is deliberately small: there is no `past_due`,
+    `trialing`, or `canceled` to mirror -- Stripe owns those. `revoked`
+    exists solely for disputes, the one case where access must end before
+    `access_expires_at`.
+    """
+
+    user = models.OneToOneField(
+        User, on_delete=models.CASCADE, related_name="subscription"
+    )
+    plan = models.ForeignKey(
+        Plan, on_delete=models.SET_NULL, null=True, blank=True, related_name="subscriptions"
+    )
+    stripe_customer_id = models.CharField(max_length=255, unique=True, null=True, blank=True)
+    stripe_subscription_id = models.CharField(max_length=255, unique=True, null=True, blank=True)
+    status = models.CharField(max_length=20, choices=SUBSCRIPTION_STATUSES, default="none")
+    access_expires_at = models.DateTimeField(null=True, blank=True)
+    last_paid_at = models.DateTimeField(null=True, blank=True)
+    last_checkout_session_id = models.CharField(max_length=255, blank=True)
+
+    def __str__(self) -> str:
+        return f"{self.user} ({self.status})"
+
+    @property
+    def has_active_access(self) -> bool:
+        if self.access_expires_at is None:
+            return False
+        return self.status == "active" and self.access_expires_at > timezone.now()
+
+
+class StripeEvent(models.Model):
+    """
+    Delivery-level idempotency: stops Stripe's duplicate *deliveries* of the
+    same event id. This is distinct from ProcessedPayment, which stops a
+    *period being granted twice* for the same money -- the webhook and the
+    Checkout success page reach the same fulfillment function by different
+    routes, and only one of them has an event id.
+    """
+
+    stripe_event_id = models.CharField(max_length=255, unique=True)
+    event_type = models.CharField(max_length=255)
+    stripe_created = models.DateTimeField(null=True, blank=True)
+    received_at = models.DateTimeField(auto_now_add=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(max_length=10, choices=STRIPE_EVENT_STATUSES, default="received")
+    error = models.TextField(blank=True)
+    payload = models.JSONField(default=dict, blank=True)
+
+    def __str__(self) -> str:
+        return f"{self.stripe_event_id} ({self.event_type}, {self.status})"
+
+
+class ProcessedPayment(models.Model):
+    """
+    Grant-level idempotency, keyed on the Stripe **invoice** id, not the
+    PaymentIntent id. One invoice is one billing period is one grant; a
+    single PaymentIntent can settle several invoices, so keying on it would
+    under-grant. The insert happens inside the same transaction that extends
+    Subscription.access_expires_at, so a concurrent double-call loses the
+    race on this unique constraint rather than granting two periods.
+    """
+
+    stripe_invoice_id = models.CharField(max_length=255, unique=True)
+    stripe_payment_intent_id = models.CharField(max_length=255, blank=True)
+    stripe_subscription_id = models.CharField(max_length=255, blank=True)
+    subscription = models.ForeignKey(
+        Subscription,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="processed_payments",
+    )
+    amount_paid_cents = models.PositiveIntegerField()
+    applied_at = models.DateTimeField(auto_now_add=True)
+    period_end = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self) -> str:
+        return self.stripe_invoice_id
 
 
 class ActiveAIModelConfigConflictError(Exception):

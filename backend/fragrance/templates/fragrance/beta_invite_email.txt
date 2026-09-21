@@ -1,0 +1,11 @@
+{% autoescape off %}Hi,
+
+You're in! Your spot in the Fragrances beta has been approved.
+
+Click the link below to set your password and get started. This link expires in 14 days and can only be used once.
+
+{{ accept_url }}
+
+If you weren't expecting this, you can safely ignore this email.
+
+— Fragrances{% endautoescape %}
