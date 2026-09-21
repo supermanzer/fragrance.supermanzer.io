@@ -30,13 +30,19 @@ just entered from the invoice side rather than through a PaymentIntent.
 
 import logging
 import time
+import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
+from functools import wraps
 from typing import Any
 
 import stripe
 from django.conf import settings
 from django.contrib.auth.models import User
+from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured
 from django.db import IntegrityError, transaction
 from django.utils import timezone
@@ -59,7 +65,70 @@ _PERIOD_END_GRACE = timedelta(days=2)
 # Stripe leg of a checkout request needs real headroom below that.
 # stripe.RequestsClient (not stripe.http_client.RequestsClient) is the
 # public, lazily-exported name in stripe-python 15.x's __init__.py.
-_HTTP_CLIENT = stripe.RequestsClient(timeout=20)
+#
+# The interactive billing endpoints (portal, change-plan) chain up to six
+# sequential Stripe calls inside one gunicorn request (--timeout 120), so they
+# run under a much tighter per-call budget than the 20s x 3 attempts above
+# would allow. stripe-python exposes max_network_retries per call but the
+# timeout only on the client, and the client is process-global, so the budget
+# is a ContextVar consulted by this subclass: scoped to the calling
+# thread/context, with no global mutation to race against other requests.
+#
+# (connect, read): stripe 15.6.1's RequestsClient annotates timeout as
+# Union[float, Tuple[float, float]] and passes it straight to requests
+# (_http_client.py: `timeout=self._timeout`), so a tuple is supported. A dead
+# host fails in ~3s instead of burning the whole 10s. requests applies the read
+# value per socket read, not as a total deadline, so the per-call worst case is
+# roughly connect + read = ~13s; six calls stay well under gunicorn's 120s.
+_INTERACTIVE_TIMEOUT_SECONDS: tuple[float, float] = (3.05, 10)
+_INTERACTIVE_MAX_NETWORK_RETRIES = 0
+_interactive_budget: ContextVar[bool] = ContextVar("stripe_interactive_budget", default=False)
+
+
+class _BudgetedRequestsClient(stripe.RequestsClient):
+    @property
+    def _timeout(self) -> Any:
+        if _interactive_budget.get():
+            return _INTERACTIVE_TIMEOUT_SECONDS
+        return self._default_timeout
+
+    @_timeout.setter
+    def _timeout(self, value: Any) -> None:
+        self._default_timeout = value
+
+    def request_with_retries(
+        self,
+        method: str,
+        url: str,
+        headers: Any,
+        post_data: Any = None,
+        max_network_retries: int | None = None,
+        *,
+        _usage: list[str] | None = None,
+    ) -> Any:
+        if _interactive_budget.get():
+            max_network_retries = _INTERACTIVE_MAX_NETWORK_RETRIES
+        return super().request_with_retries(
+            method,
+            url,
+            headers,
+            post_data,
+            max_network_retries,
+            _usage=_usage,
+        )
+
+
+@contextmanager
+def _interactive_stripe_budget() -> Iterator[None]:
+    """Cap per-call Stripe timeout and retries for the enclosed calls (see _BudgetedRequestsClient)."""
+    token = _interactive_budget.set(True)
+    try:
+        yield
+    finally:
+        _interactive_budget.reset(token)
+
+
+_HTTP_CLIENT = _BudgetedRequestsClient(timeout=20)
 
 
 def _configure_stripe() -> None:
@@ -92,6 +161,72 @@ class UnknownPlanError(CheckoutError):
     """Raised when the requested plan slug doesn't resolve to an active Plan."""
 
 
+class InvoiceNotSettledError(Exception):
+    """
+    A paid InvoicePayment carried an invoice that Stripe still reports as not
+    paid, even after a fresh re-fetch. This is a webhook-vs-invoice-finalization
+    race, not a rejection: process_stripe_event retries it on a short ladder.
+    Retrying is safe because ProcessedPayment's unique constraint on
+    stripe_invoice_id makes any re-grant of an already-applied invoice inert.
+    """
+
+    def __init__(self, *invoice_ids: str) -> None:
+        self.invoice_ids = invoice_ids
+        super().__init__(f"invoice(s) not yet settled: {', '.join(invoice_ids)}")
+
+
+class PortalError(Exception):
+    """Base for portal-session errors BillingPortalView translates into HTTP responses."""
+
+
+class ExemptAccountError(PortalError):
+    """Staff/superusers have full access and no billing to manage or change."""
+
+
+class NoBillingAccountError(PortalError):
+    """The user has never started a checkout, so there is no Stripe Customer."""
+
+
+class PlanPriceMismatchError(Exception):
+    """
+    The target Plan row disagrees with its Stripe Price (billing interval, or
+    no recurring interval at all). A data/config fault, not a client error:
+    the view answers 502 with a fixed message.
+    """
+
+
+class PlanChangeError(Exception):
+    """Base for plan-change errors; `code` is the machine-readable 409/404 code."""
+
+    code = "plan_change_error"
+
+
+class NoActiveSubscriptionError(PlanChangeError):
+    code = "no_active_subscription"
+
+
+class SamePlanError(PlanChangeError):
+    code = "same_plan"
+
+
+class ChangeAlreadyScheduledError(PlanChangeError):
+    code = "already_scheduled"
+
+
+class CancellationScheduledError(PlanChangeError):
+    code = "cancellation_scheduled"
+
+
+class ChangeInProgressError(PlanChangeError):
+    """Another plan-change request for this user holds the lock -- a 409 the client may retry."""
+
+    code = "change_in_progress"
+
+
+class NoPendingChangeError(PlanChangeError):
+    code = "no_pending_change"
+
+
 class SessionLookupError(Exception):
     """Base for BillingSessionView errors."""
 
@@ -107,6 +242,10 @@ class SessionOwnershipError(SessionLookupError):
     so a guessed session id carries no signal about whether it belongs to
     someone else -- matching this project's other anti-enumeration surfaces.
     """
+
+
+def is_exempt(*, user: User) -> bool:
+    return bool(user.is_staff or user.is_superuser)
 
 
 def get_active_plans() -> list[Plan]:
@@ -130,6 +269,10 @@ def subscription_status_payload(*, subscription: Subscription) -> dict:
         "access_expires_at": subscription.access_expires_at,
         "has_active_access": exempt or subscription.has_active_access,
         "exempt": exempt,
+        # True once a Stripe Customer exists and there is billing to manage.
+        # Reads only the in-memory row, so the unsaved placeholder used by
+        # BillingSubscriptionView stays DB-free.
+        "can_manage_billing": bool(subscription.stripe_customer_id) and not exempt,
         "quota": quota_snapshot(user=subscription.user, subscription=subscription),
     }
 
@@ -506,12 +649,21 @@ def grant_complimentary_access(*, user: User, days: int, reason: str) -> Subscri
     return locked
 
 
+def _invoice_is_settled(*, invoice: Any) -> bool:
+    return (
+        getattr(invoice, "status", None) == "paid"
+        and getattr(invoice, "amount_remaining", None) == 0
+    )
+
+
 def fulfill_payment_intent(*, payment_intent_id: str) -> int:
     """
     payment_intent.succeeded handler (steps 1-4 of the plan's validation
     chain), invoked from tasks.process_stripe_event. Returns the number of
     periods granted -- 0, 1, or more, since one PaymentIntent can settle
-    several invoices and each is an independent grant.
+    several invoices and each is an independent grant. Raises
+    InvoiceNotSettledError (retryable) when a paid InvoicePayment's invoice is
+    still not paid after a re-fetch.
     """
     _configure_stripe()
     pi = stripe.PaymentIntent.retrieve(payment_intent_id)
@@ -548,17 +700,41 @@ def fulfill_payment_intent(*, payment_intent_id: str) -> int:
 
     granted = 0
     saw_any = False
+    unsettled: list[str] = []
     for invoice_payment in payments:
         saw_any = True
         invoice = getattr(invoice_payment, "invoice", None)
         if invoice is None:
             continue
+        # The payment succeeded, but the expanded invoice can still read
+        # status=open / amount_remaining>0 for a moment (verified live at a
+        # scheduled plan-change boundary). Re-fetch it; the paid gate in
+        # _grant_period_for_invoice stays strict either way.
+        if getattr(invoice_payment, "status", None) == "paid" and not _invoice_is_settled(
+            invoice=invoice
+        ):
+            invoice = stripe.Invoice.retrieve(invoice.id)
+            if not _invoice_is_settled(invoice=invoice):
+                logger.warning(
+                    "payment_intent %s: invoice %s still not settled after re-fetch "
+                    "(status=%r, amount_remaining=%r); will retry",
+                    payment_intent_id,
+                    invoice.id,
+                    getattr(invoice, "status", None),
+                    getattr(invoice, "amount_remaining", None),
+                )
+                unsettled.append(invoice.id)
+                continue
         if _grant_period_for_invoice(
             invoice=invoice,
             expected_customer_id=pi.customer,
             payment_intent_id=pi.id,
         ):
             granted += 1
+
+    if unsettled:
+        # Raised only after every settled sibling invoice has been granted.
+        raise InvoiceNotSettledError(*unsettled)
 
     if not saw_any:
         # A clean rejection, not an error: this PaymentIntent isn't an
@@ -863,7 +1039,7 @@ def revoke_for_dispute(*, dispute: dict) -> None:
     _configure_stripe()
     try:
         pi = stripe.PaymentIntent.retrieve(payment_intent_id)
-    except stripe.StripeError:
+    except stripe.InvalidRequestError:
         logger.error(
             "could not retrieve payment_intent %s for dispute; revoking nothing",
             payment_intent_id,
@@ -877,21 +1053,497 @@ def revoke_for_dispute(*, dispute: dict) -> None:
         )
         return
 
-    updated = Subscription.objects.filter(
-        stripe_customer_id=pi.customer
-    ).update(status="revoked", access_expires_at=timezone.now())
-    if updated == 0:
+    customer_id = pi.customer
+    local = Subscription.objects.filter(stripe_customer_id=customer_id)
+    if not local.exists():
         logger.warning(
-            "disputed payment_intent %s customer %s has no local Subscription; revoking nothing",
+            "disputed payment_intent %s customer %s has no local Subscription; "
+            "revoking and cancelling nothing",
             payment_intent_id,
-            pi.customer,
+            customer_id,
         )
+        return
+
+    # Local revoke first and in its own statement: it must land even if the
+    # Stripe cancel below fails, and no DB lock is held across Stripe calls.
+    # Already-revoked rows are excluded so a replay does not move
+    # access_expires_at.
+    local.exclude(status="revoked").update(status="revoked", access_expires_at=timezone.now())
+
+    cancelled = _cancel_live_stripe_subscriptions(customer_id=customer_id)
+    # This is the "flag for the operator" step from the plan -- there is
+    # no ticketing/ops-alert integration in this codebase yet, so a
+    # loud, unambiguous log line is the mechanism.
+    logger.critical(
+        "REVOKED subscription for stripe customer %s due to charge.dispute.created and "
+        "cancelled stripe subscription(s) %s immediately -- operator review required",
+        customer_id,
+        ", ".join(cancelled) or "(none live)",
+    )
+
+
+DISPUTE_LIVE_SUBSCRIPTION_STATUSES = frozenset({"active", "past_due", "unpaid", "trialing", "incomplete"})
+
+
+def _cancel_live_stripe_subscriptions(*, customer_id: str) -> list[str]:
+    """
+    Cancels every live Stripe subscription of the customer immediately, with no
+    proration credit and no final invoice (the funds are being withdrawn).
+    Idempotent: a subscription that is already canceled counts as done. Any
+    other Stripe failure is raised after all subscriptions were attempted, so
+    process_stripe_event's retry re-runs the handler.
+    """
+    subscriptions = list(stripe.Subscription.list(customer=customer_id, status="all", limit=100).auto_paging_iter())
+    live_ids = [sub.id for sub in subscriptions if sub.status in DISPUTE_LIVE_SUBSCRIPTION_STATUSES]
+    cancelled: list[str] = []
+    failure: stripe.StripeError | None = None
+    for subscription_id in live_ids:
+        try:
+            stripe.Subscription.cancel(subscription_id, invoice_now=False, prorate=False)
+        except stripe.InvalidRequestError as exc:
+            try:
+                already_done = stripe.Subscription.retrieve(subscription_id).status == "canceled"
+            except stripe.StripeError:
+                already_done = False
+            if not already_done:
+                logger.error("dispute: could not cancel stripe subscription %s", subscription_id)
+                failure = failure or exc
+                continue
+        except stripe.StripeError as exc:
+            logger.error("dispute: could not cancel stripe subscription %s", subscription_id)
+            failure = failure or exc
+            continue
+        cancelled.append(subscription_id)
+    if failure is not None:
+        raise failure
+    return cancelled
+
+
+# --------------------------------------------------------------------------
+# Customer Portal
+# --------------------------------------------------------------------------
+
+
+def _interactive(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Run a billing service function under the tight interactive Stripe budget."""
+
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with _interactive_stripe_budget():
+            return func(*args, **kwargs)
+
+    return wrapper
+
+
+# A one-phase schedule that is mid-way through schedule_plan_change (created,
+# not yet modified) is indistinguishable from a spent shell, so any concurrent
+# request that releases "spent shells" (portal, second POST, DELETE) would
+# destroy it. This lock serialises those four Stripe sequences per user. The
+# TTL is above gunicorn's 120s --timeout (the worker, hence the lock's owner,
+# is killed by then), so the lock cannot expire while its owner is alive; if
+# the worker dies, it self-heals within the TTL. Django cache, Redis DB 1.
+#
+# Release is owner-safe: each acquisition stores a uuid4 token and release only
+# deletes if the stored value is still that token. Django's cache API has no
+# atomic compare-and-delete, so get-then-delete leaves a microsecond window; it
+# is only reachable after TTL expiry, which the TTL choice rules out. redis-py's
+# lock() was not used: it would need a second, separately configured Redis
+# connection outside the cache abstraction (and could not run under the
+# LocMemCache the test runner swaps in).
+_PLAN_CHANGE_LOCK_TTL_SECONDS = 130
+
+
+@contextmanager
+def _plan_change_lock(*, user: User, required: bool) -> Iterator[bool]:
+    """
+    Yields whether this caller holds the per-user lock (cache.add is atomic).
+
+    required=True (change-plan POST/DELETE): contention raises
+    ChangeInProgressError (409), and a cache failure raises ImproperlyConfigured
+    (the existing 503 mapping). It fails CLOSED there, because proceeding
+    unlocked is exactly the race the lock exists to prevent, and the user can
+    simply retry.
+
+    required=False (the portal's optional spent-shell release): contention or a
+    cache failure yields False and the caller skips the release. The portal
+    itself must never depend on the lock.
+    """
+    key = f"plan-change-lock:{user.pk}"
+    token = uuid.uuid4().hex
+    acquired = False
+    cache_failed = False
+    try:
+        acquired = bool(cache.add(key, token, timeout=_PLAN_CHANGE_LOCK_TTL_SECONDS))
+    except Exception as exc:
+        cache_failed = True
+        cache_exc = exc
+    if not acquired and required:
+        if cache_failed:
+            raise ImproperlyConfigured("plan-change lock unavailable (cache error)") from cache_exc
+        raise ChangeInProgressError()
+    if cache_failed:
+        logger.warning("plan-change lock unavailable, skipping optional work: %s", type(cache_exc).__name__)
+    if not acquired:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        try:
+            if cache.get(key) == token:
+                cache.delete(key)
+        except Exception:
+            logger.warning("could not release plan-change lock for user %s; it will expire", user.pk)
+
+
+def _stripe_subscription_with_schedule(*, stripe_subscription_id: str) -> Any:
+    return stripe.Subscription.retrieve(stripe_subscription_id, expand=["schedule"])
+
+
+def _live_schedule(*, stripe_subscription: Any) -> Any | None:
+    """
+    The attached schedule if it is still in force, else None. A canceled or
+    released schedule can linger on `subscription.schedule`, and must not be
+    mistaken for one.
+    """
+    schedule = getattr(stripe_subscription, "schedule", None)
+    if schedule is None:
+        return None
+    if isinstance(schedule, str):
+        schedule = stripe.SubscriptionSchedule.retrieve(schedule)
+    if getattr(schedule, "status", None) not in ("active", "not_started"):
+        return None
+    return schedule
+
+
+def _pending_phase(*, schedule: Any) -> Any | None:
+    """
+    The next phase that has not started yet, or None if the schedule is on its
+    last phase. Deliberately relative to schedule.current_phase rather than
+    the wall clock, so it also holds for test-clock customers.
+
+    A schedule on its last phase is a *spent shell*: with end_behavior=release
+    it stays attached for the whole final phase (a year, for an annual
+    switch), changes nothing, and yet blocks Stripe-side cancellation of the
+    subscription.
+    """
+    phases = list(getattr(schedule, "phases", None) or [])
+    current = getattr(schedule, "current_phase", None)
+    if current is None:
+        return phases[1] if len(phases) > 1 else None
+    later = [phase for phase in phases if phase.start_date > current.start_date]
+    return later[0] if later else None
+
+
+def _release_spent_schedule(*, stripe_subscription: Any) -> None:
+    """Release a schedule that has no pending phase so it stops blocking cancellation."""
+    schedule = _live_schedule(stripe_subscription=stripe_subscription)
+    if schedule is not None and _pending_phase(schedule=schedule) is None:
+        stripe.SubscriptionSchedule.release(schedule.id)
+        logger.info("released spent subscription schedule %s", schedule.id)
+
+
+@_interactive
+def create_portal_session(*, user: User) -> str:
+    """
+    Creates a Customer Portal session for the caller's *own* stored Stripe
+    customer and returns its short-lived URL. The customer id comes only from
+    the user's Subscription row; nothing from the client (customer,
+    configuration, return_url, flow_data) is ever accepted. Deliberately not
+    gated on active access: a lapsed customer still needs invoices and a card
+    update.
+
+    A spent schedule shell (see _pending_phase) is released first, because
+    Stripe refuses portal cancellation while any schedule is attached. This is
+    best-effort: a Stripe failure is logged and swallowed, and if another
+    plan-change request holds the per-user lock the release is skipped (that
+    request may own a half-built schedule that only looks like a shell). Neither
+    may take the portal down.
+
+    Outside DEBUG an unset STRIPE_PORTAL_CONFIGURATION_ID fails closed: Stripe's
+    account-default configuration is more permissive than ours (name/address
+    edits, possibly plan switching, which can create a free period).
+    """
+    if is_exempt(user=user):
+        raise ExemptAccountError()
+    subscription = Subscription.objects.filter(user=user).first()
+    if subscription is None or not subscription.stripe_customer_id:
+        raise NoBillingAccountError()
+
+    configuration_id = settings.STRIPE_PORTAL_CONFIGURATION_ID
+    if not configuration_id and not settings.DEBUG:
+        raise ImproperlyConfigured(
+            "STRIPE_PORTAL_CONFIGURATION_ID is not set; refusing to open the portal on "
+            "Stripe's permissive default configuration outside DEBUG."
+        )
+
+    _configure_stripe()
+
+    if subscription.stripe_subscription_id:
+        with _plan_change_lock(user=user, required=False) as locked:
+            if locked:
+                try:
+                    _release_spent_schedule(
+                        stripe_subscription=_stripe_subscription_with_schedule(
+                            stripe_subscription_id=subscription.stripe_subscription_id
+                        )
+                    )
+                except stripe.StripeError as exc:
+                    logger.warning(
+                        "could not check/release spent schedule before portal: %s",
+                        sanitize_sdk_error_message(exc),
+                    )
+
+    params: dict[str, Any] = {
+        "customer": subscription.stripe_customer_id,
+        "return_url": f"{settings.FRONTEND_URL}/billing",
+    }
+    if configuration_id:
+        params["configuration"] = configuration_id
     else:
-        # This is the "flag for the operator" step from the plan -- there is
-        # no ticketing/ops-alert integration in this codebase yet, so a
-        # loud, unambiguous log line is the mechanism.
-        logger.critical(
-            "REVOKED subscription for stripe customer %s due to charge.dispute.created "
-            "-- operator review required",
-            pi.customer,
+        logger.warning(
+            "STRIPE_PORTAL_CONFIGURATION_ID is not set; the portal falls back to Stripe's "
+            "default configuration (allowed only because DEBUG is on)"
         )
+    session = stripe.billing_portal.Session.create(**params)
+    return session.url
+
+
+# --------------------------------------------------------------------------
+# Deferred plan change (SubscriptionSchedule)
+# --------------------------------------------------------------------------
+
+
+def _price_id_of(*, price: Any) -> str:
+    return price if isinstance(price, str) else getattr(price, "id", "")
+
+
+def _pending_change_payload(*, schedule: Any) -> dict | None:
+    phase = _pending_phase(schedule=schedule)
+    if phase is None:
+        return None
+    items = phase["items"]
+    price_id = _price_id_of(price=items[0]["price"]) if items else ""
+    plan = Plan.objects.filter(stripe_price_id=price_id).first() if price_id else None
+    return {
+        "slug": plan.slug if plan else None,
+        "name": plan.name if plan else None,
+        "effective_at": datetime.fromtimestamp(phase.start_date, tz=dt_timezone.utc),
+    }
+
+
+def _changeable_subscription(*, user: User) -> Subscription:
+    """The caller's own Subscription, or a refusal. Ownership is by FK, never by client input."""
+    if is_exempt(user=user):
+        raise ExemptAccountError()
+    subscription = Subscription.objects.select_related("plan").filter(user=user).first()
+    if (
+        subscription is None
+        or not subscription.stripe_subscription_id
+        or not subscription.has_active_access
+    ):
+        raise NoActiveSubscriptionError()
+    return subscription
+
+
+def _current_price_ids(*, stripe_subscription: Any) -> set[str]:
+    return {
+        _price_id_of(price=item.price) for item in stripe_subscription["items"].data
+    }
+
+
+def _subscription_period_end(*, stripe_subscription: Any) -> int:
+    items = list(stripe_subscription["items"].data)
+    if not items:
+        raise NoActiveSubscriptionError()
+    return items[0].current_period_end
+
+
+@_interactive
+def get_plan_change_state(*, user: User) -> dict:
+    """
+    Read from Stripe on demand (one Subscription.retrieve with the schedule
+    expanded), never cached locally and never part of the polled status
+    payload. `available` is empty when nothing can be scheduled: a change is
+    already pending, or the subscription is set to cancel.
+    """
+    local = _changeable_subscription(user=user)
+    _configure_stripe()
+    stripe_sub = _stripe_subscription_with_schedule(
+        stripe_subscription_id=local.stripe_subscription_id
+    )
+    if getattr(stripe_sub, "status", None) != "active":
+        raise NoActiveSubscriptionError()
+
+    period_end = _subscription_period_end(stripe_subscription=stripe_sub)
+    cancel_at_period_end = bool(
+        getattr(stripe_sub, "cancel_at_period_end", False)
+        or getattr(stripe_sub, "cancel_at", None)
+    )
+    schedule = _live_schedule(stripe_subscription=stripe_sub)
+    pending = _pending_change_payload(schedule=schedule) if schedule is not None else None
+
+    available: list[Plan] = []
+    if pending is None and not cancel_at_period_end:
+        current = _current_price_ids(stripe_subscription=stripe_sub)
+        available = [
+            plan for plan in get_active_plans() if plan.stripe_price_id not in current
+        ]
+    return {
+        "pending": pending,
+        "available": available,
+        "current_period_end": datetime.fromtimestamp(period_end, tz=dt_timezone.utc),
+        "cancel_at_period_end": cancel_at_period_end,
+    }
+
+
+@_interactive
+def schedule_plan_change(*, user: User, plan_slug: str) -> dict:
+    """
+    Schedules a switch to `plan_slug` at the end of the current period, with no
+    proration. Verified recipe (sandbox, API 2026-08-26.dahlia): a schedule
+    created from_subscription, then modified into two phases -- the current
+    price until its period end, then the target price with
+    billing_cycle_anchor="phase_start". That anchor is what makes Stripe raise
+    one invoice for the target price at the boundary; an immediate switch, or
+    a second phase on the default anchor, creates NO invoice (a free period in
+    Stripe and a lock-out here, since access is granted only by payments).
+    The boundary invoice reaches us as an ordinary payment_intent.succeeded.
+
+    The second phase's length comes from the target Stripe Price's recurring
+    interval, not from Plan.billing_interval alone; a disagreement between the
+    two raises PlanPriceMismatchError before anything is created in Stripe.
+    The whole Stripe sequence runs under the per-user plan-change lock.
+    """
+    if is_exempt(user=user):
+        raise ExemptAccountError()
+    try:
+        target = Plan.objects.get(slug=plan_slug, is_active=True)
+    except Plan.DoesNotExist:
+        raise UnknownPlanError(f"No active plan with slug {plan_slug!r}.")
+
+    _configure_stripe()
+    local = _changeable_subscription(user=user)
+    with _plan_change_lock(user=user, required=True):
+        return _schedule_plan_change_locked(user=user, local=local, target=target)
+
+
+def _target_phase_duration(*, target: Plan) -> dict[str, Any]:
+    price = stripe.Price.retrieve(target.stripe_price_id)
+    recurring = getattr(price, "recurring", None)
+    interval = getattr(recurring, "interval", None) if recurring is not None else None
+    if interval != target.billing_interval:
+        logger.error(
+            "plan %s billing_interval %r disagrees with Stripe price %s recurring interval %r",
+            target.slug,
+            target.billing_interval,
+            target.stripe_price_id,
+            interval,
+        )
+        raise PlanPriceMismatchError(target.slug)
+    return {"interval": interval, "interval_count": getattr(recurring, "interval_count", None) or 1}
+
+
+def _schedule_plan_change_locked(*, user: User, local: Subscription, target: Plan) -> dict:
+    stripe_sub = _stripe_subscription_with_schedule(
+        stripe_subscription_id=local.stripe_subscription_id
+    )
+    if getattr(stripe_sub, "status", None) != "active":
+        raise NoActiveSubscriptionError()
+    if getattr(stripe_sub, "cancel_at_period_end", False) or getattr(stripe_sub, "cancel_at", None):
+        raise CancellationScheduledError()
+    if target.stripe_price_id in _current_price_ids(stripe_subscription=stripe_sub):
+        raise SamePlanError()
+
+    duration = _target_phase_duration(target=target)
+
+    existing = _live_schedule(stripe_subscription=stripe_sub)
+    if existing is not None:
+        if _pending_phase(schedule=existing) is not None:
+            raise ChangeAlreadyScheduledError()
+        # A spent shell from an earlier change: harmless, but it blocks a new
+        # schedule, so release it and carry on.
+        stripe.SubscriptionSchedule.release(existing.id)
+
+    try:
+        schedule = stripe.SubscriptionSchedule.create(
+            from_subscription=local.stripe_subscription_id
+        )
+    except stripe.InvalidRequestError:
+        # Lost a double-submit race: the other request created the schedule.
+        refreshed = _stripe_subscription_with_schedule(
+            stripe_subscription_id=local.stripe_subscription_id
+        )
+        if _live_schedule(stripe_subscription=refreshed) is not None:
+            raise ChangeAlreadyScheduledError()
+        raise
+
+    try:
+        current_phase = schedule.phases[0]
+        # Phase 1 is rebuilt from a whitelist (price + quantity, dates) only.
+        # Any phase-level discounts, default_tax_rates, metadata or
+        # automatic_tax on the original phase would be DROPPED here, and
+        # proration_behavior="none" hides the change. Nothing in the checkout
+        # flow sets those today; round-trip them here before introducing
+        # coupons or tax handling.
+        schedule = stripe.SubscriptionSchedule.modify(
+            schedule.id,
+            end_behavior="release",
+            proration_behavior="none",
+            phases=[
+                {
+                    "items": [
+                        {"price": _price_id_of(price=item["price"]), "quantity": getattr(item, "quantity", None) or 1}
+                        for item in current_phase["items"]
+                    ],
+                    "start_date": current_phase.start_date,
+                    "end_date": current_phase.end_date,
+                },
+                {
+                    "items": [{"price": target.stripe_price_id, "quantity": 1}],
+                    "duration": duration,
+                    "billing_cycle_anchor": "phase_start",
+                },
+            ],
+        )
+    except stripe.StripeError:
+        # Never leave a bare one-phase schedule behind: it would block
+        # cancellation for the rest of the period.
+        try:
+            stripe.SubscriptionSchedule.release(schedule.id)
+        except stripe.StripeError as cleanup_exc:
+            logger.error(
+                "could not release half-built schedule %s: %s",
+                schedule.id,
+                sanitize_sdk_error_message(cleanup_exc),
+            )
+        raise
+
+    payload = _pending_change_payload(schedule=schedule)
+    logger.info(
+        "scheduled plan change for user %s to %s at %s",
+        user.pk,
+        target.slug,
+        payload["effective_at"] if payload else None,
+    )
+    return payload
+
+
+@_interactive
+def cancel_plan_change(*, user: User) -> None:
+    """Releases the caller's pending scheduled change; the subscription carries on unchanged."""
+    if is_exempt(user=user):
+        raise ExemptAccountError()
+    local = Subscription.objects.filter(user=user).first()
+    if local is None or not local.stripe_subscription_id:
+        raise NoPendingChangeError()
+
+    _configure_stripe()
+    with _plan_change_lock(user=user, required=True):
+        stripe_sub = _stripe_subscription_with_schedule(
+            stripe_subscription_id=local.stripe_subscription_id
+        )
+        schedule = _live_schedule(stripe_subscription=stripe_sub)
+        if schedule is None or _pending_phase(schedule=schedule) is None:
+            raise NoPendingChangeError()
+        stripe.SubscriptionSchedule.release(schedule.id)

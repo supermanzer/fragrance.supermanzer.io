@@ -39,6 +39,11 @@ from .services import (
     start_recommendation_run,
 )
 
+# Seconds before each retry when Stripe's invoice hasn't settled yet: this is a
+# finalization race that clears in seconds, so it must not wait the generic 300s.
+# Used only by process_stripe_event.
+STRIPE_UNSETTLED_RETRY_COUNTDOWNS = (30, 60, 120)
+
 # The only two event types the endpoint is configured for in the Stripe
 # Dashboard -- kept here, not in views.stripe_webhook, since this is the
 # point that decides whether to act, not just whether to store. Anything
@@ -349,7 +354,7 @@ def process_stripe_event(self: 'process_stripe_event', stripe_event_id: str) -> 
     a directly-passed payload, so retries replay from committed state
     instead of a stale in-memory dict.
     """
-    from .billing import fulfill_payment_intent, revoke_for_dispute
+    from .billing import InvoiceNotSettledError, fulfill_payment_intent, revoke_for_dispute
 
     try:
         event_row = StripeEvent.objects.get(stripe_event_id=stripe_event_id)
@@ -367,14 +372,21 @@ def process_stripe_event(self: 'process_stripe_event', stripe_event_id: str) -> 
             pass  # unsubscribed event type reached the endpoint anyway -- ignored, not an error
         event_row.status = 'processed'
         event_row.processed_at = timezone.now()
-        event_row.save(update_fields=['status', 'processed_at'])
+        event_row.error = ''
+        event_row.save(update_fields=['status', 'processed_at', 'error'])
     except Exception as exc:
         event_row.status = 'failed'
         event_row.error = sanitize_sdk_error_message(exc)
         event_row.save(update_fields=['status', 'error'])
         if self.request.retries >= self.max_retries:
             raise
-        raise self.retry(exc=exc, countdown=300)
+        if isinstance(exc, InvoiceNotSettledError):
+            countdown = STRIPE_UNSETTLED_RETRY_COUNTDOWNS[
+                min(self.request.retries, len(STRIPE_UNSETTLED_RETRY_COUNTDOWNS) - 1)
+            ]
+        else:
+            countdown = 300
+        raise self.retry(exc=exc, countdown=countdown)
 
 
 @shared_task(soft_time_limit=240, time_limit=300)

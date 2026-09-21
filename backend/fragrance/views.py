@@ -46,6 +46,7 @@ from .serializers import (
     BetaAcceptSerializer,
     BetaSignupSerializer,
     ChangePasswordSerializer,
+    ChangePlanSerializer,
     CheckoutCreateSerializer,
     FragranceConfigSerializer,
     FragranceSerializer,
@@ -107,9 +108,9 @@ class FailOpenScopedRateThrottle(ScopedRateThrottle):
     - /api/v1/beta/ (public, unauthenticated): nginx `zone=beta` limit_req is
       the authoritative limiter; this throttle is defense-in-depth and must
       never be what takes the page down.
-    - Billing checkout / session views: there is NO nginx limit_req on
-      `location /api/`, so during a Redis outage failing open removes the
-      only limiter. That is still the right call: callers are authenticated,
+    - Billing checkout / session views: /api/v1/billing/ has nginx
+      `zone=billing` limit_req as a backstop, but it is coarser than these
+      per-scope limits, so during a Redis outage failing open leaves only that. That is still the right call: callers are authenticated,
       approved beta users, and 500ing a customer who has just paid (session
       confirmation) or is about to pay (checkout) is the worse failure.
     """
@@ -813,6 +814,160 @@ class BillingSessionView(generics.GenericAPIView):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
         return Response(result)
+
+
+_EXEMPT_RESPONSE_BODY = {
+    "code": "exempt",
+    "detail": "This account has full access, so there is no billing to manage.",
+}
+
+
+def _stripe_failure_response(*, exc: Exception, action: str, unavailable: str, failed: str) -> Response:
+    """
+    Shared 503/502 mapping for the billing views, matching BillingCheckoutView:
+    an unconfigured Stripe key is a 503, any Stripe error a 502, and neither
+    ever leaks str(exc) into the response body.
+    """
+    if isinstance(exc, ImproperlyConfigured):
+        logger.error("%s unavailable: %s", action, exc)
+        return Response({"detail": unavailable}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+    logger.error("stripe %s failed: %s", action, sanitize_sdk_error_message(exc))
+    return Response({"detail": failed}, status=status.HTTP_502_BAD_GATEWAY)
+
+
+class BillingPortalView(generics.GenericAPIView):
+    """
+    POST -> a one-shot Stripe Customer Portal URL for the caller's own
+    customer. No request body is read: customer, configuration, return_url
+    and flow_data are all server-derived (see billing.create_portal_session).
+    Deliberately not subscription-gated, so a lapsed customer can still reach
+    their invoices and update a card.
+    """
+
+    throttle_classes = [FailOpenScopedRateThrottle]
+    throttle_scope = "billing-portal"
+
+    def post(self, request: Request) -> Response:
+        try:
+            url = billing.create_portal_session(user=request.user)
+        except billing.ExemptAccountError:
+            return Response(_EXEMPT_RESPONSE_BODY, status=status.HTTP_409_CONFLICT)
+        except billing.NoBillingAccountError:
+            return Response(
+                {
+                    "code": "no_billing_account",
+                    "detail": "There is no billing account to manage yet.",
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        except (ImproperlyConfigured, stripe.StripeError) as exc:
+            return _stripe_failure_response(
+                exc=exc,
+                action="billing portal",
+                unavailable="Billing management is temporarily unavailable.",
+                failed="Could not open billing management. Please try again shortly.",
+            )
+        return Response({"url": url}, status=status.HTTP_200_OK)
+
+
+class BillingChangePlanView(generics.GenericAPIView):
+    """
+    GET reads the pending change from Stripe on demand (kept out of the
+    frequently polled /billing/subscription/ payload), POST schedules a switch
+    to the requested plan at the end of the current period with no proration,
+    DELETE releases the pending change. The plan is a slug resolved against
+    active Plan rows; a Stripe price id is never accepted. The Stripe
+    subscription id always comes from the caller's own Subscription row.
+    """
+
+    serializer_class = ChangePlanSerializer
+    throttle_classes = [FailOpenScopedRateThrottle]
+    throttle_scope = "billing-change-plan"
+
+    @staticmethod
+    def _plan_change_conflict(*, exc: billing.PlanChangeError) -> Response:
+        details = {
+            "no_active_subscription": "You don't have an active subscription to change.",
+            "same_plan": "You're already on that plan.",
+            "already_scheduled": "A plan change is already scheduled.",
+            "cancellation_scheduled": "Your subscription is set to end. Reactivate it before changing plans.",
+            "change_in_progress": "Another plan change is being processed. Please try again in a moment.",
+        }
+        if isinstance(exc, billing.NoPendingChangeError):
+            return Response(
+                {"code": exc.code, "detail": "There is no scheduled plan change."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(
+            {"code": exc.code, "detail": details.get(exc.code, "Plan change not possible.")},
+            status=status.HTTP_409_CONFLICT,
+        )
+
+    def get(self, request: Request) -> Response:
+        try:
+            state = billing.get_plan_change_state(user=request.user)
+        except billing.ExemptAccountError:
+            return Response(_EXEMPT_RESPONSE_BODY, status=status.HTTP_409_CONFLICT)
+        except billing.PlanChangeError as exc:
+            return self._plan_change_conflict(exc=exc)
+        except (ImproperlyConfigured, stripe.StripeError) as exc:
+            return _stripe_failure_response(
+                exc=exc,
+                action="plan change lookup",
+                unavailable="Plan changes are temporarily unavailable.",
+                failed="Could not load your plan options. Please try again shortly.",
+            )
+        return Response(
+            {
+                "pending": state["pending"],
+                "available": PlanSerializer(state["available"], many=True).data,
+                "current_period_end": state["current_period_end"],
+                "cancel_at_period_end": state["cancel_at_period_end"],
+            }
+        )
+
+    def post(self, request: Request) -> Response:
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            pending = billing.schedule_plan_change(
+                user=request.user, plan_slug=serializer.validated_data["plan"]
+            )
+        except billing.ExemptAccountError:
+            return Response(_EXEMPT_RESPONSE_BODY, status=status.HTTP_409_CONFLICT)
+        except billing.UnknownPlanError:
+            return Response({"detail": "Unknown plan."}, status=status.HTTP_400_BAD_REQUEST)
+        except billing.PlanChangeError as exc:
+            return self._plan_change_conflict(exc=exc)
+        except billing.PlanPriceMismatchError:
+            return Response(
+                {"detail": "Could not schedule the plan change. Please try again shortly."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        except (ImproperlyConfigured, stripe.StripeError) as exc:
+            return _stripe_failure_response(
+                exc=exc,
+                action="plan change",
+                unavailable="Plan changes are temporarily unavailable.",
+                failed="Could not schedule the plan change. Please try again shortly.",
+            )
+        return Response({"pending": pending}, status=status.HTTP_201_CREATED)
+
+    def delete(self, request: Request) -> Response:
+        try:
+            billing.cancel_plan_change(user=request.user)
+        except billing.ExemptAccountError:
+            return Response(_EXEMPT_RESPONSE_BODY, status=status.HTTP_409_CONFLICT)
+        except billing.PlanChangeError as exc:
+            return self._plan_change_conflict(exc=exc)
+        except (ImproperlyConfigured, stripe.StripeError) as exc:
+            return _stripe_failure_response(
+                exc=exc,
+                action="plan change cancellation",
+                unavailable="Plan changes are temporarily unavailable.",
+                failed="Could not cancel the plan change. Please try again shortly.",
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 @csrf_exempt

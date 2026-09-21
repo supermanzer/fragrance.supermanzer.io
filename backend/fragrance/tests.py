@@ -3542,6 +3542,16 @@ class BillingCheckoutViewTests(TestCase):
     url = "/api/v1/billing/checkout/"
 
     def setUp(self) -> None:
+        # The lapsed-restart guard lists the customer's Stripe subscriptions; default to none.
+        patcher = patch(
+            "fragrance.billing.stripe.Subscription.list",
+            return_value=stripe.ListObject.construct_from(
+                {"object": "list", "data": [], "has_more": False, "url": "/v1/subscriptions"},
+                "sk_test_dummy",
+            ),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.monthly = Plan.objects.create(
             name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
             amount_cents=400, currency="usd", billing_interval="month", access_days_granted=30,
@@ -3764,6 +3774,7 @@ class BillingSubscriptionViewTests(TestCase):
                 "access_expires_at": None,
                 "has_active_access": False,
                 "exempt": False,
+                "can_manage_billing": False,
                 "quota": {"runs_allowed": 0, "runs_used": 0, "next_eligible_at": None, "can_trigger": False},
             },
         )
@@ -4262,7 +4273,7 @@ class BillingSessionViewTests(TestCase):
         body = response.json()
         self.assertEqual(
             set(body.keys()),
-            {"status", "plan", "access_expires_at", "has_active_access", "exempt", "quota", "granted"},
+            {"status", "plan", "access_expires_at", "has_active_access", "exempt", "can_manage_billing", "quota", "granted"},
         )
         self.assertTrue(body["granted"])
         self.assertEqual(body["status"], "active")
@@ -4283,7 +4294,7 @@ class BillingSessionViewTests(TestCase):
         body = response.json()
         self.assertEqual(
             set(body.keys()),
-            {"status", "plan", "access_expires_at", "has_active_access", "exempt", "quota", "granted"},
+            {"status", "plan", "access_expires_at", "has_active_access", "exempt", "can_manage_billing", "quota", "granted"},
         )
         self.assertTrue(body["has_active_access"])
         self.assertFalse(body["granted"])
@@ -4458,8 +4469,9 @@ class RevokeForDisputeTests(TestCase):
             access_expires_at=timezone.now() + timedelta(days=20),
         )
 
+    @patch("fragrance.billing.stripe.Subscription.list", return_value=stripe.ListObject.construct_from({"object": "list", "data": [], "has_more": False}, "sk_test"))
     @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
-    def test_resolvable_dispute_revokes_immediately(self, mock_retrieve) -> None:
+    def test_resolvable_dispute_revokes_immediately(self, mock_retrieve, _mock_list) -> None:
         mock_retrieve.return_value = _fake_payment_intent(
             pi_id="pi_dispute", status="succeeded", customer="cus_dispute_1"
         )
@@ -4491,8 +4503,9 @@ class RevokeForDisputeTests(TestCase):
         self.subscription.refresh_from_db()
         self.assertEqual(self.subscription.status, "active")
 
+    @patch("fragrance.billing.stripe.Subscription.list", return_value=stripe.ListObject.construct_from({"object": "list", "data": [], "has_more": False}, "sk_test"))
     @patch("fragrance.billing.stripe.PaymentIntent.retrieve")
-    def test_expanded_payment_intent_object_is_normalized_to_its_id(self, mock_retrieve) -> None:
+    def test_expanded_payment_intent_object_is_normalized_to_its_id(self, mock_retrieve, _mock_list) -> None:
         """
         Dispute.payment_intent is Optional[ExpandableField["PaymentIntent"]]
         -- if the event ever arrives with that field expanded, it's a nested
@@ -4508,6 +4521,136 @@ class RevokeForDisputeTests(TestCase):
         mock_retrieve.assert_called_once_with("pi_dispute")
         self.subscription.refresh_from_db()
         self.assertEqual(self.subscription.status, "revoked")
+
+
+def _sub_list(*, statuses: dict[str, str]) -> stripe.ListObject:
+    return stripe.ListObject.construct_from(
+        {
+            "object": "list",
+            "has_more": False,
+            "data": [
+                {"id": sub_id, "object": "subscription", "status": status}
+                for sub_id, status in statuses.items()
+            ],
+        },
+        "sk_test",
+    )
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
+class DisputeCancelsStripeSubscriptionTests(TestCase):
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="dispcancel", email="dispcancel@example.com")
+        self.subscription = Subscription.objects.create(
+            user=self.user, stripe_customer_id="cus_dc_1", status="active",
+            access_expires_at=timezone.now() + timedelta(days=20),
+        )
+        patcher = patch(
+            "fragrance.billing.stripe.PaymentIntent.retrieve",
+            return_value=_fake_payment_intent(pi_id="pi_dc", status="succeeded", customer="cus_dc_1"),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @patch("fragrance.billing.stripe.Subscription.cancel")
+    @patch("fragrance.billing.stripe.Subscription.list")
+    def test_cancels_every_live_subscription_immediately_without_proration(self, mock_list, mock_cancel) -> None:
+        mock_list.return_value = _sub_list(statuses={
+            "sub_a": "active", "sub_b": "past_due", "sub_c": "unpaid", "sub_d": "trialing",
+            "sub_e": "incomplete", "sub_f": "canceled", "sub_g": "incomplete_expired", "sub_h": "paused",
+        })
+        with self.assertLogs("fragrance.billing", level="CRITICAL") as logs:
+            revoke_for_dispute(dispute={"payment_intent": "pi_dc"})
+        cancelled = [call.args[0] for call in mock_cancel.call_args_list]
+        self.assertEqual(cancelled, ["sub_a", "sub_b", "sub_c", "sub_d", "sub_e"])
+        for call in mock_cancel.call_args_list:
+            self.assertEqual(call.kwargs, {"invoice_now": False, "prorate": False})
+        self.assertEqual(mock_list.call_args.kwargs["customer"], "cus_dc_1")
+        self.assertIn("sub_a", logs.output[0])
+        self.assertNotIn("sk_test", logs.output[0])
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "revoked")
+
+    @patch("fragrance.billing.stripe.Subscription.cancel")
+    @patch("fragrance.billing.stripe.Subscription.list")
+    def test_no_live_subscriptions_is_fine_and_still_revokes(self, mock_list, mock_cancel) -> None:
+        mock_list.return_value = _sub_list(statuses={"sub_old": "canceled"})
+        revoke_for_dispute(dispute={"payment_intent": "pi_dc"})
+        mock_cancel.assert_not_called()
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "revoked")
+
+    @patch("fragrance.billing.stripe.Subscription.retrieve")
+    @patch("fragrance.billing.stripe.Subscription.cancel")
+    @patch("fragrance.billing.stripe.Subscription.list")
+    def test_already_canceled_race_counts_as_done(self, mock_list, mock_cancel, mock_retrieve) -> None:
+        mock_list.return_value = _sub_list(statuses={"sub_a": "active"})
+        mock_cancel.side_effect = stripe.InvalidRequestError("already canceled", None)
+        mock_retrieve.return_value = SimpleNamespace(status="canceled")
+        revoke_for_dispute(dispute={"payment_intent": "pi_dc"})
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "revoked")
+
+    @patch("fragrance.billing.stripe.Subscription.cancel")
+    @patch("fragrance.billing.stripe.Subscription.list")
+    def test_cancel_failure_raises_after_attempting_all_and_keeps_local_revoke(self, mock_list, mock_cancel) -> None:
+        mock_list.return_value = _sub_list(statuses={"sub_a": "active", "sub_b": "active"})
+        mock_cancel.side_effect = [stripe.APIConnectionError("down"), SimpleNamespace(id="sub_b")]
+        with self.assertRaises(stripe.APIConnectionError):
+            revoke_for_dispute(dispute={"payment_intent": "pi_dc"})
+        self.assertEqual(mock_cancel.call_count, 2)
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "revoked")
+
+    @patch("fragrance.billing.stripe.Subscription.cancel")
+    @patch("fragrance.billing.stripe.Subscription.list")
+    def test_task_retries_on_cancel_failure_then_replay_is_inert(self, mock_list, mock_cancel) -> None:
+        mock_list.return_value = _sub_list(statuses={"sub_a": "active"})
+        mock_cancel.side_effect = stripe.APIConnectionError("down")
+        StripeEvent.objects.create(
+            stripe_event_id="evt_dc", event_type="charge.dispute.created",
+            payload={"data": {"object": {"payment_intent": "pi_dc"}}},
+        )
+        with patch.object(process_stripe_event, "retry", side_effect=RuntimeError("retried")) as mock_retry:
+            result = process_stripe_event.apply(kwargs={"stripe_event_id": "evt_dc"})
+        self.assertTrue(result.failed())
+        mock_retry.assert_called_once()
+        self.assertEqual(StripeEvent.objects.get(stripe_event_id="evt_dc").status, "failed")
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "revoked")
+        first_expiry = self.subscription.access_expires_at
+
+        # Retry: Stripe recovers; the sub is now canceled, so nothing left to cancel.
+        mock_cancel.reset_mock(side_effect=True)
+        mock_list.return_value = _sub_list(statuses={"sub_a": "canceled"})
+        process_stripe_event(stripe_event_id="evt_dc")
+        mock_cancel.assert_not_called()
+        self.assertEqual(StripeEvent.objects.get(stripe_event_id="evt_dc").status, "processed")
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.access_expires_at, first_expiry)
+
+    @patch("fragrance.billing.stripe.Subscription.cancel")
+    @patch("fragrance.billing.stripe.Subscription.list")
+    def test_unresolved_customer_cancels_nothing(self, mock_list, mock_cancel) -> None:
+        with patch(
+            "fragrance.billing.stripe.PaymentIntent.retrieve",
+            return_value=_fake_payment_intent(pi_id="pi_x", status="succeeded", customer="cus_unknown"),
+        ):
+            revoke_for_dispute(dispute={"payment_intent": "pi_x"})
+        mock_list.assert_not_called()
+        mock_cancel.assert_not_called()
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "active")
+
+    @patch("fragrance.billing.stripe.Subscription.cancel")
+    @patch("fragrance.billing.stripe.Subscription.list")
+    def test_transient_payment_intent_failure_raises_and_cancels_nothing(self, mock_list, mock_cancel) -> None:
+        with patch("fragrance.billing.stripe.PaymentIntent.retrieve", side_effect=stripe.APIConnectionError("down")):
+            with self.assertRaises(stripe.APIConnectionError):
+                revoke_for_dispute(dispute={"payment_intent": "pi_dc"})
+        mock_cancel.assert_not_called()
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "active")
 
 
 @override_settings(**_STRIPE_TEST_SETTINGS)
@@ -5459,6 +5602,13 @@ class RevokedAndResendTests(TestCase):
             stripe_customer_id="cus_rev",
         )
         with patch("fragrance.billing.stripe.checkout.Session.create") as create, \
+                patch(
+                    "fragrance.billing.stripe.Subscription.list",
+                    return_value=stripe.ListObject.construct_from(
+                        {"object": "list", "data": [], "has_more": False, "url": "/v1/subscriptions"},
+                        "sk_test_x",
+                    ),
+                ), \
                 override_settings(STRIPE_SECRET_KEY="sk_test_x", STRIPE_API_VERSION="2025-09-30.clover"):
             create.return_value = SimpleNamespace(id="cs_1", url="https://checkout.example/x")
             response = self.client.post(

@@ -176,6 +176,12 @@ class CheckoutCreateSerializer(serializers.Serializer):
     slug = serializers.SlugField()
 
 
+class ChangePlanSerializer(serializers.Serializer):
+    """Only a plan slug, resolved server-side to a Plan; never a price id."""
+
+    plan = serializers.SlugField()
+
+
 class RecommendationRunSerializer(serializers.ModelSerializer):
     picks = RecommendationSerializer(many=True, read_only=True)
 

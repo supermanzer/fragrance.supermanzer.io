@@ -4,7 +4,9 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     BetaAcceptView,
     BetaSignupView,
+    BillingChangePlanView,
     BillingCheckoutView,
+    BillingPortalView,
     BillingSessionView,
     BillingSubscriptionView,
     ExportCollectionView,
@@ -36,6 +38,8 @@ urlpatterns = router.urls + [
     path('recommendations/confirm/', RecommendationConfirmView.as_view(), name='recommendation-confirm'),
     path('recommendations/<int:pk>/rate/', RecommendationRateView.as_view(), name='recommendation-rate'),
     path('billing/checkout/', BillingCheckoutView.as_view(), name='billing-checkout'),
+    path('billing/portal/', BillingPortalView.as_view(), name='billing-portal'),
+    path('billing/change-plan/', BillingChangePlanView.as_view(), name='billing-change-plan'),
     path('billing/subscription/', BillingSubscriptionView.as_view(), name='billing-subscription'),
     path('billing/session/<str:session_id>/', BillingSessionView.as_view(), name='billing-session'),
     # Both spellings route to the same view: CommonMiddleware + APPEND_SLASH

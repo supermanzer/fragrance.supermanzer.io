@@ -383,7 +383,7 @@ requires-dist = [
     { name = "python-decouple", specifier = ">=3.8" },
     { name = "redis", specifier = ">=6.4.0" },
     { name = "requests", specifier = ">=2.34.2" },
-    { name = "stripe", specifier = ">=15.6.1" },
+    { name = "stripe", specifier = "==15.6.1" },
 ]
 
 [[package]]

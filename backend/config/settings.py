@@ -145,19 +145,27 @@ DASHSCOPE_BASE_URL = config(
     default="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
 )
 
-# Stripe — read with default="" (not the bare config("X") DJANGO_SECRET_KEY
+# Stripe keys are read with default="" (not the bare config("X") DJANGO_SECRET_KEY
 # uses) for the same reason as the AI provider keys above: the operator has
 # not yet provisioned these on every environment, and a bare config() would
 # crash Django at import time rather than failing at first use inside
-# fragrance.billing._configure_stripe(). STRIPE_API_VERSION is pinned
-# explicitly (default matches the installed stripe==15.6.1 wheel's own
-# _ApiVersion.CURRENT) — the PaymentIntent/Invoice decoupling this project's
-# webhook handler relies on (invoice.parent.subscription_details) is
-# version-dependent, and an unpinned account default could change payload
-# shapes silently.
+# fragrance.billing._configure_stripe().
 STRIPE_SECRET_KEY = config("STRIPE_SECRET_KEY", default="")
 STRIPE_WEBHOOK_SECRET = config("STRIPE_WEBHOOK_SECRET", default="")
-STRIPE_API_VERSION = config("STRIPE_API_VERSION", default="2026-08-26.dahlia")
+# The Stripe API version is a CONSTANT, deliberately not read from the environment.
+# The webhook/grant code depends on version-specific payload shapes (PaymentIntent/
+# Invoice decoupling, invoice.parent.subscription_details, SubscriptionSchedule
+# phases using `duration`), so it is code, not deployment config: it must move only
+# together with the pinned `stripe` package (pyproject.toml, `==`) and after
+# re-verifying those shapes. The webhook endpoint in the Stripe Dashboard must be
+# created with this same version; `stripe listen` defaults to an older one, so pass
+# `--latest`-style pinning when testing locally.
+STRIPE_API_VERSION = "2026-08-26.dahlia"
+# Id (bpc_...) of the Customer Portal configuration created by the
+# configure_stripe_portal command. Empty falls back to Stripe's default
+# configuration, which is more permissive than ours (name/address/phone edits),
+# so the portal endpoint refuses (503) when this is empty unless DEBUG is on.
+STRIPE_PORTAL_CONFIGURATION_ID = config("STRIPE_PORTAL_CONFIGURATION_ID", default="")
 
 # Celery async task worker(s)
 # https://docs.celeryq.dev/en/latest/django/first-steps-with-django.html
@@ -231,8 +239,15 @@ REST_FRAMEWORK = {
         # restarts the budget and must not be throttled mid-payment.
         "billing-session": "30/min",
         # The layout refetches subscription state on mount, on leaving
-        # /billing*, and after every 402; /api/ has no nginx limit_req.
+        # /billing*, and after every 402; /api/v1/billing/ has nginx
+        # zone=billing as a backstop.
         "billing-status": "60/min",
+        "billing-portal": "10/min",
+        # One scope for GET/POST/DELETE on /billing/change-plan/; a request
+        # costs one to six sequential Stripe round trips (POST is the most:
+        # subscription, price, optional release, create, modify, cleanup
+        # release), each capped at 10s with no retries (see billing.py).
+        "billing-change-plan": "20/min",
     },
     # DRF's default SimpleMetadata answers OPTIONS for any caller, including
     # AllowAny views, by cloning the request per unsafe method and including
