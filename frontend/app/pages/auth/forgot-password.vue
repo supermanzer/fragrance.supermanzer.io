@@ -33,7 +33,7 @@
 
     <div v-else>
       <v-alert type="success" variant="tonal" class="mb-4">
-        If an account with that email exists, a reset link has been sent. Check your inbox.
+        If an account with that email exists, a reset link has been sent. Check your inbox, and your spam or junk folder if it isn't there.
       </v-alert>
       <div class="text-center mt-4">
         <NuxtLink to="/auth/login" class="text-body-2 text-primary">Back to sign in</NuxtLink>

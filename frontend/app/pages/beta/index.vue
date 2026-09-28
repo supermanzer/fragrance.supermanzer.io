@@ -62,7 +62,7 @@
 
       <div v-else key="success">
         <v-alert type="success" variant="tonal" class="mb-4">
-          We'll be in touch by email if there's a place for you.
+          We'll be in touch by email if there's a place for you. Invitations sometimes land in spam or junk, so check there too.
         </v-alert>
         <div class="text-center mt-4">
           <NuxtLink to="/" class="text-body-2 text-primary">Back to home</NuxtLink>
