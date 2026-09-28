@@ -7,7 +7,6 @@ Implements Celery tasks for Fragrance Recommendation Runs
 import logging
 from datetime import timedelta
 
-import stripe
 from celery import shared_task
 from celery.exceptions import SoftTimeLimitExceeded
 from django.conf import settings
@@ -84,12 +83,12 @@ NON_RETRYABLE_CONFIG_EXCEPTIONS = (
 def render_and_send_email(user_id: int, run_id: int) -> None:
     """Pipeline step 6. Renders the email HTML and sends via the centralized sender."""
     run = (
-        RecommendationRun.objects
+        RecommendationRun.objects  # ty: ignore[unresolved-attribute]
         .select_related('profile')
         .prefetch_related('picks')
         .get(id=run_id)
     )
-    config = FragranceConfig.objects.get(user_id=user_id)
+    config = FragranceConfig.objects.get(user_id=user_id)  # ty: ignore[unresolved-attribute]
 
     # Attach ad-hoc confirm_url_* attributes directly onto the prefetched pick instances
     # so the template can reference pick.confirm_url_own/_like/_dislike without a second
@@ -136,12 +135,12 @@ def _resolve_profile(
     reuses the latest existing profile to avoid an unnecessary LLM call.
     """
     latest_change = (
-        Fragrance.objects
+        Fragrance.objects  # ty: ignore[unresolved-attribute]
         .filter(user_id=user_id)
         .aggregate(Max('updated_at'))['updated_at__max']
     )
     latest_profile = (
-        PreferenceProfile.objects
+        PreferenceProfile.objects  # ty: ignore[unresolved-attribute]
         .filter(user_id=user_id)
         .order_by('-generated_at')
         .first()
@@ -159,7 +158,7 @@ def _resolve_profile(
         )
 
     # Reuse the existing profile but still link it to this run.
-    RecommendationRun.objects.filter(id=run_id).update(profile=latest_profile)
+    RecommendationRun.objects.filter(id=run_id).update(profile=latest_profile)  # ty: ignore[unresolved-attribute]
     return latest_profile
 
 
@@ -171,7 +170,7 @@ def send_beta_invite_email(self: 'send_beta_invite_email', signup_id: int) -> No
     -- a Postmark outage must not 500 the admin approval request the way
     PasswordResetRequestView's inline, fail_silently=False send would.
     """
-    signup = BetaSignup.objects.select_related('invited_user').get(id=signup_id)
+    signup = BetaSignup.objects.select_related('invited_user').get(id=signup_id)  # ty: ignore[unresolved-attribute]
     if signup.invited_user is None:
         return
     token = generate_beta_invite_token(signup=signup)
@@ -325,22 +324,22 @@ def restore_stripe_customer_email(
     address, so it skips unless User.email still equals `email` and the
     customer is still this user's Subscription customer. Logs carry ids only.
     """
-    from .billing import _configure_stripe, _normalized_email
+    from .billing import _normalized_email, get_stripe_client
 
     current = User.objects.filter(pk=user_id).values_list('email', flat=True).first()
     if current is None or _normalized_email(email=current) != _normalized_email(email=email):
         logger.info('skipping stripe email restore for user %s: local email changed since the revert', user_id)
         return
-    if not Subscription.objects.filter(user_id=user_id, stripe_customer_id=customer_id).exists():
+    if not Subscription.objects.filter(user_id=user_id, stripe_customer_id=customer_id).exists():  # ty: ignore[unresolved-attribute]
         logger.warning('skipping stripe email restore for user %s: customer %s is not theirs', user_id, customer_id)
         return
     try:
-        _configure_stripe()
-        customer = stripe.Customer.retrieve(customer_id)
+        client = get_stripe_client()
+        customer = client.v1.customers.retrieve(customer_id)
         if _normalized_email(email=getattr(customer, 'email', None)) == _normalized_email(email=email):
             logger.info('stripe customer %s already has the restored email for user %s', customer_id, user_id)
             return
-        stripe.Customer.modify(customer_id, email=email)
+        client.v1.customers.update(customer_id, params={'email': email})
         logger.info('restored email on stripe customer %s for user %s', customer_id, user_id)
     except Exception as exc:
         logger.error(
@@ -361,7 +360,7 @@ def send_recommendation_email(self: 'send_recommendation_email', user_id: int, r
         render_and_send_email(user_id=user_id, run_id=run_id)
     except Exception as exc:
         if self.request.retries >= self.max_retries:
-            RecommendationRun.objects.filter(id=run_id).update(
+            RecommendationRun.objects.filter(id=run_id).update(  # ty: ignore[unresolved-attribute]
                 email_status='failed',
                 error_message=f"Email delivery failed after {self.max_retries} retries: {exc}",
             )
@@ -389,15 +388,25 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
                 "scheduled run skipped for user %s: %s", user_id, type(refusal).__name__
             )
             return
-        run.status = 'running'
+        # Django noise, not a Stripe params-shape issue: RecommendationRun's
+        # CharField/TextField attributes read to ty as their descriptor
+        # class rather than plain str (no django-stubs installed -- see
+        # [tool.ty] in pyproject.toml). Every `run.<field> = <str literal>`
+        # assignment in this function carries the same, individually
+        # reviewed exception.
+        run.status = 'running'  # ty: ignore[invalid-assignment]
         run.save(update_fields=['status'])
     else:
-        run = RecommendationRun.objects.get(id=run_id)
+        # Not ignored: .objects.get(...)'s return type is unresolved-attribute
+        # (Unknown) here too, but ty doesn't flag this specific pair of
+        # assignments as invalid-assignment as it does on the create() path
+        # a few lines up -- an inference-order quirk, not a real difference.
+        run = RecommendationRun.objects.get(id=run_id)  # ty: ignore[unresolved-attribute]
         run.status = 'running'
         run.error_message = ''
         run.save(update_fields=['status', 'error_message'])
         # Wipe any picks from a previous attempt so retries start clean.
-        Recommendation.objects.filter(run=run).delete()
+        Recommendation.objects.filter(run=run).delete()  # ty: ignore[unresolved-attribute]
     try:
         # Resolved once per run, not once per call: a run must not straddle two
         # providers if an admin flips AIModelConfig.is_active mid-run. Resolved
@@ -411,33 +420,33 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
         run.provider_model_id = config.model_id
         run.save(update_fields=['provider_family', 'provider_model_id'])
 
-        profile = _resolve_profile(user_id=user_id, run_id=run.id, provider=provider)
-        results = run_discovery_searches(user_id=user_id, profile_id=profile.id)
+        profile = _resolve_profile(user_id=user_id, run_id=run.id, provider=provider)  # ty: ignore[unresolved-attribute]
+        results = run_discovery_searches(user_id=user_id, profile_id=profile.id)  # ty: ignore[unresolved-attribute]
         candidates = select_candidates(
             user_id=user_id,
-            profile_id=profile.id,
+            profile_id=profile.id,  # ty: ignore[unresolved-attribute]
             search_results=results,
             provider=provider,
         )
         picks = verify_candidates(
             user_id=user_id,
-            run_id=run.id,
+            run_id=run.id,  # ty: ignore[unresolved-attribute]
             candidates=candidates,
             profile=profile,
             provider=provider,
         )
-        generate_email_content(run_id=run.id, verified_picks=picks, provider=provider)
-        run.status = 'done'
-        run.email_status = 'pending'
+        generate_email_content(run_id=run.id, verified_picks=picks, provider=provider)  # ty: ignore[unresolved-attribute]
+        run.status = 'done'  # ty: ignore[invalid-assignment]
+        run.email_status = 'pending'  # ty: ignore[invalid-assignment]
         run.save(update_fields=['status', 'email_status'])
-        send_recommendation_email.delay(user_id=user_id, run_id=run.id)
+        send_recommendation_email.delay(user_id=user_id, run_id=run.id)  # ty: ignore[unresolved-attribute]
     except SoftTimeLimitExceeded:
         # A run that overran its budget is a failure, not a transient error:
         # retrying would just burn another 20 minutes.
-        run.status = 'failed'
-        run.error_message = STALE_RUN_TIMEOUT_MESSAGE
+        run.status = 'failed'  # ty: ignore[invalid-assignment]
+        run.error_message = STALE_RUN_TIMEOUT_MESSAGE  # ty: ignore[invalid-assignment]
         run.save(update_fields=['status', 'error_message'])
-        logger.error("run %s for user %s exceeded its soft time limit", run.id, user_id)
+        logger.error("run %s for user %s exceeded its soft time limit", run.id, user_id)  # ty: ignore[unresolved-attribute]
         return
     except Exception as exc:
         # Config errors fail immediately, on any attempt — retrying can't fix
@@ -449,8 +458,8 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
         is_config_error = isinstance(exc, NON_RETRYABLE_CONFIG_EXCEPTIONS)
         is_final_attempt = self.request.retries >= self.max_retries
         if is_config_error or is_final_attempt:
-            run.status = 'failed'
-            run.error_message = sanitize_sdk_error_message(exc)
+            run.status = 'failed'  # ty: ignore[invalid-assignment]
+            run.error_message = sanitize_sdk_error_message(exc)  # ty: ignore[invalid-assignment]
             run.save(update_fields=['status', 'error_message'])
             raise
         # Retry against the run we already own: re-entering the beat path would
@@ -458,7 +467,7 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
         raise self.retry(
             exc=exc,
             countdown=300,
-            kwargs={'user_id': user_id, 'run_id': run.id},
+            kwargs={'user_id': user_id, 'run_id': run.id},  # ty: ignore[unresolved-attribute]
         )
 
 
@@ -474,7 +483,7 @@ def reap_stale_runs() -> int:
     quota, so this also releases the allowance the stranded row was holding.
     """
     cutoff = timezone.now() - IN_FLIGHT_MAX_AGE
-    reaped = RecommendationRun.objects.filter(
+    reaped = RecommendationRun.objects.filter(  # ty: ignore[unresolved-attribute]
         status__in=('pending', 'running'), triggered_at__lt=cutoff
     ).update(status='failed', error_message=STALE_RUN_ERROR_MESSAGE)
     if reaped:
@@ -504,8 +513,8 @@ def process_stripe_event(self: 'process_stripe_event', stripe_event_id: str) -> 
     )
 
     try:
-        event_row = StripeEvent.objects.get(stripe_event_id=stripe_event_id)
-    except StripeEvent.DoesNotExist:
+        event_row = StripeEvent.objects.get(stripe_event_id=stripe_event_id)  # ty: ignore[unresolved-attribute]
+    except StripeEvent.DoesNotExist:  # ty: ignore[unresolved-attribute]
         return
 
     data_object = event_row.payload.get('data', {}).get('object', {})
@@ -577,7 +586,7 @@ def prune_stripe_event_payloads() -> int:
     """
     cutoff = timezone.now() - timedelta(days=STRIPE_EVENT_PAYLOAD_RETENTION_DAYS)
     pruned = (
-        StripeEvent.objects.filter(received_at__lt=cutoff)
+        StripeEvent.objects.filter(received_at__lt=cutoff)  # ty: ignore[unresolved-attribute]
         .exclude(payload={})
         .update(payload={})
     )

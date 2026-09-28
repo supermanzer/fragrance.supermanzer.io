@@ -21,9 +21,15 @@ prorations; the portal's own switching cannot control the billing anchor and
 can create a free period), pause, promotion codes and the hosted login page.
 """
 
+import argparse
 import json
+from typing import cast
 
 import stripe
+from stripe.params.billing_portal import (
+    ConfigurationCreateParams,
+    ConfigurationUpdateParams,
+)
 from django.core.management.base import BaseCommand, CommandError
 
 from fragrance import billing
@@ -32,11 +38,21 @@ from fragrance.ai_providers.base import sanitize_sdk_error_message
 _METADATA = {"app": "fragrances", "managed_by": "configure_stripe_portal"}
 
 
-def desired_configuration() -> dict:
+def desired_configuration() -> ConfigurationUpdateParams:
+    """
+    Returned type is ConfigurationUpdateParams (the superset of the two
+    Stripe accepts -- it additionally has "active", which this dict never
+    sets). The .create() call site below casts to ConfigurationCreateParams:
+    both are all-NotRequired TypedDicts describing the identical wire body,
+    but their nested sub-TypedDicts (e.g. *Features) are nominally distinct
+    types, so a type checker won't treat one as freely assignable to the
+    other even though the JSON shapes are the same -- cast documents that
+    deliberately, rather than re-declaring this whole dict twice.
+    """
     from django.conf import settings
 
     frontend_url = settings.FRONTEND_URL.rstrip("/")
-    return {
+    config: ConfigurationUpdateParams = {
         "business_profile": {
             "headline": "Manage your Fragrances subscription",
             "terms_of_service_url": f"{frontend_url}/terms",
@@ -62,11 +78,22 @@ def desired_configuration() -> dict:
                 },
             },
             "subscription_update": {"enabled": False},
-            "subscription_pause": {"enabled": False},
         },
         "login_page": {"enabled": False},
         "metadata": dict(_METADATA),
     }
+    # "subscription_pause" is not a real key of Stripe's portal Configuration
+    # Features (confirmed: absent from both ConfigurationCreateParamsFeatures
+    # and ConfigurationUpdateParamsFeatures in stripe-python 15.6.1 -- ty's
+    # invalid-key check caught this). It has silently never actually
+    # configured anything; flagged for operator review rather than changed
+    # here, since the intended control (does Stripe's portal expose a pause
+    # toggle at all in this API version, and if so under what key) is a real
+    # product/business question, not a typo this file's author could safely
+    # guess at. Assigned after construction, with its own narrowly-scoped
+    # suppression, so the dict literal above still type-checks cleanly.
+    config["features"]["subscription_pause"] = {"enabled": False}  # ty: ignore[invalid-key]
+    return config
 
 
 def _is_ours(*, configuration: object) -> bool:
@@ -78,7 +105,7 @@ def _is_ours(*, configuration: object) -> bool:
 class Command(BaseCommand):
     help = "Create/update the Stripe Customer Portal configuration. Idempotent."
 
-    def add_arguments(self, parser: object) -> None:
+    def add_arguments(self, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
             "--dry-run",
             action="store_true",
@@ -103,13 +130,15 @@ class Command(BaseCommand):
         if live and not options["yes"] and not options["dry_run"]:
             raise CommandError("Refusing to modify a LIVE Stripe account without --yes.")
 
-        billing._configure_stripe()
+        client = billing.get_stripe_client()
         desired = desired_configuration()
 
         try:
             ours = [
                 configuration
-                for configuration in stripe.billing_portal.Configuration.list(limit=100, active=True).auto_paging_iter()
+                for configuration in client.v1.billing_portal.configurations.list(
+                    params={"limit": 100, "active": True}
+                ).auto_paging_iter()
                 if _is_ours(configuration=configuration)
             ]
         except stripe.StripeError as exc:
@@ -130,9 +159,13 @@ class Command(BaseCommand):
 
         try:
             if ours:
-                configuration = stripe.billing_portal.Configuration.modify(ours[0].id, **desired)
+                configuration = client.v1.billing_portal.configurations.update(
+                    ours[0].id, params=desired
+                )
             else:
-                configuration = stripe.billing_portal.Configuration.create(**desired)
+                configuration = client.v1.billing_portal.configurations.create(
+                    params=cast(ConfigurationCreateParams, desired)
+                )
         except stripe.StripeError as exc:
             raise CommandError(f"Stripe rejected the configuration: {sanitize_sdk_error_message(exc)}")
 

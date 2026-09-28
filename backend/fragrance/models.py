@@ -236,6 +236,11 @@ class Plan(models.Model):
     quota_period_days = models.PositiveIntegerField(default=30)
     max_runs_per_quota_period = models.PositiveIntegerField(default=1)
     failed_run_grace = models.PositiveIntegerField(default=1)
+    # "Offered at checkout / plan-change target" -- never "honoured at
+    # renewal". billing._match_plan_line matches ANY Plan row regardless of
+    # this flag, on purpose: a retired row (see seed_plans --rotate-price)
+    # must keep granting for subscribers still billing on its Price even
+    # after it stops being offered here.
     is_active = models.BooleanField(default=True)
 
     def __str__(self) -> str:

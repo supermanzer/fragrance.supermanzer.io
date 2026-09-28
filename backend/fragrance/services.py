@@ -3,7 +3,7 @@ import hashlib
 import hmac
 import logging
 from datetime import datetime, timedelta
-from typing import IO
+from typing import IO, Literal
 
 from django.conf import settings
 from django.contrib.auth.models import User
@@ -477,6 +477,17 @@ _IN_FLIGHT_STATUSES = ("pending", "running")
 # case: 3 attempts x 1500s hard limit + 2 x 300s retry backoff.
 IN_FLIGHT_MAX_AGE = timedelta(hours=2)
 
+# The beat schedule is calendar-monthly (day_of_month), but quota_period_days
+# is a rolling window measured in exact days. A 28- or 30-day month, or
+# sub-second scheduling jitter around a 30-day boundary, can put the
+# previous scheduled run inside the new rolling window even though a full
+# calendar month has genuinely elapsed. Only the beat path gets this slack;
+# a manual API trigger keeps the strict rolling quota_period_days so a user
+# cannot use the "Run Now" button to get extra runs.
+BEAT_QUOTA_TOLERANCE = timedelta(days=4)
+
+TriggerSource = Literal["api", "beat"]
+
 
 class QuotaExceeded(Exception):
     def __init__(self, *, next_eligible_at: datetime | None) -> None:
@@ -517,7 +528,7 @@ def _quota_terms(*, plan: Plan | None) -> tuple[timedelta, int, int]:
 
 
 def _evaluate_quota(
-    *, user: User, plan: Plan | None, now: datetime
+    *, user: User, plan: Plan | None, now: datetime, source: TriggerSource = "api"
 ) -> tuple[int, bool, datetime | None]:
     """
     Returns (consumed, blocked, next_eligible_at) for the rolling window.
@@ -528,8 +539,15 @@ def _evaluate_quota(
     stop it. next_eligible_at is when enough of the oldest relevant runs
     have left the window to drop back under the limit; None if not blocked
     (or if a zero allowance means it never will be).
+
+    source="beat" shrinks the window by BEAT_QUOTA_TOLERANCE so a calendar-
+    monthly scheduled run is never refused just because the rolling window
+    hasn't quite finished elapsing (see BEAT_QUOTA_TOLERANCE). Manual/API
+    triggers always use the full, strict quota_period_days.
     """
     period, max_runs, grace = _quota_terms(plan=plan)
+    if source == "beat":
+        period = period - BEAT_QUOTA_TOLERANCE
     windowed = list(
         RecommendationRun.objects.filter(
             user=user, triggered_at__gte=now - period
@@ -560,11 +578,17 @@ def _check_can_start(
     subscription: Subscription | None,
     now: datetime,
     quota: tuple[int, bool, datetime | None] | None = None,
+    source: TriggerSource = "api",
 ) -> tuple[Exception | None, datetime | None]:
     """
     The single rule set behind both start_recommendation_run (which calls it
     under the row lock) and quota_snapshot (read-only, no lock), so the two
     cannot drift. Returns (refusal or None, next_eligible_at). Creates nothing.
+
+    source only matters when the caller doesn't already have a precomputed
+    quota tuple -- it picks the strict or beat-tolerant window in
+    _evaluate_quota. If a caller passes `quota` in, that tuple's source
+    already won and this parameter is ignored for the quota check.
     """
     staff = _is_staff(user=user)
     if not (staff or (subscription is not None and subscription.has_active_access)):
@@ -574,7 +598,7 @@ def _check_can_start(
     if staff:
         return None, None
     if quota is None:
-        quota = _evaluate_quota(user=user, plan=subscription.plan, now=now)
+        quota = _evaluate_quota(user=user, plan=subscription.plan, now=now, source=source)
     _, blocked, next_eligible_at = quota
     if blocked:
         return QuotaExceeded(next_eligible_at=next_eligible_at), next_eligible_at
@@ -582,7 +606,16 @@ def _check_can_start(
 
 
 def quota_snapshot(*, user: User, subscription: Subscription | None) -> dict:
-    """Frontend-facing quota state. Read-only: no writes, no locks."""
+    """
+    Frontend-facing quota state. Read-only: no writes, no locks.
+
+    Always evaluated with source="api" (the default), deliberately: this
+    backs the "Run Now" button and the "next eligible" display, both of
+    which describe what a *manual* trigger would do right now. Reporting
+    the beat-tolerant window here would show can_trigger=True for a user
+    whose actual manual trigger would still be refused by the strict
+    rolling window in start_recommendation_run.
+    """
     now = timezone.now()
     staff = _is_staff(user=user)
     plan = subscription.plan if subscription else None
@@ -604,7 +637,7 @@ def quota_snapshot(*, user: User, subscription: Subscription | None) -> dict:
     }
 
 
-def start_recommendation_run(*, user: User, source: str) -> RecommendationRun:
+def start_recommendation_run(*, user: User, source: TriggerSource) -> RecommendationRun:
     """
     The single chokepoint both trigger paths (the API view and the beat task)
     go through. Serialised per user by a row lock on their Subscription, which
@@ -612,12 +645,15 @@ def start_recommendation_run(*, user: User, source: str) -> RecommendationRun:
     row would lock nothing. The OneToOne unique constraint makes concurrent
     creation safe. Raises SubscriptionRequired, RunInProgress or QuotaExceeded;
     otherwise returns a new 'pending' run created inside the lock.
+
+    source distinguishes the beat-tolerant quota window from the strict one
+    (see _evaluate_quota) -- it is not just a log label.
     """
     with transaction.atomic():
         subscription, _ = Subscription.objects.get_or_create(user=user)
         subscription = Subscription.objects.select_for_update().get(pk=subscription.pk)
         refusal, _ = _check_can_start(
-            user=user, subscription=subscription, now=timezone.now()
+            user=user, subscription=subscription, now=timezone.now(), source=source
         )
         if refusal is not None:
             raise refusal

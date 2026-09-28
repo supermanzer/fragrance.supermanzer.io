@@ -1,70 +1,14 @@
-"""
-Tests for the customer.updated email sync (billing.sync_customer_email plus its
-two notice emails) and for Terms of Service consent on Checkout.
-
-Stripe objects are real SDK objects via `construct_from`. The sync never calls
-Stripe, so those tests need no Stripe patching at all.
-"""
-
 import logging
-from datetime import timedelta
 from unittest.mock import patch
 
-import stripe
 from celery.exceptions import Retry
 from django.contrib.auth.models import User
 from django.core import mail
 from django.test import TestCase, override_settings
-from django.utils import timezone
-from rest_framework.test import APIClient
-
-from .billing import fulfill_checkout_session
-from .models import Plan, StripeEvent, Subscription
-from .tasks import process_stripe_event, send_account_email_change_notice
-
-_KEY = "sk_test_dummy"
-_SETTINGS = {
-    "STRIPE_SECRET_KEY": _KEY,
-    "STRIPE_API_VERSION": "2026-08-26.dahlia",
-    "FRONTEND_URL": "https://app.example.test",
-}
-
-
-def _store_customer_updated(
-    *, event_id: str, customer_id: str, email: str | None, previous: dict | None
-) -> None:
-    data: dict = {"object": {"id": customer_id, "object": "customer", "email": email}}
-    if previous is not None:
-        data["previous_attributes"] = previous
-    StripeEvent.objects.create(
-        stripe_event_id=event_id,
-        event_type="customer.updated",
-        stripe_created=timezone.now(),
-        payload={"id": event_id, "type": "customer.updated", "data": data},
-    )
-
-
-class _EmailSyncBase(TestCase):
-    def setUp(self) -> None:
-        self.user = User.objects.create_user(
-            username="alice", email="alice@old.example", password="pw12345!"
-        )
-        Subscription.objects.create(user=self.user, stripe_customer_id="cus_alice")
-        patcher = patch("fragrance.tasks.send_account_email_change_notice.delay")
-        self.mock_delay = patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def _process(self, *, event_id: str, email: str | None, previous: dict | None = None,
-                 customer_id: str = "cus_alice") -> None:
-        _store_customer_updated(
-            event_id=event_id, customer_id=customer_id, email=email,
-            previous={"email": "alice@old.example"} if previous is None else previous,
-        )
-        process_stripe_event(stripe_event_id=event_id)
-
-    def _email(self) -> str:
-        self.user.refresh_from_db()
-        return self.user.email
+from fragrance.models import StripeEvent, Subscription
+from fragrance.tasks import process_stripe_event, send_account_email_change_notice
+from fragrance.tests.support.bases import _EmailSyncBase
+from fragrance.tests.support.stripe_fakes import _store_customer_updated
 
 
 class SyncCustomerEmailTests(_EmailSyncBase):
@@ -197,11 +141,11 @@ class SyncCustomerEmailTests(_EmailSyncBase):
         self.assertEqual(other.email, "dave@x.example")
 
     def test_no_stripe_calls_are_made(self) -> None:
-        with patch("fragrance.billing._configure_stripe") as configure, \
-                patch("fragrance.billing.stripe.Customer.modify") as modify:
+        with patch("fragrance.billing.get_stripe_client") as get_client, \
+                patch("fragrance.billing.get_interactive_stripe_client") as get_interactive_client:
             self._process(event_id="evt_nostripe", email="alice@new.example")
-        configure.assert_not_called()
-        modify.assert_not_called()
+        get_client.assert_not_called()
+        get_interactive_client.assert_not_called()
 
     def test_broker_failure_rolls_back_the_change_and_retries_the_event(self) -> None:
         self.mock_delay.side_effect = OSError("broker down")
@@ -311,154 +255,3 @@ class EmailChangeNoticeTaskTests(TestCase):
             new_email="n@x.example", is_new_address=True,
         )
         self.assertEqual(mail.outbox, [])
-
-
-@override_settings(**_SETTINGS)
-class ToSConsentCheckoutTests(TestCase):
-    url = "/api/v1/billing/checkout/"
-
-    def setUp(self) -> None:
-        patcher = patch(
-            "fragrance.billing.stripe.Subscription.list",
-            return_value=stripe.ListObject.construct_from(
-                {"object": "list", "data": [], "has_more": False, "url": "/v1/subscriptions"}, _KEY
-            ),
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        Plan.objects.create(
-            name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
-            amount_cents=400, currency="usd", billing_interval="month", access_days_granted=30,
-        )
-        self.user = User.objects.create_user(username="u", email="u@example.com", password="pw12345!")
-        Subscription.objects.create(
-            user=self.user, stripe_customer_id="cus_1", last_checkout_session_id="cs_old"
-        )
-        self.client = APIClient()
-        self.client.force_authenticate(user=self.user)
-
-    def _session(self, *, consent: dict | None, session_id: str = "cs_old") -> stripe.checkout.Session:
-        data = {
-            "id": session_id, "object": "checkout.session", "status": "open", "mode": "subscription",
-            "url": f"https://checkout.stripe.com/{session_id}",
-            "metadata": {"plan_slug": "beta-monthly", "price_id": "price_mo"},
-            "consent_collection": consent,
-        }
-        return stripe.checkout.Session.construct_from(data, _KEY)
-
-    def _new_session(self) -> stripe.checkout.Session:
-        return self._session(consent=None, session_id="cs_new")
-
-    @override_settings(STRIPE_REQUIRE_TOS_CONSENT=True)
-    @patch("fragrance.billing.stripe.checkout.Session.create")
-    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
-    def test_param_present_when_flag_on(self, retrieve, create) -> None:
-        retrieve.side_effect = stripe.InvalidRequestError("gone", "id")
-        create.return_value = self._new_session()
-        self.assertEqual(self.client.post(self.url, {"slug": "beta-monthly"}).status_code, 200)
-        self.assertEqual(create.call_args.kwargs["consent_collection"], {"terms_of_service": "required"})
-
-    @override_settings(STRIPE_REQUIRE_TOS_CONSENT=False)
-    @patch("fragrance.billing.stripe.checkout.Session.create")
-    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
-    def test_param_absent_when_flag_off(self, retrieve, create) -> None:
-        retrieve.side_effect = stripe.InvalidRequestError("gone", "id")
-        create.return_value = self._new_session()
-        self.assertEqual(self.client.post(self.url, {"slug": "beta-monthly"}).status_code, 200)
-        self.assertNotIn("consent_collection", create.call_args.kwargs)
-
-    @override_settings(STRIPE_REQUIRE_TOS_CONSENT=True)
-    @patch("fragrance.billing.stripe.checkout.Session.expire")
-    @patch("fragrance.billing.stripe.checkout.Session.create")
-    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
-    def test_open_session_without_consent_is_expired_when_flag_on(self, retrieve, create, expire) -> None:
-        retrieve.return_value = self._session(consent=None)
-        create.return_value = self._new_session()
-        response = self.client.post(self.url, {"slug": "beta-monthly"})
-        self.assertEqual(response.json()["url"], "https://checkout.stripe.com/cs_new")
-        expire.assert_called_once_with("cs_old")
-
-    @override_settings(STRIPE_REQUIRE_TOS_CONSENT=True)
-    @patch("fragrance.billing.stripe.checkout.Session.expire")
-    @patch("fragrance.billing.stripe.checkout.Session.create")
-    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
-    def test_open_session_with_consent_is_reused_when_flag_on(self, retrieve, create, expire) -> None:
-        retrieve.return_value = self._session(consent={"terms_of_service": "required"})
-        response = self.client.post(self.url, {"slug": "beta-monthly"})
-        self.assertEqual(response.json()["url"], "https://checkout.stripe.com/cs_old")
-        create.assert_not_called()
-        expire.assert_not_called()
-
-    @override_settings(STRIPE_REQUIRE_TOS_CONSENT=False)
-    @patch("fragrance.billing.stripe.checkout.Session.expire")
-    @patch("fragrance.billing.stripe.checkout.Session.create")
-    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
-    def test_open_session_with_consent_is_expired_when_flag_off(self, retrieve, create, expire) -> None:
-        retrieve.return_value = self._session(consent={"terms_of_service": "required"})
-        create.return_value = self._new_session()
-        self.client.post(self.url, {"slug": "beta-monthly"})
-        expire.assert_called_once_with("cs_old")
-        create.assert_called_once()
-
-    @override_settings(STRIPE_REQUIRE_TOS_CONSENT=False)
-    @patch("fragrance.billing.stripe.checkout.Session.expire")
-    @patch("fragrance.billing.stripe.checkout.Session.create")
-    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
-    def test_open_session_without_consent_is_reused_when_flag_off(self, retrieve, create, expire) -> None:
-        retrieve.return_value = self._session(consent=None)
-        response = self.client.post(self.url, {"slug": "beta-monthly"})
-        self.assertEqual(response.json()["url"], "https://checkout.stripe.com/cs_old")
-        create.assert_not_called()
-
-    @override_settings(STRIPE_REQUIRE_TOS_CONSENT=True)
-    @patch("fragrance.billing.stripe.checkout.Session.create")
-    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
-    def test_missing_terms_url_maps_to_502_with_fixed_message_and_actionable_log(self, retrieve, create) -> None:
-        retrieve.side_effect = stripe.InvalidRequestError("gone", "id")
-        create.side_effect = stripe.InvalidRequestError(
-            "You cannot collect consent to a terms of service agreement until a URL is set in "
-            "the Stripe Dashboard at https://dashboard.stripe.com/settings/public.",
-            "consent_collection",
-        )
-        with self.assertLogs("fragrance.billing", level=logging.ERROR) as logs:
-            response = self.client.post(self.url, {"slug": "beta-monthly"})
-        self.assertEqual(response.status_code, 502)
-        self.assertEqual(response.json(), {"detail": "Could not start checkout. Please try again shortly."})
-        self.assertIn("STRIPE_REQUIRE_TOS_CONSENT=False", logs.output[0])
-        self.assertIn("Public details", logs.output[0])
-        # State is not advanced by a failed create.
-        self.assertEqual(Subscription.objects.get(user=self.user).last_checkout_session_id, "cs_old")
-
-    @override_settings(STRIPE_REQUIRE_TOS_CONSENT=True)
-    @patch("fragrance.billing.stripe.checkout.Session.create")
-    @patch("fragrance.billing.stripe.checkout.Session.retrieve")
-    def test_other_invalid_request_errors_still_502_via_generic_path(self, retrieve, create) -> None:
-        retrieve.side_effect = stripe.InvalidRequestError("gone", "id")
-        create.side_effect = stripe.InvalidRequestError("No such price: 'price_mo'", "price")
-        with self.assertLogs("fragrance.views", level=logging.ERROR):
-            response = self.client.post(self.url, {"slug": "beta-monthly"})
-        self.assertEqual(response.status_code, 502)
-
-
-@override_settings(**_SETTINGS)
-class ToSAcceptanceLogTests(TestCase):
-    def setUp(self) -> None:
-        self.user = User.objects.create_user(username="u2", email="u2@example.com", password="pw12345!")
-
-    def _fulfill(self, *, consent: dict | None) -> None:
-        session = stripe.checkout.Session.construct_from({
-            "id": "cs_done", "object": "checkout.session", "client_reference_id": str(self.user.id),
-            "payment_status": "unpaid", "consent": consent, "invoice": None,
-        }, _KEY)
-        with patch("fragrance.billing.stripe.checkout.Session.retrieve", return_value=session):
-            fulfill_checkout_session(session_id="cs_done", user=self.user)
-
-    def test_accepted_terms_are_logged_with_the_session_id(self) -> None:
-        with self.assertLogs("fragrance.billing", level=logging.INFO) as logs:
-            self._fulfill(consent={"terms_of_service": "accepted", "promotions": None})
-        self.assertTrue(any("cs_done" in line and "terms of service" in line for line in logs.output))
-
-    def test_no_consent_logs_no_acceptance(self) -> None:
-        with self.assertLogs("fragrance.billing", level=logging.INFO) as logs:
-            self._fulfill(consent=None)
-        self.assertFalse(any("accepted the terms" in line for line in logs.output))

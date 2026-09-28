@@ -1,94 +1,35 @@
-"""
-Tests for the "this wasn't me" email revert: the signed link in the old-address
-notice, POST /api/v1/auth/revert-email/, and billing.revert_customer_email.
-
-Stripe objects are real SDK objects via `construct_from`; only the network calls
-(`stripe.Customer.retrieve`/`modify`) are patched.
-"""
-
 import logging
 from unittest.mock import patch
 
 import stripe
+from celery.exceptions import Retry
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
 from django.core import mail
-from django.core.cache import cache
 from django.core.cache.backends.locmem import LocMemCache
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
-from rest_framework.test import APIClient
-from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
-from rest_framework_simplejwt.tokens import RefreshToken
-
-from .models import StripeEvent, Subscription
-from .services import (
+from fragrance.models import StripeEvent, Subscription
+from fragrance.services import (
     EMAIL_REVERT_MAX_AGE,
     generate_email_revert_token,
     verify_email_revert_token,
 )
-from celery.exceptions import Retry
-
-from .tasks import (
+from fragrance.tasks import (
     process_stripe_event,
     restore_stripe_customer_email,
     send_account_email_change_notice,
     send_email_reverted_notice,
 )
-from .views import FailOpenScopedRateThrottle
-
-_KEY = "sk_test_dummy"
-OLD = "alice@old.example"
-NEW = "attacker@evil.example"
-INVALID_BODY = {"detail": "This link is invalid or has expired."}
-
-
-def _customer(*, email: str) -> stripe.Customer:
-    return stripe.Customer.construct_from({"id": "cus_alice", "object": "customer", "email": email}, _KEY)
-
-
-@override_settings(
-    STRIPE_SECRET_KEY=_KEY,
-    STRIPE_API_VERSION="2026-08-26.dahlia",
-    FRONTEND_URL="https://app.example.test",
-    SUPPORT_EMAIL="help@example.test",
-    DEFAULT_FROM_EMAIL="noreply@example.test",
+from fragrance.tests.support.bases import NEW, OLD, _RevertBase
+from fragrance.tests.support.stripe_fakes import _customer
+from fragrance.views import FailOpenScopedRateThrottle
+from rest_framework_simplejwt.token_blacklist.models import (
+    BlacklistedToken,
+    OutstandingToken,
 )
-class _RevertBase(TestCase):
-    def setUp(self) -> None:
-        cache.clear()
-        self.addCleanup(cache.clear)
-        self.url = reverse("revert_email")
-        self.client = APIClient()
-        # State right after the sync applied the attacker's change.
-        self.user = User.objects.create_user(username="alice", email=NEW, password="pw12345!")
-        Subscription.objects.create(user=self.user, stripe_customer_id="cus_alice")
-        self.token = generate_email_revert_token(user_id=self.user.pk, old_email=OLD, new_email=NEW)
-
-        modify = patch("fragrance.billing.stripe.Customer.modify", return_value=_customer(email=OLD))
-        self.mock_modify = modify.start()
-        self.addCleanup(modify.stop)
-        retrieve = patch("fragrance.billing.stripe.Customer.retrieve", return_value=_customer(email=NEW))
-        self.mock_retrieve = retrieve.start()
-        self.addCleanup(retrieve.stop)
-        restore = patch("fragrance.tasks.restore_stripe_customer_email.delay")
-        self.mock_restore = restore.start()
-        self.addCleanup(restore.stop)
-        notice = patch("fragrance.tasks.send_email_reverted_notice.delay")
-        self.mock_notice = notice.start()
-        self.addCleanup(notice.stop)
-
-    def _post(self, *, token: object = None, **extra):
-        return self.client.post(self.url, {"token": self.token if token is None else token}, format="json", **extra)
-
-    def _email(self) -> str:
-        self.user.refresh_from_db()
-        return self.user.email
-
-    def _assert_invalid(self, response) -> None:
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json(), INVALID_BODY)
+from rest_framework_simplejwt.tokens import RefreshToken
 
 
 class TokenTests(TestCase):
@@ -435,7 +376,7 @@ class RestoreStripeCustomerEmailTaskTests(_RevertBase):
     def test_modifies_stripe_when_customer_still_has_the_attacker_address(self) -> None:
         self._run()
         self.mock_retrieve.assert_called_once_with("cus_alice")
-        self.mock_modify.assert_called_once_with("cus_alice", email=OLD)
+        self.mock_modify.assert_called_once_with("cus_alice", params={"email": OLD})
 
     def test_skips_when_stripe_already_matches_case_insensitively(self) -> None:
         self.mock_retrieve.return_value = _customer(email=OLD.upper())

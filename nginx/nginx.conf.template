@@ -209,11 +209,12 @@ http {
         # via https://groups.google.com/a/lists.stripe.com/g/api-announce — subscribe to it. If
         # the list changes unnoticed, webhooks 403 silently. Two things bound the damage: Stripe's
         # 72-hour retry window, and the nightly `reconcile_stripe_subscriptions` task (03:17 UTC,
-        # fragrance/billing.py) which lists each candidate customer's PAID invoices from the last
-        # 60 days and applies any missed one through the same grant function the webhook uses
-        # (idempotent via ProcessedPayment). It only considers `checkout_started` subscriptions and
-        # `active` ones within ~14 days past expiry, and it never touches `revoked` ones, so an
-        # outage that outlives BOTH windows still needs `manage.py reconcile_stripe` by hand.
+        # fragrance/billing.py). It makes ONE account-wide list of PAID invoices created in the
+        # last 7 days and applies any that are missing from ProcessedPayment through the same
+        # grant function the webhook uses. Customers whose local Subscription is `revoked` are
+        # skipped. Because it runs nightly, a webhook outage alone loses nothing. If
+        # reconciliation itself was also down for more than 7 days, sweep the gap by hand with
+        # `manage.py reconcile_stripe --days N`, and run it with `--dry-run` first.
         #
         # The allowlist decides what REACHES Django. Signature verification decides what is
         # TRUSTED. Neither substitutes for the other.

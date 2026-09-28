@@ -197,7 +197,7 @@ class BetaSignupView(generics.GenericAPIView):
         # footprint than "new to the waitlist," a narrow but real timing
         # signal. This narrows, not closes, that channel: a successful
         # insert still does more index/WAL work than a no-op conflict.
-        BetaSignup.objects.bulk_create(
+        BetaSignup.objects.bulk_create(  # ty: ignore[unresolved-attribute]
             [BetaSignup(email=email, normalized_email=normalized, signup_ip_hash=ip_hash)],
             ignore_conflicts=True,
         )
@@ -256,7 +256,7 @@ class BetaAcceptView(generics.GenericAPIView):
                 # side of an outer join. Fetching it via the accessor below
                 # is a separate, unlocked query -- fine, since only the
                 # BetaSignup row's status transition needs the lock.
-                signup = BetaSignup.objects.select_for_update().get(
+                signup = BetaSignup.objects.select_for_update().get(  # ty: ignore[unresolved-attribute]
                     pk=serializer.validated_data["signup_id"]
                 )
                 # Re-checked under the lock: a concurrent replay of the same
@@ -277,7 +277,7 @@ class BetaAcceptView(generics.GenericAPIView):
                 signup.status = "converted"
                 signup.converted_at = timezone.now()
                 signup.save(update_fields=["status", "converted_at"])
-        except BetaSignup.DoesNotExist:
+        except BetaSignup.DoesNotExist:  # ty: ignore[unresolved-attribute]
             return Response(_BETA_ACCEPT_INVALID_RESPONSE, status=status.HTTP_400_BAD_REQUEST)
 
         refresh = RefreshToken.for_user(user)
@@ -414,7 +414,7 @@ class FragranceViewSet(viewsets.ModelViewSet):
     permission_classes = [HasActiveSubscriptionOrReadOnly]
 
     def get_queryset(self):
-        qs = Fragrance.objects.filter(user=self.request.user)
+        qs = Fragrance.objects.filter(user=self.request.user)  # ty: ignore[unresolved-attribute]
         status = self.request.query_params.get("status")
         if status:
             qs = qs.filter(status=status)
@@ -429,10 +429,10 @@ class PreferenceProfileView(generics.RetrieveAPIView):
 
     def get_object(self):
         try:
-            return PreferenceProfile.objects.filter(
+            return PreferenceProfile.objects.filter(  # ty: ignore[unresolved-attribute]
                 user=self.request.user
             ).latest("generated_at")
-        except PreferenceProfile.DoesNotExist:
+        except PreferenceProfile.DoesNotExist:  # ty: ignore[unresolved-attribute]
             raise NotFound("No preference profile found.")
 
 
@@ -440,7 +440,7 @@ class PreferenceProfileHistoryView(generics.ListAPIView):
     serializer_class = PreferenceProfileSerializer
 
     def get_queryset(self):
-        return PreferenceProfile.objects.filter(
+        return PreferenceProfile.objects.filter(  # ty: ignore[unresolved-attribute]
             user=self.request.user
         ).order_by("-generated_at")
 
@@ -449,7 +449,7 @@ class RecommendationListView(generics.ListAPIView):
     serializer_class = RecommendationSerializer
 
     def get_queryset(self):
-        qs = Recommendation.objects.filter(
+        qs = Recommendation.objects.filter(  # ty: ignore[unresolved-attribute]
             user=self.request.user
         ).select_related("promoted_fragrance")
         if self.request.query_params.get("include_replaced") != "true":
@@ -462,12 +462,12 @@ class RecommendationRunViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [HasActiveSubscriptionOrReadOnly]
 
     def get_queryset(self):
-        return RecommendationRun.objects.filter(
+        return RecommendationRun.objects.filter(  # ty: ignore[unresolved-attribute]
             user=self.request.user
         ).prefetch_related(
             Prefetch(
                 "picks",
-                queryset=Recommendation.objects.filter(
+                queryset=Recommendation.objects.filter(  # ty: ignore[unresolved-attribute]
                     status="confirmed"
                 ).select_related("promoted_fragrance"),
             )
@@ -517,13 +517,17 @@ class RecommendationRunViewSet(viewsets.ReadOnlyModelViewSet):
         # SubscriptionRequired propagates: DRF renders it as the 402 body.
         try:
             task = monthly_fragrance_run.delay(
-                user_id=request.user.id, run_id=run.id
+                user_id=request.user.id, run_id=run.id  # ty: ignore[unresolved-attribute]
             )
         except OperationalError:
             # Broker down: don't leave a 'pending' run that would block this
             # user via the in-flight guard forever. 'failed' doesn't burn quota.
-            run.status = "failed"
-            run.error_message = "Could not queue the run; please try again shortly."
+            # Django noise, not a Stripe params-shape issue: RecommendationRun's
+            # CharField/TextField attributes read to ty as their descriptor
+            # class rather than plain str (no django-stubs installed -- see
+            # [tool.ty] in pyproject.toml).
+            run.status = "failed"  # ty: ignore[invalid-assignment]
+            run.error_message = "Could not queue the run; please try again shortly."  # ty: ignore[invalid-assignment]
             run.save(update_fields=["status", "error_message"])
             return Response(
                 {"detail": "Could not queue the run; please try again shortly."},
@@ -531,12 +535,12 @@ class RecommendationRunViewSet(viewsets.ReadOnlyModelViewSet):
             )
         run.celery_task_id = task.id
         run.save(update_fields=["celery_task_id"])
-        return Response({"run_id": run.id}, status=status.HTTP_202_ACCEPTED)
+        return Response({"run_id": run.id}, status=status.HTTP_202_ACCEPTED)  # ty: ignore[unresolved-attribute]
 
 
 class ExportCollectionView(generics.GenericAPIView):
     def get(self, request) -> HttpResponse:
-        fragrances = Fragrance.objects.filter(user=request.user).order_by('name')
+        fragrances = Fragrance.objects.filter(user=request.user).order_by('name')  # ty: ignore[unresolved-attribute]
 
         output = io.StringIO()
         writer = csv.writer(output)
@@ -656,10 +660,10 @@ class RecommendationConfirmView(APIView):
         if payload is None:
             return None
         try:
-            recommendation = Recommendation.objects.select_related(
+            recommendation = Recommendation.objects.select_related(  # ty: ignore[unresolved-attribute]
                 "promoted_fragrance"
             ).get(id=payload["rid"], user_id=payload["uid"], status="confirmed")
-        except Recommendation.DoesNotExist:
+        except Recommendation.DoesNotExist:  # ty: ignore[unresolved-attribute]
             return None
         return recommendation, payload
 
@@ -797,7 +801,7 @@ class BillingSubscriptionView(generics.GenericAPIView):
 
     def get(self, request: Request) -> Response:
         subscription = (
-            Subscription.objects.select_related("plan").filter(user=request.user).first()
+            Subscription.objects.select_related("plan").filter(user=request.user).first()  # ty: ignore[unresolved-attribute]
             or Subscription(user=request.user)
         )
         return Response(billing.subscription_status_payload(subscription=subscription))
@@ -821,7 +825,7 @@ class BillingSessionView(generics.GenericAPIView):
         # load, and once access is granted (typically by the webhook) every
         # further poll would otherwise cost a Stripe round trip for nothing.
         subscription = (
-            Subscription.objects.select_related("plan")
+            Subscription.objects.select_related("plan")  # ty: ignore[unresolved-attribute]
             .filter(user=request.user)
             .first()
         )
@@ -1034,8 +1038,8 @@ def stripe_webhook(request: HttpRequest) -> HttpResponse:
     sig_header = request.META.get("HTTP_STRIPE_SIGNATURE", "")
 
     try:
-        billing._configure_stripe()
-        event = stripe.Webhook.construct_event(payload, sig_header, settings.STRIPE_WEBHOOK_SECRET)
+        client = billing.get_stripe_client()
+        event = client.construct_event(payload, sig_header, settings.STRIPE_WEBHOOK_SECRET)
     except (ValueError, stripe.SignatureVerificationError, ImproperlyConfigured):
         # Never log the raw body or the Stripe-Signature header here.
         logger.warning("stripe webhook signature verification failed")
@@ -1049,7 +1053,7 @@ def stripe_webhook(request: HttpRequest) -> HttpResponse:
         # the same reasoning as the nested atomic() in
         # billing._grant_period_for_invoice and services.apply_recommendation_rating.
         with transaction.atomic():
-            StripeEvent.objects.create(
+            StripeEvent.objects.create(  # ty: ignore[unresolved-attribute]
                 stripe_event_id=event["id"],
                 event_type=event["type"],
                 stripe_created=datetime.fromtimestamp(event["created"], tz=dt_timezone.utc),
