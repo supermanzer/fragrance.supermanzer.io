@@ -21,3 +21,58 @@ dependencies = [
     "requests>=2.34.2",
     "stripe==15.6.1",
 ]
+
+[dependency-groups]
+dev = [
+    "ty==0.0.84",
+]
+
+# Scoped to the four modules that make synchronous or asynchronous Stripe SDK
+# calls, so this catches real stripe-python *Params TypedDict shape mistakes
+# (see tests/maintenance/test_type_check.py) without drowning that signal in
+# unrelated, untyped Django code project-wide. ty has no django-stubs-style
+# plugin (unlike mypy's separate django-stubs plugin, which ty does not run),
+# so any Django ORM code ty resolves on its own is necessarily inferred from
+# undecorated class bodies -- ".objects", ".DoesNotExist", and Model field
+# descriptors (CharField, TextField, PositiveIntegerField, OneToOneField,
+# ForeignKey) all read, to ty, as their *descriptor* class rather than the
+# plain str/int/User value they resolve to at runtime.
+[tool.ty.src]
+include = [
+    "fragrance/billing.py",
+    "fragrance/views.py",
+    "fragrance/tasks.py",
+    "fragrance/management/commands/configure_stripe_portal.py",
+]
+
+# No [[tool.ty.overrides]] rule-suppression block exists for these four files
+# (2026-09-27, replacing an earlier file-wide `unresolved-attribute = "ignore"`
+# override). That file-wide form covered both the intended Django-ORM noise
+# and any real Stripe-SDK-response attribute typo in the same four files --
+# ty resolves stripe-python's typed SDK return objects precisely enough to
+# catch a genuine typo (e.g. `session.urlxyz` on a `stripe.checkout.Session`),
+# so suppressing the rule file-wide silently reopened that exact detection for
+# the whole file. ty has no rule-scoping mechanism finer than file/glob-level
+# include/exclude (https://docs.astral.sh/ty/reference/configuration), so the
+# only finer-grained tool available is a per-line `# ty: ignore[...]` comment
+# at each genuine false-positive site, which is what both unresolved-attribute
+# and invalid-assignment below now use uniformly.
+#
+# unresolved-attribute: every current instance in these four files (as of
+# 2026-09-27, ~82 sites) was individually reviewed and confirmed to be the
+# Django-descriptor artifact described above (".objects", ".DoesNotExist",
+# FK/User attribute access) -- never a Stripe SDK attribute typo -- and marked
+# with its own inline `# ty: ignore[unresolved-attribute]`.
+# See tests/maintenance/test_type_check.py's
+# test_ty_actually_catches_a_stripe_response_attribute_typo_under_the_real_config
+# for the automated proof that a real Stripe SDK attribute typo in any of
+# these four files is still caught under this project's actual [tool.ty]
+# config, not just in an isolated one.
+#
+# invalid-assignment: the exact rule that flags a wrong-typed value assigned
+# into an already-typed Stripe params TypedDict via subscript
+# (`params["configuration"] = 12345`), which has no other test coverage --
+# autospec only checks call shape, never params contents. Its ~10 genuine
+# Django-noise instances (RecommendationRun.status = "failed", etc., in
+# billing.py, tasks.py and views.py) are each individually reviewed and
+# marked with their own inline `# ty: ignore[invalid-assignment]`.
