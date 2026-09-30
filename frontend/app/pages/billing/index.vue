@@ -744,6 +744,8 @@ const recoveryTerminal = computed(
 )
 const recovering = computed(() => recoveryActive.value && !locked.value && !exempt.value)
 let pollCount = 0
+// Newest failed attempt the user has already seen; only a later attempt may settle as declined again.
+let seenFailedAttemptAt: number | null = null
 let pollTimer: ReturnType<typeof setTimeout> | null = null
 let cancelled = false
 
@@ -829,7 +831,10 @@ function evaluateRecovery(): boolean {
   const pr = sub?.payment_recovery ?? null
   if (pr?.state === 'failed') {
     const started = readMarker()
-    if (started === null || new Date(pr.attempted_at).getTime() >= started - STARTED_AT_TOLERANCE_MS) {
+    const attemptedAt = new Date(pr.attempted_at).getTime()
+    const isNewAttempt = seenFailedAttemptAt === null || attemptedAt > seenFailedAttemptAt
+    if (isNewAttempt && (started === null || attemptedAt >= started - STARTED_AT_TOLERANCE_MS)) {
+      seenFailedAttemptAt = attemptedAt
       settleRecovery('declined')
       return true
     }
@@ -860,6 +865,11 @@ function startRecovery(): void {
 }
 
 function checkAgain(): void {
+  const pr = subscription.value?.payment_recovery
+  if (pr?.state === 'failed') {
+    const seen = new Date(pr.attempted_at).getTime()
+    if (Number.isFinite(seen) && (seenFailedAttemptAt === null || seen > seenFailedAttemptAt)) seenFailedAttemptAt = seen
+  }
   startRecovery()
 }
 

@@ -40,6 +40,12 @@
           <p class="text-caption text-medium-emphasis mb-0 mt-2 text-sm-right">
             Staff only. Starts a run outside the schedule.
           </p>
+          <p
+            v-if="retryBlocksStaff"
+            class="text-caption text-medium-emphasis mb-0 mt-1 text-sm-right"
+          >
+            {{ retryBlockNote }}
+          </p>
         </div>
 
         <div
@@ -162,6 +168,12 @@
               Run now
             </VBtn>
           </LapsedGate>
+          <p
+            v-if="retryBlocksStaff"
+            class="text-caption text-medium-emphasis mt-2 mb-0"
+          >
+            {{ retryBlockNote }}
+          </p>
         </template>
         <template v-else-if="known">
           <p class="text-body-2 text-medium-emphasis mt-1">{{ emptyLine }}</p>
@@ -396,11 +408,11 @@
                         {{ openRationales.has(pick.id) ? 'Hide rationale' : 'Read rationale' }}
                       </VBtn>
                       <VBtn
-                        v-if="pick.search_source_url"
+                        v-if="safeHttpUrl(pick.search_source_url)"
                         size="small"
                         variant="text"
                         prepend-icon="mdi-open-in-new"
-                        :href="pick.search_source_url"
+                        :href="safeHttpUrl(pick.search_source_url) ?? undefined"
                         target="_blank"
                         rel="noopener"
                       >
@@ -527,6 +539,16 @@ const firstRunAvailable = computed(
   () => known.value && !isStaff.value && !isLapsed.value && !anyActive.value && quota.value?.first_run_available === true,
 )
 const nextRunAt = computed(() => quota.value?.next_run_at ?? null)
+
+const retryBlocksStaff = computed(
+  () => isStaff.value && runs.value.some((r) => r.status === 'failed' && r.retry?.state === 'scheduled'),
+)
+const retryBlockNote = 'A retry is scheduled; Run now is unavailable until it finishes.'
+
+function safeHttpUrl(url: string | null | undefined): string | null {
+  if (!url) return null
+  return /^https?:\/\//i.test(url.trim()) ? url.trim() : null
+}
 
 const triggerReason = computed(() => 'A run is already in progress')
 

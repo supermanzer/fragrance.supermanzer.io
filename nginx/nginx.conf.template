@@ -272,6 +272,13 @@ http {
             proxy_set_header   X-Forwarded-Proto $scheme;
         }
 
+        # Nuxt's server-component island endpoint. The app has no server components, and
+        # unauthenticated requests to it are a known DoS/OOM surface (GHSA-9pgf-384g-p7mv,
+        # GHSA-hxcr-hm88-mpq6, GHSA-48hr-524c-v5w3), so it is never proxied.
+        location /__nuxt_island/ {
+            return 404;
+        }
+
         location / {
             set $frontend_upstream http://frontend:3000;
             proxy_pass         $frontend_upstream;
