@@ -33,6 +33,7 @@ from .models import (
     Fragrance,
     FragranceConfig,
     PreferenceProfile,
+    PriceChangeNotice,
     RecommendationRun,
     StripeEvent,
     Subscription,
@@ -45,6 +46,7 @@ from .services import (
     RunFailureOutcome,
     RunInProgress,
     claim_run_retry,
+    format_price,
     generate_beta_invite_token,
     generate_recommendation_token,
     get_or_create_fragrance_config,
@@ -56,6 +58,11 @@ from .services import (
 
 
 logger = logging.getLogger(__name__)
+
+
+# The privacy page promises rejected waitlist entries are deleted after six
+# months; there is no rejected_at column, so age is measured from created_at.
+BETA_SIGNUP_REJECTED_RETENTION_DAYS = 183
 
 
 # Configuration errors: retrying on the same backoff as transient
@@ -314,6 +321,22 @@ def prune_stripe_event_payloads() -> int:
     )
     logger.info('pruned payload from %d StripeEvent rows older than %d days', pruned, STRIPE_EVENT_PAYLOAD_RETENTION_DAYS)
     return pruned
+
+
+@shared_task
+def purge_rejected_beta_signups() -> int:
+    """
+    Nightly: deletes BetaSignup rows with status 'rejected' older than six
+    months, the retention the privacy page states. Other statuses are never
+    touched. Returns the number of rows deleted.
+    """
+    cutoff = timezone.now() - timedelta(days=BETA_SIGNUP_REJECTED_RETENTION_DAYS)
+    _, deleted_by_model = BetaSignup.objects.filter(  # ty: ignore[unresolved-attribute]
+        status='rejected', created_at__lt=cutoff
+    ).delete()
+    purged = deleted_by_model.get('fragrance.BetaSignup', 0)
+    logger.info('purged %d rejected BetaSignup rows older than %d days', purged, BETA_SIGNUP_REJECTED_RETENTION_DAYS)
+    return purged
 
 
 @shared_task
@@ -692,6 +715,54 @@ def send_password_reset_email(self: 'send_password_reset_email', user_id: int) -
         if self.request.retries >= self.max_retries:
             raise
         raise self.retry(exc=exc, countdown=60 * 2 ** self.request.retries)
+
+
+@shared_task(bind=True, max_retries=5)
+def send_price_change_notice_email(self: 'send_price_change_notice_email', notice_id: int, user_id: int) -> None:
+    """
+    One subscriber's copy of a price-change notice, queued per recipient by
+    services.send_price_change_notice so a failed send retries only that
+    recipient. Re-checks at send time that the account is still an unrevoked
+    subscriber of the notice's plan; states the current price, the new price,
+    the effective date and how to cancel. Sent to the account email.
+    """
+    notice = PriceChangeNotice.objects.select_related('plan').filter(pk=notice_id).first()  # ty: ignore[unresolved-attribute]
+    user = User.objects.filter(pk=user_id, is_active=True).exclude(email='').first()
+    if notice is None or user is None:
+        return
+    subscription = Subscription.objects.filter(user_id=user_id).first()  # ty: ignore[unresolved-attribute]
+    if subscription is None or subscription.plan_id != notice.plan_id or subscription.status == 'revoked':
+        return
+    plan = notice.plan
+    context = {
+        'username': user.username,
+        'plan_name': plan.name,
+        'current_price': format_price(
+            amount_cents=notice.current_amount_cents, currency=plan.currency, billing_interval=plan.billing_interval
+        ),
+        'new_price': format_price(
+            amount_cents=notice.new_amount_cents, currency=plan.currency, billing_interval=plan.billing_interval
+        ),
+        'effective_date': notice.effective_date,
+        'billing_url': f"{settings.FRONTEND_URL}/billing",
+        'support_email': settings.SUPPORT_EMAIL,
+    }
+    try:
+        message = EmailMultiAlternatives(
+            subject='Your Fragrance Journey price is changing',
+            body=render_to_string(template_name='fragrance/price_change_notice_email.txt', context=context),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[user.email],
+        )
+        message.attach_alternative(
+            render_to_string(template_name='fragrance/price_change_notice_email.html', context=context),
+            'text/html',
+        )
+        message.send(fail_silently=False)
+    except Exception as exc:
+        if self.request.retries >= self.max_retries:
+            raise
+        raise self.retry(exc=exc, countdown=300)
 
 
 @shared_task(bind=True, max_retries=5)

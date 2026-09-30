@@ -153,6 +153,53 @@ class PreferenceProfile(models.Model):
     search_angle_2 = models.CharField(max_length=500)
 
 
+class PriceChangeNotice(models.Model):
+    """
+    Record of one 30-day price-change notice sent to a Plan's subscribers.
+    It never touches Stripe or `Plan.amount_cents`: the operator creates the
+    new Price/Plan separately, this only tells subscribers what is coming.
+    The unique constraint is what makes a second send of the same notice
+    impossible, however many admins submit it. `current_amount_cents` is the
+    Plan's price at send time, frozen so the record stays true after the
+    Plan is edited. `sent_at` is when the emails were queued.
+    """
+
+    plan = models.ForeignKey(
+        Plan, on_delete=models.PROTECT, related_name="price_change_notices"
+    )
+    current_amount_cents = models.PositiveIntegerField(editable=False)
+    new_amount_cents = models.PositiveIntegerField(
+        help_text="New price in the smallest currency unit (cents), in the plan's currency."
+    )
+    effective_date = models.DateField(
+        help_text="First day the new price applies. Must be at least 30 days from today."
+    )
+    sent_at = models.DateTimeField(null=True, blank=True, editable=False)
+    recipient_count = models.PositiveIntegerField(default=0, editable=False)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        editable=False,
+        related_name="price_change_notices",
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["plan", "new_amount_cents", "effective_date"],
+                name="unique_price_change_notice",
+                violation_error_message=(
+                    "A notice for this plan, price and effective date has already been sent."
+                ),
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.plan.slug}: {self.new_amount_cents} effective {self.effective_date}"
+
+
 class RecommendationRun(models.Model):
     """
     Executed recommendation generation event. One row per retry chain: a

@@ -7,6 +7,7 @@ from django.db import transaction
 from django.db.models import QuerySet
 from django.forms import ModelForm
 from django.http import HttpRequest, HttpResponse, HttpResponseRedirect
+from django.urls import reverse
 from django.utils import timezone
 
 from . import billing
@@ -19,6 +20,7 @@ from .models import (
     FragranceConfig,
     Plan,
     PreferenceProfile,
+    PriceChangeNotice,
     ProcessedPayment,
     Recommendation,
     RecommendationRun,
@@ -27,9 +29,13 @@ from .models import (
 )
 from .services import (
     MAX_RUN_DAY_OF_MONTH,
+    PriceChangeNoticeError,
     default_schedule_for,
     derive_unique_username,
     get_or_create_fragrance_config,
+    price_change_notice_problems,
+    price_change_recipients,
+    send_price_change_notice,
 )
 
 # Register your models here.
@@ -67,6 +73,27 @@ class PlanAdminForm(forms.ModelForm):
         )
         if problems:
             self.add_error("stripe_price_id", problems)
+        return cleaned_data
+
+
+class PriceChangeNoticeAdminForm(forms.ModelForm):
+    """Runs the same refusal rules as the send itself, so a bad date or price is a field error, not a failed send."""
+
+    class Meta:
+        model = PriceChangeNotice
+        fields = ("plan", "new_amount_cents", "effective_date")
+
+    def clean(self) -> dict:
+        cleaned_data = super().clean()
+        plan = cleaned_data.get("plan")
+        new_amount_cents = cleaned_data.get("new_amount_cents")
+        effective_date = cleaned_data.get("effective_date")
+        if plan is None or new_amount_cents is None or effective_date is None:
+            return cleaned_data
+        for problem in price_change_notice_problems(
+            plan=plan, new_amount_cents=new_amount_cents, effective_date=effective_date
+        ):
+            self.add_error(None, problem)
         return cleaned_data
 
 
@@ -358,6 +385,7 @@ class PlanAdmin(admin.ModelAdmin):
     form = PlanAdminForm
     list_display = ("slug", "name", "amount_cents", "billing_interval", "is_active")
     list_filter = ("is_active", "billing_interval")
+    actions = ["send_price_change_notice_action"]
 
     def get_readonly_fields(self, request: HttpRequest, obj: Plan | None = None) -> tuple[str, ...]:
         # An edited price id silently stops every current subscriber's
@@ -367,6 +395,86 @@ class PlanAdmin(admin.ModelAdmin):
         if obj is not None:
             return (*readonly, "stripe_price_id")
         return readonly
+
+    @admin.action(description="Send a 30-day price-change notice to this plan's subscribers...")
+    def send_price_change_notice_action(
+        self, request: HttpRequest, queryset: QuerySet[Plan]
+    ) -> HttpResponse | None:
+        """
+        Opens the notice form for exactly one plan (prefilled), where the new
+        price and effective date are entered; nothing is sent from here.
+        """
+        if not request.user.has_perm("fragrance.add_pricechangenotice"):
+            self.message_user(request, "You may not send price-change notices.", level=messages.ERROR)
+            return None
+        if queryset.count() != 1:
+            self.message_user(request, "Select exactly one plan.", level=messages.ERROR)
+            return None
+        plan = queryset.get()
+        self.message_user(
+            request,
+            f"{price_change_recipients(plan=plan).count()} active subscriber(s) on {plan} would receive the notice.",
+            level=messages.INFO,
+        )
+        return HttpResponseRedirect(f"{reverse('admin:fragrance_pricechangenotice_add')}?plan={plan.pk}")
+
+
+@admin.register(PriceChangeNotice)
+class PriceChangeNoticeAdmin(admin.ModelAdmin):
+    """
+    Add-only: saving the add form sends the notice (one email per active
+    subscriber of the plan) and records it. Sent notices are a permanent
+    record: view only, never edited or deleted. Changes nothing at Stripe.
+    """
+
+    form = PriceChangeNoticeAdminForm
+    list_display = (
+        "plan", "current_amount_cents", "new_amount_cents", "effective_date", "sent_at", "recipient_count",
+    )
+    list_filter = ("plan",)
+    readonly_fields = (
+        "plan", "current_amount_cents", "new_amount_cents", "effective_date", "sent_at",
+        "recipient_count", "created_by",
+    )
+
+    def get_readonly_fields(
+        self, request: HttpRequest, obj: PriceChangeNotice | None = None
+    ) -> tuple[str, ...]:
+        return self.readonly_fields if obj is not None else ()
+
+    def has_change_permission(self, request: HttpRequest, obj: PriceChangeNotice | None = None) -> bool:
+        return False
+
+    def has_delete_permission(self, request: HttpRequest, obj: PriceChangeNotice | None = None) -> bool:
+        return False
+
+    def log_addition(self, request: HttpRequest, obj: PriceChangeNotice, message: object) -> object:
+        if obj.pk is None:
+            return None
+        return super().log_addition(request, obj, message)
+
+    def response_add(
+        self, request: HttpRequest, obj: PriceChangeNotice, post_url_continue: str | None = None
+    ) -> HttpResponse:
+        if obj.pk is None:
+            return HttpResponseRedirect(reverse("admin:fragrance_pricechangenotice_changelist"))
+        return super().response_add(request, obj, post_url_continue)
+
+    def save_model(
+        self, request: HttpRequest, obj: PriceChangeNotice, form: ModelForm, change: bool
+    ) -> None:
+        try:
+            send_price_change_notice(notice=obj, created_by=request.user)
+        except PriceChangeNoticeError as exc:
+            self.message_user(
+                request, f"Notice NOT sent: {'; '.join(exc.problems)}", level=messages.ERROR
+            )
+            return
+        self.message_user(
+            request,
+            f"Price-change notice queued for {obj.recipient_count} subscriber(s) of {obj.plan}.",
+            level=messages.SUCCESS,
+        )
 
 
 @admin.register(PreferenceProfile)

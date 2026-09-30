@@ -1,0 +1,19 @@
+{% autoescape off %}Hi {{ username }},
+
+We're changing the price of your Fragrance Journey subscription ({{ plan_name }}).
+
+Current price: {{ current_price }}
+New price: {{ new_price }}
+Effective: {{ effective_date|date:"F j, Y" }}
+
+Nothing changes until that date, and you don't need to do anything to continue at the new price.
+
+If you'd rather not continue at the new price, you can cancel before {{ effective_date|date:"F j, Y" }}. Open the Billing page, choose "Manage billing" to reach the payment portal, and cancel your subscription there:
+
+{{ billing_url }}
+
+Cancelling stops future charges; you keep access through the period you've already paid for.
+
+Questions? Contact us at {{ support_email }}.
+
+— Fragrance Journey{% endautoescape %}

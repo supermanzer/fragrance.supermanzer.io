@@ -2,7 +2,7 @@ import csv
 import hashlib
 import hmac
 import logging
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from datetime import timezone as dt_timezone
 from typing import IO, Literal
 from zoneinfo import ZoneInfo
@@ -11,7 +11,7 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.core import signing
 from django.db import IntegrityError, transaction
-from django.db.models import F, Q
+from django.db.models import F, Q, QuerySet
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.utils.text import slugify
@@ -24,6 +24,7 @@ from .models import (
     Fragrance,
     FragranceConfig,
     Plan,
+    PriceChangeNotice,
     Recommendation,
     RecommendationRun,
     Subscription,
@@ -87,6 +88,11 @@ MAX_RUN_DAY_OF_MONTH = 28
 # Automatic retries after a failed first attempt: one chain is at most
 # MAX_RUN_RETRIES + 1 attempts, all on one RecommendationRun row.
 MAX_RUN_RETRIES = 4
+
+
+# Notice a subscriber is owed before a price rise: an effective date closer
+# than this is refused, in the admin form and again at send time.
+PRICE_CHANGE_NOTICE_MIN_DAYS = 30
 
 
 RECOMMENDATION_FEEDBACK_MAX_AGE = 60 * 60 * 24 * 90  # 90 days
@@ -167,6 +173,14 @@ class BetaInviteTokenInvalidError(BetaInviteTokenError):
     other than 'approved' or 'converted'), or invited_user missing/inactive/
     mismatched. Maps to 400 {"code": "invalid_or_expired"}.
     """
+
+
+class PriceChangeNoticeError(Exception):
+    """A price-change notice was refused; `problems` are admin-readable reasons."""
+
+    def __init__(self, *, problems: list[str]) -> None:
+        super().__init__("; ".join(problems))
+        self.problems = problems
 
 
 class QuotaExceeded(Exception):
@@ -339,6 +353,12 @@ def derive_unique_username(*, email: str) -> str:
         suffix += 1
         candidate = f"{base}_{suffix}"[:_MAX_USERNAME_LENGTH]
     return candidate
+
+
+def format_price(*, amount_cents: int, currency: str, billing_interval: str) -> str:
+    """Human-readable price for notices, e.g. "$4.00 per month" or "EUR 40.00 per year"."""
+    symbol = "$" if currency.lower() == "usd" else f"{currency.upper()} "
+    return f"{symbol}{amount_cents / 100:.2f} per {billing_interval}"
 
 
 def generate_beta_invite_token(*, signup: BetaSignup) -> str:
@@ -518,6 +538,41 @@ def normalize_email(*, email: str) -> str:
     return f"{local}@{domain}"
 
 
+def price_change_notice_problems(
+    *, plan: Plan, new_amount_cents: int, effective_date: date, today: date | None = None
+) -> list[str]:
+    """Reasons a notice must not go out; empty means it may. Shared by the admin form and the send."""
+    today = today or timezone.localdate()
+    earliest = today + timedelta(days=PRICE_CHANGE_NOTICE_MIN_DAYS)
+    problems: list[str] = []
+    if effective_date < earliest:
+        problems.append(
+            f"The effective date must be at least {PRICE_CHANGE_NOTICE_MIN_DAYS} days from today "
+            f"(no earlier than {earliest.isoformat()})."
+        )
+    if new_amount_cents <= 0:
+        problems.append("The new price must be greater than zero.")
+    elif new_amount_cents == plan.amount_cents:
+        problems.append("The new price is the same as the plan's current price.")
+    return problems
+
+
+def price_change_recipients(*, plan: Plan) -> QuerySet[User]:
+    """
+    Subscribers a notice on this plan goes to: active, unexpired access on the
+    plan and a usable address. Revoked (disputed) accounts, lapsed or
+    never-paid ones, and staff (exempt from billing) are skipped.
+    """
+    return User.objects.filter(
+        is_active=True,
+        is_staff=False,
+        is_superuser=False,
+        subscription__plan=plan,
+        subscription__status="active",
+        subscription__access_expires_at__gt=timezone.now(),
+    ).exclude(email="")
+
+
 def quota_snapshot(*, user: User, subscription: Subscription | None) -> dict:
     """
     Frontend-facing quota state. Read-only: no writes, no locks.
@@ -622,6 +677,48 @@ def resolve_beta_invite_signup(*, token: str) -> BetaSignup:
         raise BetaInviteTokenInvalidError()
 
     return signup
+
+
+def send_price_change_notice(*, notice: PriceChangeNotice, created_by: User | None) -> PriceChangeNotice:
+    """
+    Validates, records and queues a price-change notice: one email task per
+    recipient, queued only after the record commits. The plan row is locked
+    so the "current price" frozen on the notice cannot race an edit, and the
+    unique constraint turns a concurrent duplicate into PriceChangeNoticeError.
+    Changes nothing at Stripe and does not edit the Plan.
+    """
+    from .tasks import send_price_change_notice_email
+
+    with transaction.atomic():
+        plan = Plan.objects.select_for_update().get(pk=notice.plan_id)
+        problems = price_change_notice_problems(
+            plan=plan, new_amount_cents=notice.new_amount_cents, effective_date=notice.effective_date
+        )
+        if problems:
+            raise PriceChangeNoticeError(problems=problems)
+        user_ids = list(price_change_recipients(plan=plan).values_list("id", flat=True))
+        notice.current_amount_cents = plan.amount_cents
+        notice.recipient_count = len(user_ids)
+        notice.sent_at = timezone.now()
+        notice.created_by = created_by
+        try:
+            with transaction.atomic():
+                notice.save(force_insert=True)
+        except IntegrityError:
+            raise PriceChangeNoticeError(
+                problems=["A notice for this plan, price and effective date has already been sent."]
+            )
+
+        def queue_emails() -> None:
+            for user_id in user_ids:
+                try:
+                    send_price_change_notice_email.delay(notice_id=notice.pk, user_id=user_id)
+                except Exception:
+                    logger.exception("could not queue price-change notice %s for user %s", notice.pk, user_id)
+
+        transaction.on_commit(queue_emails)
+    logger.info("price-change notice %s recorded: %d recipient(s)", notice.pk, notice.recipient_count)
+    return notice
 
 
 def stale_in_flight_runs(*, now: datetime):

@@ -30,6 +30,10 @@ app.conf.beat_schedule = {
         "task": "fragrance.tasks.send_operator_failure_digest",
         "schedule": crontab(minute=23, hour="*/4"),
     },
+    "system-purge-rejected-beta-signups": {
+        "task": "fragrance.tasks.purge_rejected_beta_signups",
+        "schedule": crontab(minute=53, hour=4),
+    },
     "system-reconcile-stripe": {
         "task": "fragrance.tasks.reconcile_stripe_subscriptions",
         "schedule": crontab(minute=17, hour=3),
