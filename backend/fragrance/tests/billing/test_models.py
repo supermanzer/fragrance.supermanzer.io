@@ -1,17 +1,10 @@
 from datetime import timedelta
-from io import StringIO
 
 from django.contrib.auth.models import User
-from django.core.management import call_command
-from django.core.management.base import CommandError
 from django.test import TestCase, override_settings
 from django.utils import timezone
-from fragrance.models import BetaSignup, Plan, Subscription
-from fragrance.tests.support.stripe_fakes import (
-    _STRIPE_TEST_SETTINGS,
-    _sdk_invoice,
-    _sdk_line,
-)
+from fragrance.models import Plan, Subscription
+from fragrance.tests.support.stripe_fakes import _STRIPE_TEST_SETTINGS
 from rest_framework.test import APIClient
 
 
@@ -23,7 +16,6 @@ class PlanModelTests(TestCase):
             stripe_price_id="price_test_monthly",
             amount_cents=400,
             billing_interval="month",
-            access_days_granted=30,
         )
         annual = Plan.objects.create(
             name="Beta Annual",
@@ -31,13 +23,11 @@ class PlanModelTests(TestCase):
             stripe_price_id="price_test_annual",
             amount_cents=4400,
             billing_interval="year",
-            access_days_granted=365,
         )
         # Usage terms must not follow billing terms -- an annual subscriber
         # gets one run per 30 days, not twelve on the first of January.
         self.assertEqual(monthly.quota_period_days, annual.quota_period_days)
         self.assertEqual(monthly.max_runs_per_quota_period, annual.max_runs_per_quota_period)
-        self.assertNotEqual(monthly.access_days_granted, annual.access_days_granted)
         self.assertNotEqual(monthly.billing_interval, annual.billing_interval)
 
 
@@ -76,107 +66,6 @@ class SubscriptionHasActiveAccessTests(TestCase):
         self.assertFalse(sub.has_active_access)
 
 
-class SeedPlansCommandTests(TestCase):
-    def test_creates_both_plans(self) -> None:
-        out = StringIO()
-        call_command(
-            "seed_plans",
-            "--monthly-price-id=price_mo",
-            "--annual-price-id=price_yr",
-            stdout=out,
-        )
-        monthly = Plan.objects.get(slug="beta-monthly")
-        annual = Plan.objects.get(slug="beta-annual")
-        self.assertEqual(monthly.stripe_price_id, "price_mo")
-        self.assertEqual(annual.stripe_price_id, "price_yr")
-        self.assertEqual(monthly.billing_interval, "month")
-        self.assertEqual(annual.billing_interval, "year")
-        self.assertEqual(monthly.access_days_granted, 30)
-        self.assertEqual(annual.access_days_granted, 365)
-        self.assertEqual(monthly.quota_period_days, 30)
-        self.assertEqual(annual.quota_period_days, 30)
-        self.assertEqual(monthly.max_runs_per_quota_period, 1)
-        self.assertEqual(annual.max_runs_per_quota_period, 1)
-
-    def test_rerun_with_same_price_id_updates_other_fields_in_place(self) -> None:
-        call_command("seed_plans", "--monthly-price-id=price_mo", "--annual-price-id=price_yr")
-        Plan.objects.filter(slug="beta-monthly").update(name="stale name", amount_cents=1)
-        call_command("seed_plans", "--monthly-price-id=price_mo", "--annual-price-id=price_yr")
-        self.assertEqual(Plan.objects.filter(slug="beta-monthly").count(), 1)
-        monthly = Plan.objects.get(slug="beta-monthly")
-        self.assertEqual(monthly.stripe_price_id, "price_mo")
-        self.assertEqual(monthly.name, "Beta Monthly")
-        self.assertEqual(monthly.amount_cents, 400)
-
-    def test_same_price_id_for_both_plans_raises(self) -> None:
-        with self.assertRaises(CommandError):
-            call_command("seed_plans", "--monthly-price-id=same", "--annual-price-id=same")
-
-    def test_rerun_with_different_price_without_rotate_flag_refuses(self) -> None:
-        call_command("seed_plans", "--monthly-price-id=price_mo", "--annual-price-id=price_yr")
-        with self.assertRaises(CommandError):
-            call_command("seed_plans", "--monthly-price-id=price_mo2", "--annual-price-id=price_yr")
-        # Refused, so nothing was changed: still one row, still on the old price.
-        self.assertEqual(Plan.objects.filter(slug="beta-monthly").count(), 1)
-        self.assertEqual(Plan.objects.get(slug="beta-monthly").stripe_price_id, "price_mo")
-
-    def test_rotate_price_retires_old_row_and_creates_new_active_one(self) -> None:
-        call_command("seed_plans", "--monthly-price-id=price_mo", "--annual-price-id=price_yr")
-        call_command(
-            "seed_plans",
-            "--monthly-price-id=price_mo2",
-            "--annual-price-id=price_yr",
-            "--rotate-price",
-        )
-        active = Plan.objects.get(slug="beta-monthly")
-        self.assertEqual(active.stripe_price_id, "price_mo2")
-        self.assertTrue(active.is_active)
-
-        retired = Plan.objects.exclude(pk=active.pk).get(stripe_price_id="price_mo")
-        self.assertFalse(retired.is_active)
-        self.assertNotEqual(retired.slug, "beta-monthly")
-        self.assertTrue(retired.slug.startswith("beta-monthly-retired-"))
-
-    def test_rotate_price_old_row_still_matches_renewals(self) -> None:
-        from fragrance.billing import _grant_period_for_invoice
-
-        call_command("seed_plans", "--monthly-price-id=price_mo", "--annual-price-id=price_yr")
-        call_command(
-            "seed_plans",
-            "--monthly-price-id=price_mo2",
-            "--annual-price-id=price_yr",
-            "--rotate-price",
-        )
-        user = User.objects.create_user(username="rotated", email="rotated@example.com")
-        BetaSignup.objects.create(
-            email="rotated@example.com", normalized_email="rotated@example.com",
-            status="converted", invited_user=user,
-        )
-        subscription = Subscription.objects.create(user=user, stripe_customer_id="cus_rot")
-        invoice = _sdk_invoice(
-            invoice_id="in_rot_1", customer_id="cus_rot", subscription_id="sub_rot",
-            amount_paid=400,
-            lines=[_sdk_line(price_id="price_mo", period_end=int(timezone.now().timestamp()) + 30 * 86400)],
-        )
-        self.assertTrue(_grant_period_for_invoice(invoice=invoice))
-        subscription.refresh_from_db()
-        self.assertTrue(subscription.has_active_access)
-
-    def test_rotate_price_checkout_offers_only_the_new_price(self) -> None:
-        from fragrance.billing import get_active_plans
-
-        call_command("seed_plans", "--monthly-price-id=price_mo", "--annual-price-id=price_yr")
-        call_command(
-            "seed_plans",
-            "--monthly-price-id=price_mo2",
-            "--annual-price-id=price_yr",
-            "--rotate-price",
-        )
-        offered_price_ids = {p.stripe_price_id for p in get_active_plans()}
-        self.assertIn("price_mo2", offered_price_ids)
-        self.assertNotIn("price_mo", offered_price_ids)
-
-
 @override_settings(**_STRIPE_TEST_SETTINGS)
 class BillingConfigurationTests(TestCase):
     """Fail-fast guard for missing Stripe credentials, mirroring the ANTHROPIC_API_KEY precedent."""
@@ -187,10 +76,71 @@ class BillingConfigurationTests(TestCase):
         self.client.force_authenticate(user=self.user)
         Plan.objects.create(
             name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
-            amount_cents=400, billing_interval="month", access_days_granted=30,
+            amount_cents=400, billing_interval="month",
         )
 
     @override_settings(STRIPE_SECRET_KEY="")
     def test_checkout_returns_503_when_stripe_not_configured(self) -> None:
         response = self.client.post("/api/v1/billing/checkout/", {"slug": "beta-monthly"})
         self.assertEqual(response.status_code, 503)
+
+
+class PlanlessSubscriptionTests(TestCase):
+    """
+    Approval no longer assigns a plan, so every reader of Subscription.plan
+    must cope with None before the first payment: the status payload (plan
+    already null for never-subscribed users), quota_snapshot and _quota_terms.
+    """
+
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(
+            username="planless", email="planless@example.com", password="pw12345!"
+        )
+        self.subscription = Subscription.objects.create(user=self.user, status="none")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_status_payload_has_null_plan_and_lapsed_quota(self) -> None:
+        response = self.client.get("/api/v1/billing/subscription/")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertIsNone(body["plan"])
+        self.assertEqual(body["status"], "none")
+        self.assertFalse(body["has_active_access"])
+        self.assertEqual(body["quota"]["runs_allowed"], 0)
+        self.assertFalse(body["quota"]["can_trigger"])
+
+    def test_quota_terms_fall_back_to_the_defaults_without_a_plan(self) -> None:
+        from fragrance.services import (
+            DEFAULT_FAILED_RUN_GRACE,
+            DEFAULT_MAX_RUNS_PER_QUOTA_PERIOD,
+            DEFAULT_QUOTA_PERIOD_DAYS,
+            _quota_terms,
+        )
+
+        self.assertEqual(
+            _quota_terms(plan=None),
+            (
+                timedelta(days=DEFAULT_QUOTA_PERIOD_DAYS),
+                DEFAULT_MAX_RUNS_PER_QUOTA_PERIOD,
+                DEFAULT_FAILED_RUN_GRACE,
+            ),
+        )
+
+    def test_active_plan_less_subscription_can_trigger_under_default_terms(self) -> None:
+        from fragrance.services import quota_snapshot
+
+        Subscription.objects.filter(pk=self.subscription.pk).update(
+            status="active", access_expires_at=timezone.now() + timedelta(days=5)
+        )
+        self.subscription.refresh_from_db()
+
+        snapshot = quota_snapshot(user=self.user, subscription=self.subscription)
+
+        self.assertEqual(snapshot["runs_allowed"], 1)
+        self.assertTrue(snapshot["can_trigger"])
+
+    def test_first_status_poll_after_approval_shows_no_plan_without_an_error(self) -> None:
+        # The frontend contract: plan is null until the first grant sets it.
+        self.assertIsNone(self.client.get("/api/v1/billing/subscription/").json()["plan"])

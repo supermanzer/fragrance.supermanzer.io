@@ -197,7 +197,8 @@ class ConfigureStripePortalCommandTests(StripeClientTestCase):
         cancel = features["subscription_cancel"]
         self.assertEqual((cancel["enabled"], cancel["mode"], cancel["proration_behavior"]), (True, "at_period_end", "none"))
         self.assertFalse(features["subscription_update"]["enabled"])
-        self.assertFalse(features["subscription_pause"]["enabled"])
+        # Not a key of Stripe's portal Configuration Features; it must not be sent.
+        self.assertNotIn("subscription_pause", features)
         self.assertFalse(params["login_page"]["enabled"])
         self.assertEqual(params["business_profile"]["headline"], "Manage your Fragrances subscription")
         self.assertEqual(params["business_profile"]["terms_of_service_url"], "https://app.example.test/terms")

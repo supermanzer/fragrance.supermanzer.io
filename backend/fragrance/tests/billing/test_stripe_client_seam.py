@@ -16,6 +16,7 @@ across an SDK upgrade.
 
 import json
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import requests
@@ -25,7 +26,7 @@ from django.core.exceptions import ImproperlyConfigured
 from django.core.management import call_command
 from django.test import TestCase, override_settings
 from fragrance import billing
-from fragrance.models import Plan, Subscription
+from fragrance.models import Subscription
 from fragrance.tests.support.factories import _active_user, _make_plans
 from fragrance.tests.support.stripe_fakes import (
     _BILLING_CHANGES_SETTINGS as _SETTINGS,
@@ -46,6 +47,7 @@ from fragrance.tests.support.stripe_fakes import (
     build_fake_stripe_client,
     patch_stripe_clients,
 )
+from requests.structures import CaseInsensitiveDict
 from rest_framework.test import APIClient
 
 
@@ -247,6 +249,118 @@ class StripeClientConstructionTests(TestCase):
         self._assert_globals_untouched()
 
 
+class _FakeStripeServer:
+    """
+    Stands in for api.stripe.com at the requests layer (requests.Session.request),
+    with Stripe's server-side idempotency: the first request carrying a given
+    Idempotency-Key creates a Customer and stores the response body; any later
+    request with the same key gets that stored body back and creates nothing.
+
+    lose_responses=N makes the first N wire calls raise requests' Timeout AFTER
+    the server has processed them -- the worst case for a retry: the request
+    reached Stripe, the response was lost.
+    """
+
+    def __init__(self, *, lose_responses: int = 0) -> None:
+        self.lose_responses = lose_responses
+        self.wire_calls: list[dict] = []
+        self.customers_created = 0
+        self._stored_by_key: dict[str, str] = {}
+
+    def handle(self, session, method, url, **kwargs):
+        headers = kwargs["headers"]
+        key = headers.get("Idempotency-Key")
+        self.wire_calls.append(
+            {"method": method, "url": url, "idempotency_key": key, "timeout": kwargs.get("timeout")}
+        )
+        if key not in self._stored_by_key:
+            self.customers_created += 1
+            self._stored_by_key[key] = json.dumps(
+                {"id": f"cus_srv_{self.customers_created}", "object": "customer"}
+            )
+        if len(self.wire_calls) <= self.lose_responses:
+            raise requests.exceptions.Timeout("simulated: response lost after the server processed it")
+        return SimpleNamespace(
+            content=self._stored_by_key[key], status_code=200, headers=CaseInsensitiveDict()
+        )
+
+
+@contextmanager
+def _fake_stripe_server(*, lose_responses: int = 0):
+    server = _FakeStripeServer(lose_responses=lose_responses)
+    with patch.object(
+        requests.Session, "request", autospec=True, side_effect=server.handle
+    ), patch("stripe._http_client.time.sleep", return_value=None):
+        yield server
+
+
+@override_settings(STRIPE_SECRET_KEY="sk_test_retry", STRIPE_API_VERSION="2026-08-26.dahlia")
+class CustomerCreateRetryWireTests(TestCase):
+    """
+    Checkout's interactive client has 0 retries, but _get_or_create_customer
+    grants customers.create ONE retry via the per-request max_network_retries
+    option. What makes that safe is that the SDK reuses one Idempotency-Key
+    across the attempts of a single call; proven here on the wire, against a
+    server that models Stripe's idempotency, never by reading SDK internals.
+    """
+
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="retrier", email="retrier@example.com")
+        self.subscription = Subscription.objects.create(user=self.user)
+
+    def _create(self) -> str:
+        return billing._get_or_create_customer(
+            user=self.user,
+            subscription=self.subscription,
+            client=billing.get_interactive_stripe_client(),
+        )
+
+    def test_timeout_then_success_creates_exactly_one_customer_under_one_idempotency_key(self) -> None:
+        with _fake_stripe_server(lose_responses=1) as server:
+            customer_id = self._create()
+
+        self.assertEqual(len(server.wire_calls), 2)
+        keys = [call["idempotency_key"] for call in server.wire_calls]
+        self.assertTrue(keys[0])
+        self.assertEqual(keys[0], keys[1])
+        self.assertTrue(all(call["url"].endswith("/v1/customers") for call in server.wire_calls))
+        self.assertTrue(all(call["timeout"] == (3.05, 10) for call in server.wire_calls))
+        self.assertEqual(server.customers_created, 1)
+        self.assertEqual(customer_id, "cus_srv_1")
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.stripe_customer_id, "cus_srv_1")
+
+    def test_retry_budget_is_exactly_one(self) -> None:
+        with _fake_stripe_server(lose_responses=2) as server:
+            with self.assertRaises(stripe.APIConnectionError):
+                self._create()
+
+        self.assertEqual(len(server.wire_calls), 2)
+        self.assertEqual(server.wire_calls[0]["idempotency_key"], server.wire_calls[1]["idempotency_key"])
+        self.assertEqual(server.customers_created, 1)
+        self.subscription.refresh_from_db()
+        self.assertIsNone(self.subscription.stripe_customer_id)
+
+    def test_a_separate_call_gets_a_fresh_idempotency_key(self) -> None:
+        with _fake_stripe_server() as server:
+            client = billing.get_interactive_stripe_client()
+            client.v1.customers.create(params={"email": "a@example.test"})
+            client.v1.customers.create(params={"email": "b@example.test"})
+
+        keys = [call["idempotency_key"] for call in server.wire_calls]
+        self.assertEqual(len(set(keys)), 2)
+
+    def test_other_interactive_calls_still_get_no_retry(self) -> None:
+        with _fake_stripe_server(lose_responses=5) as server:
+            client = billing.get_interactive_stripe_client()
+            with self.assertRaises(stripe.APIConnectionError):
+                client.v1.checkout.sessions.create(params={"mode": "subscription"})
+            with self.assertRaises(stripe.APIConnectionError):
+                client.v1.customers.create(params={"email": "no-retry@example.test"})
+
+        self.assertEqual(len(server.wire_calls), 2)
+
+
 @override_settings(**_SETTINGS)
 class WhichClientIsUsedTests(TestCase):
     """
@@ -429,58 +543,14 @@ class DefaultOnlyEndpointsNeverUseTheInteractiveClientTests(TestCase):
     Checkout (create_checkout_session) and the session fallback
     (fulfill_checkout_session) moved to the interactive client on
     2026-09-27 (see the request-path rule documented above
-    billing._INTERACTIVE_HTTP_CLIENT): BillingCheckoutView.post and
-    BillingSessionView.get both run synchronously inside a gunicorn request.
-    Their two test methods below keep their original, now-inaccurate names
-    ONLY because of this project's Class.method test-ID superset rule --
-    see WhichClientIsUsedTests.test_create_checkout_session_uses_the_interactive_client_only,
-    WhichClientIsUsedTests.test_fulfill_checkout_session_uses_the_interactive_client_only,
-    and their WhichClientIsUsedOverHTTPTests twins for the correctly named,
-    currently-accurate coverage of the same two functions. Whether the two
-    misnamed methods below may be deleted is an operator decision, not made
-    here.
+    billing._INTERACTIVE_HTTP_CLIENT); they are covered, under accurate
+    names, by WhichClientIsUsedTests and WhichClientIsUsedOverHTTPTests.
     """
 
     def setUp(self) -> None:
         self._cm = patch_stripe_clients()
         self.stripe, self.mock_default, self.mock_interactive = self._cm.__enter__()
         self.addCleanup(self._cm.__exit__, None, None, None)
-
-    @override_settings(**_STRIPE_TEST_SETTINGS)
-    def test_create_checkout_session_never_uses_the_interactive_client(self) -> None:
-        """
-        Name predates the 2026-09-27 request-path rule -- create_checkout_session
-        now uses the interactive client exclusively. Kept, with its body
-        flipped to match, only for the test-ID superset rule; see the class
-        docstring for the accurately named twin.
-        """
-        plan = Plan.objects.create(
-            name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
-            amount_cents=400, billing_interval="month", access_days_granted=30,
-        )
-        user = User.objects.create_user(username="checkoutwhich", email="checkoutwhich@example.com")
-        self.stripe.v1.customers.create.return_value = _customer(email=user.email)
-        self.stripe.v1.checkout.sessions.create.return_value = _session(url="https://checkout.stripe.com/x")
-        billing.create_checkout_session(user=user, plan_slug=plan.slug)
-        self.mock_interactive.assert_called()
-        self.mock_default.assert_not_called()
-
-    @override_settings(**_STRIPE_TEST_SETTINGS)
-    def test_fulfill_checkout_session_never_uses_the_interactive_client(self) -> None:
-        """
-        Name predates the 2026-09-27 request-path rule -- fulfill_checkout_session
-        now uses the interactive client exclusively. Kept, with its body
-        flipped to match, only for the test-ID superset rule; see the class
-        docstring for the accurately named twin.
-        """
-        user = User.objects.create_user(username="sessionwhich", email="sessionwhich@example.com")
-        Subscription.objects.create(user=user, stripe_customer_id="cus_sw")
-        self.stripe.v1.checkout.sessions.retrieve.return_value = _session(
-            client_reference_id=str(user.id), customer="cus_sw", invoice=None, subscription=None,
-        )
-        billing.fulfill_checkout_session(session_id="cs_seam", user=user)
-        self.mock_interactive.assert_called()
-        self.mock_default.assert_not_called()
 
     @override_settings(**_STRIPE_TEST_SETTINGS)
     def test_reconcile_subscriptions_never_uses_the_interactive_client(self) -> None:
@@ -499,6 +569,7 @@ class DefaultOnlyEndpointsNeverUseTheInteractiveClientTests(TestCase):
             customer="cus_dispute_which"
         )
         self.stripe.v1.subscriptions.list.return_value = _list_object(data=[])
+        self.stripe.v1.checkout.sessions.list.return_value = _list_object(data=[])
         billing.revoke_for_dispute(dispute={"payment_intent": "pi_dispute_which"})
         self.mock_default.assert_called()
         self.mock_interactive.assert_not_called()

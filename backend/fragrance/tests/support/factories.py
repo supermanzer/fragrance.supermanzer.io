@@ -35,10 +35,10 @@ def _make_run_with_pick(
     )
 
 
-def _make_plan(*, slug: str, interval: str, access_days: int) -> Plan:
+def _make_plan(*, slug: str, interval: str) -> Plan:
     return Plan.objects.create(
         name=slug, slug=slug, stripe_price_id=f"price_{slug}", amount_cents=400,
-        billing_interval=interval, access_days_granted=access_days,
+        billing_interval=interval,
     )
 
 
@@ -67,11 +67,11 @@ def _make_user(*, username: str, customer_id: str | None, approved: bool = True)
 def _make_plans() -> tuple[Plan, Plan]:
     monthly = Plan.objects.create(
         name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
-        amount_cents=400, billing_interval="month", access_days_granted=30,
+        amount_cents=400, billing_interval="month",
     )
     annual = Plan.objects.create(
         name="Beta Annual", slug="beta-annual", stripe_price_id="price_yr",
-        amount_cents=4400, billing_interval="year", access_days_granted=365,
+        amount_cents=4400, billing_interval="year",
     )
     return monthly, annual
 

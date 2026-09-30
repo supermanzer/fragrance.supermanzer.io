@@ -34,7 +34,16 @@ def _create_or_update_user_schedule(config: FragranceConfig) -> None:
     Changing frequency in the UI takes effect on the next Celery Beat tick without
     any redeploy.
     """
-    crontab_kwargs: dict = {'minute': '0', 'hour': str(config.run_hour)}
+    # Monthly-shaped by default: only monthly is offered, so a row whose
+    # frequency matches no branch below must never fall through to a crontab
+    # with only minute/hour set (which would run daily).
+    crontab_kwargs: dict = {
+        'minute': '0',
+        'hour': str(config.run_hour),
+        'day_of_week': '*',
+        'day_of_month': str(config.run_day_of_month),
+        'month_of_year': '*',
+    }
 
     if config.frequency == 'weekly':
         crontab_kwargs.update({

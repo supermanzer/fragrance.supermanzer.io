@@ -20,7 +20,7 @@ class ToSConsentCheckoutTests(StripeClientTestCase):
         self.stripe.v1.subscriptions.list.return_value = _list_object(data=[])
         Plan.objects.create(
             name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
-            amount_cents=400, currency="usd", billing_interval="month", access_days_granted=30,
+            amount_cents=400, currency="usd", billing_interval="month",
         )
         self.user = User.objects.create_user(username="u", email="u@example.com", password="pw12345!")
         Subscription.objects.create(

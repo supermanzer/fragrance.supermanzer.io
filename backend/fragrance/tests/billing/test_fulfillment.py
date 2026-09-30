@@ -63,7 +63,7 @@ class FulfillPaymentIntentTests(StripeClientTestCase):
         super().setUp()
         self.plan = Plan.objects.create(
             name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
-            amount_cents=400, billing_interval="month", access_days_granted=30,
+            amount_cents=400, billing_interval="month",
         )
         self.user = User.objects.create_user(username="payer", email="payer@example.com")
         BetaSignup.objects.create(
@@ -168,7 +168,12 @@ class FulfillPaymentIntentTests(StripeClientTestCase):
         self.assertEqual(self.subscription.access_expires_at, expected)
         self.assertEqual(ProcessedPayment.objects.filter(stripe_invoice_id="in_3").count(), 1)
 
-    def test_falls_back_to_access_days_granted_when_period_end_absent(self) -> None:
+    def test_line_without_period_end_records_payment_and_grants_nothing(self) -> None:
+        """
+        Access is dated only by Stripe: a matched line with no period.end is
+        recorded (never reprocessed), grants nothing, and pages the operator
+        at CRITICAL. No locally computed fallback exists any more.
+        """
         self.stripe.v1.payment_intents.retrieve.return_value = _sdk_payment_intent(
             pi_id="pi_4", status="succeeded", customer="cus_test_1"
         )
@@ -179,17 +184,111 @@ class FulfillPaymentIntentTests(StripeClientTestCase):
         self.stripe.v1.invoice_payments.list.return_value = _list_object(
             data=[_sdk_invoice_payment(invoice=invoice)]
         )
-        before = timezone.now()
 
-        fulfill_payment_intent(payment_intent_id="pi_4")
+        with self.assertLogs("fragrance.billing", level="CRITICAL") as logs:
+            recorded = fulfill_payment_intent(payment_intent_id="pi_4")
+
+        self.assertEqual(recorded, 1)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("in_4", logs.output[0])
+        self.assertIn("NO PERIOD", logs.output[0])
+        self.assertNotIn("payer", logs.output[0])
+        self.subscription.refresh_from_db()
+        self.assertIsNone(self.subscription.access_expires_at)
+        self.assertEqual(self.subscription.status, "none")
+        self.assertIsNone(self.subscription.plan)
+        self.assertIsNone(self.subscription.stripe_subscription_id)
+        self.assertIsNone(self.subscription.last_paid_at)
+        payment = ProcessedPayment.objects.get(stripe_invoice_id="in_4")
+        self.assertIsNone(payment.period_end)
+        self.assertEqual(payment.amount_paid_cents, 400)
+
+    def test_period_less_invoice_replay_is_inert_and_silent(self) -> None:
+        self.stripe.v1.payment_intents.retrieve.return_value = _sdk_payment_intent(
+            pi_id="pi_4b", status="succeeded", customer="cus_test_1"
+        )
+        invoice = _sdk_invoice(
+            invoice_id="in_4b", customer_id="cus_test_1", subscription_id="sub_4b",
+            amount_paid=400, lines=[_sdk_line(price_id="price_mo", period_end=None)],
+        )
+        self.stripe.v1.invoice_payments.list.return_value = _list_object(
+            data=[_sdk_invoice_payment(invoice=invoice)]
+        )
+        with self.assertLogs("fragrance.billing", level="CRITICAL"):
+            self.assertEqual(fulfill_payment_intent(payment_intent_id="pi_4b"), 1)
+
+        with self.assertNoLogs("fragrance.billing", level="CRITICAL"):
+            self.assertEqual(fulfill_payment_intent(payment_intent_id="pi_4b"), 0)
+        self.assertEqual(ProcessedPayment.objects.filter(stripe_invoice_id="in_4b").count(), 1)
+
+    def test_period_less_invoice_leaves_existing_access_untouched(self) -> None:
+        existing_expiry = timezone.now() + timedelta(days=12)
+        Subscription.objects.filter(pk=self.subscription.pk).update(
+            status="active", access_expires_at=existing_expiry, stripe_subscription_id="sub_kept",
+            plan=self.plan,
+        )
+        self.stripe.v1.payment_intents.retrieve.return_value = _sdk_payment_intent(
+            pi_id="pi_4c", status="succeeded", customer="cus_test_1"
+        )
+        invoice = _sdk_invoice(
+            invoice_id="in_4c", customer_id="cus_test_1", subscription_id="sub_other",
+            amount_paid=400, lines=[_sdk_line(price_id="price_mo", period_end=None)],
+        )
+        self.stripe.v1.invoice_payments.list.return_value = _list_object(
+            data=[_sdk_invoice_payment(invoice=invoice)]
+        )
+
+        with self.assertLogs("fragrance.billing", level="CRITICAL"):
+            fulfill_payment_intent(payment_intent_id="pi_4c")
 
         self.subscription.refresh_from_db()
-        self.assertGreaterEqual(
-            self.subscription.access_expires_at, before + timedelta(days=30) - timedelta(seconds=5)
+        self.assertEqual(self.subscription.access_expires_at, existing_expiry)
+        self.assertEqual(self.subscription.stripe_subscription_id, "sub_kept")
+        self.assertEqual(self.subscription.status, "active")
+
+    def test_inactive_plan_still_matches_renewals(self) -> None:
+        """
+        is_active means "offered at checkout", never "honoured at renewal":
+        a Plan switched off in admin must keep granting for subscribers still
+        billing on its Price (billing._match_plan_line matches any Plan).
+        """
+        Plan.objects.filter(pk=self.plan.pk).update(is_active=False)
+        self.stripe.v1.payment_intents.retrieve.return_value = _sdk_payment_intent(
+            pi_id="pi_4d", status="succeeded", customer="cus_test_1"
         )
-        self.assertLessEqual(
-            self.subscription.access_expires_at, before + timedelta(days=30) + timedelta(seconds=5)
+        period_end = int(timezone.now().timestamp()) + 30 * 86400
+        invoice = _sdk_invoice(
+            invoice_id="in_4d", customer_id="cus_test_1", subscription_id="sub_4d",
+            amount_paid=400, lines=[_sdk_line(price_id="price_mo", period_end=period_end)],
         )
+        self.stripe.v1.invoice_payments.list.return_value = _list_object(
+            data=[_sdk_invoice_payment(invoice=invoice)]
+        )
+
+        self.assertEqual(fulfill_payment_intent(payment_intent_id="pi_4d"), 1)
+
+        self.subscription.refresh_from_db()
+        self.assertTrue(self.subscription.has_active_access)
+        self.assertEqual(self.subscription.plan, self.plan)
+
+    def test_first_grant_sets_the_plan_on_a_plan_less_subscription(self) -> None:
+        self.assertIsNone(self.subscription.plan)
+        self.stripe.v1.payment_intents.retrieve.return_value = _sdk_payment_intent(
+            pi_id="pi_4e", status="succeeded", customer="cus_test_1"
+        )
+        period_end = int(timezone.now().timestamp()) + 30 * 86400
+        invoice = _sdk_invoice(
+            invoice_id="in_4e", customer_id="cus_test_1", subscription_id="sub_4e",
+            amount_paid=400, lines=[_sdk_line(price_id="price_mo", period_end=period_end)],
+        )
+        self.stripe.v1.invoice_payments.list.return_value = _list_object(
+            data=[_sdk_invoice_payment(invoice=invoice)]
+        )
+
+        fulfill_payment_intent(payment_intent_id="pi_4e")
+
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.plan, self.plan)
 
     def test_two_invoices_grant_two_periods(self) -> None:
         self.stripe.v1.payment_intents.retrieve.return_value = _sdk_payment_intent(
@@ -279,7 +378,7 @@ class FulfillCheckoutSessionTests(StripeClientTestCase):
         super().setUp()
         self.plan = Plan.objects.create(
             name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
-            amount_cents=400, billing_interval="month", access_days_granted=30,
+            amount_cents=400, billing_interval="month",
         )
         self.user = User.objects.create_user(username="sessionuser", email="sessionuser@example.com")
         BetaSignup.objects.create(
@@ -451,7 +550,7 @@ class BillingSessionViewTests(StripeClientTestCase):
         super().setUp()
         self.plan = Plan.objects.create(
             name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
-            amount_cents=400, billing_interval="month", access_days_granted=30,
+            amount_cents=400, billing_interval="month",
         )
         self.user = User.objects.create_user(username="sessionview", email="sessionview@example.com")
         BetaSignup.objects.create(
@@ -653,18 +752,26 @@ class BoundaryInvoiceGrantTests(StripeClientTestCase):
 
 
 @override_settings(**_STRIPE_TEST_SETTINGS)
-class GrantPeriodAllowRevokedTests(StripeClientTestCase):
+class LockedAccountGrantTests(StripeClientTestCase):
+    """
+    A `revoked` (disputed) Subscription can never gain access through a
+    Stripe payment, by any path, until the operator unlocks it in admin. The
+    payment is still recorded (ProcessedPayment) and pages the operator at
+    CRITICAL: money reached a locked account and needs a manual refund.
+    """
+
     def setUp(self) -> None:
         super().setUp()
-        Plan.objects.create(
+        self.plan = Plan.objects.create(
             name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
-            amount_cents=400, billing_interval="month", access_days_granted=30,
+            amount_cents=400, billing_interval="month",
         )
         user = User.objects.create_user(username="disputed", email="disputed@example.com")
         BetaSignup.objects.create(
             email="disputed@example.com", normalized_email="disputed@example.com",
             status="converted", invited_user=user,
         )
+        self.user = user
         self.subscription = Subscription.objects.create(
             user=user, stripe_customer_id="cus_disp", status="revoked"
         )
@@ -673,14 +780,22 @@ class GrantPeriodAllowRevokedTests(StripeClientTestCase):
             lines=[_sdk_line(price_id="price_mo", period_end=int(timezone.now().timestamp()) + 30 * 86400)],
         )
 
+    def _assert_still_locked_and_ungranted(self) -> None:
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "revoked")
+        self.assertIsNone(self.subscription.access_expires_at)
+        self.assertIsNone(self.subscription.plan)
+        self.assertIsNone(self.subscription.stripe_subscription_id)
+        self.assertIsNone(self.subscription.last_paid_at)
+        self.assertFalse(self.subscription.has_active_access)
+
     def test_late_low_invoice_after_revoke_does_not_un_revoke(self) -> None:
         """
-        A revoke sets access_expires_at to "now" (see revoke_for_dispute). If
-        an old, lower invoice for the same (now-revoked) customer settles
-        late -- computed expiry earlier than the revoke timestamp -- it must
-        not become the new maximum, and therefore must not flip status back
-        to "active". Without the produces_new_max guard on status this would
-        silently un-revoke a disputed row.
+        A revoke sets access_expires_at to "now" (see revoke_for_dispute). A
+        late invoice for the (now-revoked) customer must leave status and
+        access_expires_at exactly as the revoke set them, whatever its own
+        period end -- the locked-account rule, not the monotonic-max guard,
+        is what holds here. The payment is still recorded.
         """
         revoke_time = timezone.now()
         user = User.objects.create_user(username="revoke_late", email="revoke_late@example.com")
@@ -702,43 +817,130 @@ class GrantPeriodAllowRevokedTests(StripeClientTestCase):
             ],
         )
 
-        self.assertTrue(_grant_period_for_invoice(invoice=old_invoice))  # allow_revoked defaults True
+        with self.assertLogs("fragrance.billing", level="CRITICAL"):
+            self.assertTrue(_grant_period_for_invoice(invoice=old_invoice))
 
         subscription.refresh_from_db()
         self.assertEqual(subscription.status, "revoked")
         self.assertEqual(subscription.access_expires_at, revoke_time)
         self.assertEqual(ProcessedPayment.objects.filter(stripe_invoice_id="in_revlate_old").count(), 1)
 
-    def test_revoked_is_not_regranted_when_disallowed(self) -> None:
-        self.assertFalse(_grant_period_for_invoice(invoice=self.invoice, allow_revoked=False))
+    def test_late_invoice_with_a_future_period_end_after_revoke_does_not_un_revoke(self) -> None:
+        """
+        The case the old allow_revoked=True behaviour got wrong: an invoice
+        whose period end is AFTER the revoke time would have become the new
+        maximum and flipped the row back to active.
+        """
+        revoke_time = timezone.now()
+        Subscription.objects.filter(pk=self.subscription.pk).update(access_expires_at=revoke_time)
+
+        with self.assertLogs("fragrance.billing", level="CRITICAL"):
+            self.assertTrue(_grant_period_for_invoice(invoice=self.invoice))
+
         self.subscription.refresh_from_db()
         self.assertEqual(self.subscription.status, "revoked")
-        self.assertIsNone(self.subscription.access_expires_at)
-        self.assertEqual(ProcessedPayment.objects.count(), 0)
+        self.assertEqual(self.subscription.access_expires_at, revoke_time)
+        self.assertFalse(self.subscription.has_active_access)
 
-    def test_revoked_customer_can_resubscribe_by_default(self) -> None:
-        self.assertTrue(_grant_period_for_invoice(invoice=self.invoice))
-        self.subscription.refresh_from_db()
-        self.assertEqual(self.subscription.status, "active")
-        self.assertEqual(ProcessedPayment.objects.count(), 1)
+    def test_payment_on_a_locked_account_is_recorded_but_grants_nothing(self) -> None:
+        with self.assertLogs("fragrance.billing", level="CRITICAL") as logs:
+            self.assertTrue(_grant_period_for_invoice(invoice=self.invoice))
 
-    def test_reconcile_passes_allow_revoked_false(self) -> None:
+        self._assert_still_locked_and_ungranted()
+        payment = ProcessedPayment.objects.get(stripe_invoice_id="in_disp")
+        self.assertEqual(payment.amount_paid_cents, 400)
+        self.assertEqual(payment.subscription, self.subscription)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("MONEY RECEIVED ON A LOCKED ACCOUNT", logs.output[0])
+        self.assertIn("manual refund", logs.output[0])
+        self.assertIn("in_disp", logs.output[0])
+        # Ids only: no email address or username in the page.
+        self.assertNotIn("disputed", logs.output[0])
+
+    def test_locked_payment_replay_is_inert_and_does_not_page_again(self) -> None:
+        with self.assertLogs("fragrance.billing", level="CRITICAL"):
+            self.assertTrue(_grant_period_for_invoice(invoice=self.invoice))
+
+        with self.assertNoLogs("fragrance.billing", level="CRITICAL"):
+            self.assertFalse(_grant_period_for_invoice(invoice=self.invoice))
+
+        self.assertEqual(ProcessedPayment.objects.filter(stripe_invoice_id="in_disp").count(), 1)
+        self._assert_still_locked_and_ungranted()
+
+    def test_webhook_path_records_on_a_locked_account_and_grants_nothing(self) -> None:
+        self.stripe.v1.payment_intents.retrieve.return_value = _sdk_payment_intent(
+            pi_id="pi_disp", status="succeeded", customer="cus_disp"
+        )
+        self.stripe.v1.invoice_payments.list.return_value = _list_object(
+            data=[_sdk_invoice_payment(invoice=self.invoice)]
+        )
+
+        with self.assertLogs("fragrance.billing", level="CRITICAL"):
+            self.assertEqual(fulfill_payment_intent(payment_intent_id="pi_disp"), 1)
+
+        self._assert_still_locked_and_ungranted()
+        self.assertEqual(
+            ProcessedPayment.objects.get(stripe_invoice_id="in_disp").stripe_payment_intent_id, "pi_disp"
+        )
+
+    def test_success_page_path_records_on_a_locked_account_and_grants_nothing(self) -> None:
+        self.stripe.v1.checkout.sessions.retrieve.return_value = _session(
+            id="cs_disp", client_reference_id=str(self.user.id), customer="cus_disp",
+            invoice=self.invoice, subscription="sub_disp", payment_status="paid",
+        )
+
+        with self.assertLogs("fragrance.billing", level="CRITICAL"):
+            result = fulfill_checkout_session(session_id="cs_disp", user=self.user)
+
+        self.assertEqual(result["status"], "revoked")
+        self.assertFalse(result["has_active_access"])
+        # "granted" is the frontend's JSON key; its value means "recorded".
+        self.assertTrue(result["granted"])
+        self._assert_still_locked_and_ungranted()
+        self.assertEqual(ProcessedPayment.objects.filter(stripe_invoice_id="in_disp").count(), 1)
+
+    def test_reconcile_records_and_pages_a_revoked_customers_paid_invoice_without_granting(self) -> None:
         from fragrance.billing import reconcile_subscriptions
 
-        Subscription.objects.filter(pk=self.subscription.pk).update(status="active")
         self.stripe.v1.invoices.list.return_value = _list_object(data=[self.invoice])
-        with patch("fragrance.billing._grant_period_for_invoice", return_value=True) as grant:
-            reconcile_subscriptions()
-        self.assertIs(grant.call_args.kwargs["allow_revoked"], False)
+        before = Subscription.objects.values().get(pk=self.subscription.pk)
 
-    def test_dispute_landing_mid_reconcile_is_not_overwritten(self) -> None:
+        with self.assertLogs("fragrance.billing", level="CRITICAL") as logs:
+            summary = reconcile_subscriptions()
+
+        self.assertEqual(summary["invoices_matched"], 1)
+        self.assertEqual(summary["recorded"], 1)
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("MONEY RECEIVED ON A LOCKED ACCOUNT", logs.output[0])
+        self.assertIn("in_disp", logs.output[0])
+        self.assertEqual(ProcessedPayment.objects.filter(stripe_invoice_id="in_disp").count(), 1)
+        # The Subscription row is byte-for-byte what it was.
+        self.assertEqual(Subscription.objects.values().get(pk=self.subscription.pk), before)
+        self._assert_still_locked_and_ungranted()
+
+    def test_a_second_reconcile_over_a_recorded_locked_invoice_is_silent(self) -> None:
+        from fragrance.billing import reconcile_subscriptions
+
+        self.stripe.v1.invoices.list.return_value = _list_object(data=[self.invoice])
+        with self.assertLogs("fragrance.billing", level="CRITICAL"):
+            reconcile_subscriptions()
+
+        with self.assertNoLogs("fragrance.billing", level="CRITICAL"):
+            summary = reconcile_subscriptions()
+
+        self.assertEqual(summary["recorded"], 0)
+        self.assertEqual(summary["already_applied"], 1)
+
+    def test_dispute_landing_mid_reconcile_is_recorded_but_not_granted(self) -> None:
         """
         reconcile_subscriptions snapshots known_customers *before* it calls
         client.v1.invoices.list(...). A side_effect on that call reproduces the
         same race with a real stripe.ListObject as the eventual return value:
         the customer is already a candidate by the time this side_effect runs
         (the snapshot happened earlier), and the dispute revoke landing here
-        is exactly "before the grant reaches the row lock".
+        is exactly "before the grant reaches the row lock". The locked-account
+        rule then records the payment (so it is never reprocessed), grants
+        nothing and pages the operator.
         """
         from fragrance.billing import reconcile_subscriptions
 
@@ -749,10 +951,81 @@ class GrantPeriodAllowRevokedTests(StripeClientTestCase):
             return _list_object(data=[self.invoice])
 
         self.stripe.v1.invoices.list.side_effect = _revoke_then_list
-        reconcile_subscriptions()
+        with self.assertLogs("fragrance.billing", level="CRITICAL"):
+            summary = reconcile_subscriptions()
         self.subscription.refresh_from_db()
         self.assertEqual(self.subscription.status, "revoked")
-        self.assertEqual(ProcessedPayment.objects.count(), 0)
+        self.assertIsNone(self.subscription.access_expires_at)
+        self.assertEqual(ProcessedPayment.objects.count(), 1)
+        self.assertEqual(summary["recorded"], 1)
+
+    def test_after_unlock_a_new_subscriptions_payment_grants_normally(self) -> None:
+        # What the admin "Unlock disputed account" action leaves behind:
+        # status "none", access_expires_at untouched (the dispute time).
+        dispute_time = timezone.now() - timedelta(days=3)
+        Subscription.objects.filter(pk=self.subscription.pk).update(
+            status="none", access_expires_at=dispute_time
+        )
+
+        self.assertTrue(_grant_period_for_invoice(invoice=self.invoice))
+
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "active")
+        self.assertEqual(self.subscription.plan, self.plan)
+        self.assertEqual(self.subscription.stripe_subscription_id, "sub_disp")
+        self.assertTrue(self.subscription.has_active_access)
+
+    def test_after_unlock_a_late_invoice_from_the_disputed_subscription_can_reactivate(self) -> None:
+        """
+        Documents the residual that remains, not a guarantee: the account-wide
+        block ends at unlock, and nothing tells an old subscription's invoice
+        apart from a new one. An invoice paid WHILE the account was locked is
+        no longer part of it -- it was recorded (webhook, success page or
+        reconcile, which now sees revoked customers), so it can never be
+        granted later (see the next test). What is left is an invoice that
+        first reaches us AFTER the unlock (unlikely: revoke_for_dispute
+        cancels the live Stripe subscriptions and expires open Checkout
+        Sessions): with a period end later than the dispute time it grants
+        once the row is `none`.
+        """
+        Subscription.objects.filter(pk=self.subscription.pk).update(
+            status="none", access_expires_at=timezone.now() - timedelta(days=1)
+        )
+        late_invoice = _sdk_invoice(
+            invoice_id="in_disp_late", customer_id="cus_disp", subscription_id="sub_disputed_old",
+            amount_paid=400,
+            lines=[_sdk_line(price_id="price_mo", period_end=int(timezone.now().timestamp()) + 5 * 86400)],
+        )
+
+        self.assertTrue(_grant_period_for_invoice(invoice=late_invoice))
+
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "active")
+
+    def test_an_invoice_paid_while_locked_can_never_be_granted_by_a_reconcile_after_the_unlock(self) -> None:
+        """
+        Refunding does not change invoice.status (it stays paid), so before
+        reconcile saw revoked customers, "paid while locked, refund, unlock"
+        let the next nightly run grant it. Now the locked-time reconcile
+        records it, and the post-unlock run finds it already applied.
+        """
+        from fragrance.billing import reconcile_subscriptions
+
+        self.stripe.v1.invoices.list.return_value = _list_object(data=[self.invoice])
+        with self.assertLogs("fragrance.billing", level="CRITICAL"):
+            reconcile_subscriptions()
+        Subscription.objects.filter(pk=self.subscription.pk).update(
+            status="none", access_expires_at=timezone.now() - timedelta(days=1)
+        )
+
+        summary = reconcile_subscriptions()
+
+        self.assertEqual(summary["recorded"], 0)
+        self.assertEqual(summary["already_applied"], 1)
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "none")
+        self.assertFalse(self.subscription.has_active_access)
+        self.assertEqual(ProcessedPayment.objects.filter(stripe_invoice_id="in_disp").count(), 1)
 
 
 class GrantMonotonicityTests(TestCase):
@@ -769,11 +1042,11 @@ class GrantMonotonicityTests(TestCase):
     def setUp(self) -> None:
         self.monthly = Plan.objects.create(
             name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
-            amount_cents=400, billing_interval="month", access_days_granted=30,
+            amount_cents=400, billing_interval="month",
         )
         self.annual = Plan.objects.create(
             name="Beta Annual", slug="beta-annual", stripe_price_id="price_yr",
-            amount_cents=4400, billing_interval="year", access_days_granted=365,
+            amount_cents=4400, billing_interval="year",
         )
         self.user = User.objects.create_user(username="outoforder", email="outoforder@example.com")
         BetaSignup.objects.create(
@@ -837,6 +1110,40 @@ class GrantMonotonicityTests(TestCase):
             datetime.fromtimestamp(self.older_period_end, tz=dt_timezone.utc) + timedelta(days=2)
         )
         self.assertEqual(older_record.period_end, expected_older)
+
+    def test_period_less_invoice_never_rolls_back_a_newer_grant(self) -> None:
+        """
+        The old locally computed fallback was always "later than the current
+        expiry", so a period-less invoice could overwrite plan and
+        stripe_subscription_id. It now records and grants nothing, in either order.
+        """
+        period_less = _sdk_invoice(
+            invoice_id="in_ooo_none", customer_id="cus_ooo", subscription_id="sub_none",
+            amount_paid=400, lines=[_sdk_line(price_id="price_mo", period_end=None)],
+        )
+        with self.assertLogs("fragrance.billing", level="CRITICAL"):
+            self.assertTrue(_grant_period_for_invoice(invoice=self.newer_invoice))
+            self.assertTrue(_grant_period_for_invoice(invoice=period_less))
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.access_expires_at, self.expected_expiry)
+        self.assertEqual(self.subscription.plan, self.annual)
+        self.assertEqual(self.subscription.stripe_subscription_id, "sub_new")
+        self.assertEqual(ProcessedPayment.objects.count(), 2)
+
+    def test_period_less_invoice_first_then_newer_lands_on_same_final_state(self) -> None:
+        period_less = _sdk_invoice(
+            invoice_id="in_ooo_none2", customer_id="cus_ooo", subscription_id="sub_none",
+            amount_paid=400, lines=[_sdk_line(price_id="price_mo", period_end=None)],
+        )
+        with self.assertLogs("fragrance.billing", level="CRITICAL"):
+            self.assertTrue(_grant_period_for_invoice(invoice=period_less))
+        self.assertTrue(_grant_period_for_invoice(invoice=self.newer_invoice))
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.access_expires_at, self.expected_expiry)
+        self.assertEqual(self.subscription.plan, self.annual)
+        self.assertEqual(self.subscription.stripe_subscription_id, "sub_new")
+        self.assertEqual(self.subscription.status, "active")
+        self.assertEqual(ProcessedPayment.objects.count(), 2)
 
 
 class GrantComplimentaryAccessTests(TestCase):

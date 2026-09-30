@@ -33,7 +33,7 @@ class ReconcileSubscriptionsTests(StripeClientTestCase):
         self.reconcile = reconcile_subscriptions
         self.plan = Plan.objects.create(
             name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
-            amount_cents=400, billing_interval="month", access_days_granted=30,
+            amount_cents=400, billing_interval="month",
         )
         self.period_end = int(timezone.now().timestamp()) + 30 * 86400
 
@@ -73,11 +73,11 @@ class ReconcileSubscriptionsTests(StripeClientTestCase):
         second = self.reconcile()
         loaded.refresh_from_db()
 
-        self.assertEqual(first["grants"], 2)
+        self.assertEqual(first["recorded"], 2)
         self.assertEqual(renewal.status, "active")
         self.assertGreater(renewal.access_expires_at, timezone.now())
         self.assertEqual(loaded.status, "active")
-        self.assertEqual(second["grants"], 0)
+        self.assertEqual(second["recorded"], 0)
         self.assertEqual(second["already_applied"], 2)
         self.assertEqual(loaded.access_expires_at, expiry_after_first)
         self.assertEqual(ProcessedPayment.objects.count(), 2)
@@ -85,7 +85,7 @@ class ReconcileSubscriptionsTests(StripeClientTestCase):
     def test_active_subscriber_long_past_expiry_is_still_reconciled(self) -> None:
         sub = self._make_user(name="ancient", customer_id="cus_old", status="active", expires_in=-timedelta(days=40))
         self.stripe.v1.invoices.list.return_value = self._listing(self._invoice(invoice_id="in_old", customer_id="cus_old"))
-        self.assertEqual(self.reconcile()["grants"], 1)
+        self.assertEqual(self.reconcile()["recorded"], 1)
         sub.refresh_from_db()
         self.assertGreater(sub.access_expires_at, timezone.now())
 
@@ -100,7 +100,7 @@ class ReconcileSubscriptionsTests(StripeClientTestCase):
         summary = self.reconcile()
         sub.refresh_from_db()
         self.assertEqual(summary["already_applied"], 1)
-        self.assertEqual(summary["grants"], 0)
+        self.assertEqual(summary["recorded"], 0)
         self.assertEqual(sub.access_expires_at, before)
 
     def test_unpaid_invoice_grants_nothing(self) -> None:
@@ -110,7 +110,7 @@ class ReconcileSubscriptionsTests(StripeClientTestCase):
         )
         summary = self.reconcile()
         sub.refresh_from_db()
-        self.assertEqual(summary["grants"], 0)
+        self.assertEqual(summary["recorded"], 0)
         self.assertIsNone(sub.access_expires_at)
         self.assertEqual(ProcessedPayment.objects.count(), 0)
 
@@ -120,7 +120,7 @@ class ReconcileSubscriptionsTests(StripeClientTestCase):
         self.stripe.v1.invoices.list.return_value = self._listing(self._invoice(invoice_id="in_pend", customer_id="cus_pending"))
         summary = self.reconcile()
         sub.refresh_from_db()
-        self.assertEqual(summary["grants"], 0)
+        self.assertEqual(summary["recorded"], 0)
         self.assertEqual(sub.status, "checkout_started")
 
     def test_invoice_list_is_one_account_wide_call(self) -> None:
@@ -146,20 +146,23 @@ class ReconcileSubscriptionsTests(StripeClientTestCase):
         sub = self._make_user(name="revoked", customer_id="cus_rev", status="revoked", expires_in=timedelta(days=1))
         before = sub.access_expires_at
         self.stripe.v1.invoices.list.return_value = self._listing(self._invoice(invoice_id="in_rev", customer_id="cus_rev"))
-        summary = self.reconcile()
+        with self.assertLogs("fragrance.billing", level="CRITICAL"):
+            summary = self.reconcile()
         sub.refresh_from_db()
-        self.assertEqual(summary["grants"], 0)
-        self.assertEqual(summary["invoices_matched"], 0)
+        # Recorded (and paged) so it is never reprocessed, but nothing is granted.
+        self.assertEqual(summary["recorded"], 1)
+        self.assertEqual(summary["invoices_matched"], 1)
         self.assertEqual(sub.status, "revoked")
         self.assertEqual(sub.access_expires_at, before)
-        self.assertEqual(ProcessedPayment.objects.count(), 0)
+        self.assertIsNone(sub.plan)
+        self.assertEqual(ProcessedPayment.objects.count(), 1)
 
     def test_invoice_for_unknown_customer_is_ignored(self) -> None:
         self.stripe.v1.invoices.list.return_value = self._listing(self._invoice(invoice_id="in_x", customer_id="cus_stranger"))
         summary = self.reconcile()
         self.assertEqual(summary["invoices_seen"], 1)
         self.assertEqual(summary["invoices_matched"], 0)
-        self.assertEqual(summary["grants"], 0)
+        self.assertEqual(summary["recorded"], 0)
         self.assertEqual(ProcessedPayment.objects.count(), 0)
 
     def test_abandoned_checkout_costs_no_per_customer_call(self) -> None:
@@ -180,14 +183,14 @@ class ReconcileSubscriptionsTests(StripeClientTestCase):
             mock_grant.side_effect = [RuntimeError("boom"), True]
             summary = self.reconcile()
         self.assertEqual(summary["errors"], 1)
-        self.assertEqual(summary["grants"], 1)
+        self.assertEqual(summary["recorded"], 1)
 
     def test_listing_failure_is_contained_and_events_still_requeued(self) -> None:
         self.stripe.v1.invoices.list.side_effect = stripe.APIConnectionError("boom")
         with self.assertLogs("fragrance.billing", level="ERROR"):
             summary = self.reconcile()
         self.assertEqual(summary["errors"], 1)
-        self.assertEqual(summary["grants"], 0)
+        self.assertEqual(summary["recorded"], 0)
 
     def test_errors_with_no_grants_and_pending_invoices_log_at_error(self) -> None:
         self._make_user(name="stuck", customer_id="cus_stuck")
@@ -195,7 +198,7 @@ class ReconcileSubscriptionsTests(StripeClientTestCase):
         with patch("fragrance.billing._grant_period_for_invoice", side_effect=RuntimeError("boom")):
             with self.assertLogs("fragrance.billing", level="ERROR") as logs:
                 self.reconcile()
-        self.assertTrue(any("NO grants" in line for line in logs.output))
+        self.assertTrue(any("NO payments recorded" in line for line in logs.output))
 
     def test_deadline_stops_the_loop(self) -> None:
         for name in ("a", "b", "c"):
@@ -206,7 +209,7 @@ class ReconcileSubscriptionsTests(StripeClientTestCase):
         with self.assertLogs("fragrance.billing", level="ERROR") as logs:
             summary = self.reconcile(time_budget_seconds=0)
         self.assertTrue(summary["deadline_exceeded"])
-        self.assertEqual(summary["grants"], 0)
+        self.assertEqual(summary["recorded"], 0)
         self.assertTrue(any("budget exhausted" in line for line in logs.output))
 
     @patch("fragrance.billing.RECONCILE_MAX_INVOICES", 2)
@@ -310,6 +313,6 @@ class ReconcileStuckEventsTests(StripeClientTestCase):
     def test_celery_task_delegates(self, mock_reconcile) -> None:
         from fragrance.tasks import reconcile_stripe_subscriptions
 
-        mock_reconcile.return_value = {"grants": 0}
+        mock_reconcile.return_value = {"recorded": 0}
         reconcile_stripe_subscriptions()
         mock_reconcile.assert_called_once_with(dry_run=False)

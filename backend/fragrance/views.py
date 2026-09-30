@@ -432,6 +432,17 @@ class BillingCheckoutView(generics.GenericAPIView):
             url = billing.create_checkout_session(
                 user=request.user, plan_slug=serializer.validated_data["slug"]
             )
+        except billing.AccountLockedError:
+            return Response(
+                {
+                    "code": "account_locked",
+                    "detail": (
+                        "This account is locked following a payment dispute, so checkout is "
+                        f"unavailable. Please contact {settings.SUPPORT_EMAIL} to resolve it."
+                    ),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
         except billing.SubscriptionAlreadyActiveError:
             return Response(
                 {"detail": "You already have an active subscription."},
@@ -445,8 +456,11 @@ class BillingCheckoutView(generics.GenericAPIView):
                 {"detail": "Checkout is temporarily unavailable."},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
-        except billing.TermsUrlNotConfiguredError:
-            # Already logged with the fix by billing.create_checkout_session.
+        except (
+            billing.TermsUrlNotConfiguredError,
+            billing.CheckoutSessionUrlMissingError,
+        ):
+            # Already logged by billing.create_checkout_session.
             return Response(
                 {"detail": "Could not start checkout. Please try again shortly."},
                 status=status.HTTP_502_BAD_GATEWAY,

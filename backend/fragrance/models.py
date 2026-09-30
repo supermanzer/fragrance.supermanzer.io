@@ -39,10 +39,10 @@ FRAGRANCE_STATUSES = [
 ]
 
 
+# Only monthly is offered for now; weekly/yearly may return, so the
+# run_day_of_week/run_month columns and signals.py's branches stay.
 FREQUENCIES = [
-    ("weekly", "Weekly"),
     ("monthly", "Monthly"),
-    ("yearly", "Yearly"),
 ]
 
 
@@ -86,13 +86,19 @@ class ActiveAIModelConfigConflictError(Exception):
 class Plan(models.Model):
     """
     Billing terms and usage terms, deliberately separate. `billing_interval`
-    and `access_days_granted` describe how the customer is charged;
+    describes how the customer is charged (how long access lasts is dated
+    only by Stripe's own invoice period, never by a field here);
     `quota_period_days` and `max_runs_per_quota_period` describe how often
     the pipeline may run. They must stay separate fields: a single period
     reused for both would let an annual subscriber take twelve runs on the
     first of January. The quota chokepoint (a later slice) reads
     `quota_period_days` on every plan and must never look at
     `billing_interval`.
+
+    Plans are created by hand in Django admin. `stripe_price_id` is editable
+    only on the add form: a changed price id would silently stop every
+    current subscriber's renewals from matching (billing._match_plan_line),
+    so a new Price means a NEW Plan row.
     """
 
     name = models.CharField(max_length=100)
@@ -101,15 +107,12 @@ class Plan(models.Model):
     amount_cents = models.PositiveIntegerField()
     currency = models.CharField(max_length=3, default="usd")
     billing_interval = models.CharField(max_length=5, choices=BILLING_INTERVALS)
-    # Fallback only for computing access_expires_at when Stripe's own
-    # period_end is unavailable -- prefer the value Stripe supplies.
-    access_days_granted = models.PositiveIntegerField()
     quota_period_days = models.PositiveIntegerField(default=30)
     max_runs_per_quota_period = models.PositiveIntegerField(default=1)
     failed_run_grace = models.PositiveIntegerField(default=1)
     # "Offered at checkout / plan-change target" -- never "honoured at
     # renewal". billing._match_plan_line matches ANY Plan row regardless of
-    # this flag, on purpose: a retired row (see seed_plans --rotate-price)
+    # this flag, on purpose: a retired row (is_active switched off in admin)
     # must keep granting for subscribers still billing on its Price even
     # after it stops being offered here.
     is_active = models.BooleanField(default=True)

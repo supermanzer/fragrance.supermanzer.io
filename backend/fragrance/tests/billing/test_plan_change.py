@@ -230,6 +230,27 @@ class BillingChangePlanViewTests(StripeClientTestCase):
         self.assertEqual(second["billing_cycle_anchor"], "phase_start")
         self.assertEqual(second["items"], [{"price": "price_mo", "quantity": 1}])
 
+    def test_post_when_stripe_echoes_back_no_pending_phase_is_201_with_null_pending(self) -> None:
+        """
+        _pending_change_payload can return None; the view must not 500 or
+        invent a payload -- it answers {"pending": null} and the frontend refetches.
+        """
+        self.stripe.v1.subscriptions.retrieve.return_value = _stripe_subscription()
+        self.stripe.v1.subscription_schedules.create.return_value = _real_schedule(
+            schedule=_schedule_dict(
+                phases=[_phase_dict(start=_PERIOD_START, end=_PERIOD_END, price_id="price_mo")],
+                current_start=_PERIOD_START,
+            )
+        )
+        self.stripe.v1.subscription_schedules.update.return_value = _real_schedule(
+            schedule=_spent_schedule_dict()
+        )
+
+        response = self._post()
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json(), {"pending": None})
+
     def test_post_missing_plan_is_400(self) -> None:
         self.assertEqual(self.client.post(self.url, {}, format="json").status_code, 400)
 

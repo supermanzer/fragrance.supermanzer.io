@@ -1,3 +1,6 @@
+import logging
+
+from django import forms
 from django.contrib import admin, messages
 from django.contrib.auth.models import User
 from django.db import transaction
@@ -6,6 +9,7 @@ from django.forms import ModelForm
 from django.http import HttpRequest, HttpResponse, HttpResponseRedirect
 from django.utils import timezone
 
+from . import billing
 from .ai_providers import registry
 from .ai_providers.verification import persist_verification_results, run_verification_checks
 from .models import (
@@ -26,7 +30,39 @@ from .services import default_schedule_for, derive_unique_username
 # Register your models here.
 
 
-_DEFAULT_PLAN_SLUG = "beta-monthly"
+logger = logging.getLogger(__name__)
+
+
+class PlanAdminForm(forms.ModelForm):
+    """
+    On the ADD form only, verifies the entered stripe_price_id against Stripe
+    (billing.validate_plan_price) and refuses the save with an error on the
+    price-id field if any check fails, including "Stripe could not be
+    reached" -- a Plan must never be created on an unverified Price.
+    stripe_price_id is read-only once a Plan exists, so the change form
+    never re-checks.
+    """
+
+    class Meta:
+        model = Plan
+        fields = "__all__"
+
+    def clean(self) -> dict:
+        cleaned_data = super().clean()
+        if not self.instance._state.adding:
+            return cleaned_data
+        required = ("stripe_price_id", "amount_cents", "currency", "billing_interval")
+        if any(name not in cleaned_data for name in required):
+            return cleaned_data
+        problems = billing.validate_plan_price(
+            price_id=cleaned_data["stripe_price_id"],
+            amount_cents=cleaned_data["amount_cents"],
+            currency=cleaned_data["currency"],
+            billing_interval=cleaned_data["billing_interval"],
+        )
+        if problems:
+            self.add_error("stripe_price_id", problems)
+        return cleaned_data
 
 
 @admin.register(AIModelConfig)
@@ -184,10 +220,9 @@ class BetaSignupAdmin(admin.ModelAdmin):
                     user.set_unusable_password()
                     user.save()
 
-                    default_plan = Plan.objects.filter(
-                        slug=_DEFAULT_PLAN_SLUG, is_active=True
-                    ).first()
-                    Subscription.objects.create(user=user, plan=default_plan, status="none")
+                    # No plan yet: the first payment sets it
+                    # (billing._grant_period_for_invoice).
+                    Subscription.objects.create(user=user, status="none")
 
                     locked.approved_at = timezone.now()
                     locked.approved_by = request.user
@@ -297,8 +332,18 @@ class FragraneAdmin(admin.ModelAdmin):
 
 @admin.register(Plan)
 class PlanAdmin(admin.ModelAdmin):
+    form = PlanAdminForm
     list_display = ("slug", "name", "amount_cents", "billing_interval", "is_active")
     list_filter = ("is_active", "billing_interval")
+
+    def get_readonly_fields(self, request: HttpRequest, obj: Plan | None = None) -> tuple[str, ...]:
+        # An edited price id silently stops every current subscriber's
+        # renewal from matching a Plan (billing._match_plan_line), so it is
+        # set once, on add. Changing a price means creating a NEW Plan.
+        readonly = tuple(super().get_readonly_fields(request, obj))
+        if obj is not None:
+            return (*readonly, "stripe_price_id")
+        return readonly
 
 
 @admin.register(PreferenceProfile)
@@ -349,6 +394,65 @@ class SubscriptionAdmin(admin.ModelAdmin):
     # manual verification (see the plan's end-to-end walk), never for
     # granting access by hand.
     readonly_fields = [f.name for f in Subscription._meta.fields]
+    actions = ["unlock_disputed_accounts"]
 
     def has_add_permission(self, request: HttpRequest) -> bool:
         return False
+
+    # Deleting a revoked row would let get_or_create recreate it as "none",
+    # bypassing the lock and the unlock action's audit line.
+    def has_delete_permission(
+        self, request: HttpRequest, obj: Subscription | None = None
+    ) -> bool:
+        return False
+
+    @admin.action(
+        description="Unlock disputed account (revoked -> none; access stays lapsed)",
+        permissions=["change"],
+    )
+    def unlock_disputed_accounts(
+        self, request: HttpRequest, queryset: QuerySet[Subscription]
+    ) -> None:
+        """
+        The only way out of `revoked`. Sets status back to "none" and nothing
+        else: access_expires_at is kept (the dispute set it to the dispute
+        time), so access stays lapsed until a NEW subscription's payment
+        grants normally. Do this only after the disputed payment and any
+        money received on the locked account have been settled in Stripe.
+        Each row is re-fetched under a row lock so a concurrent revoke or
+        grant cannot interleave; non-revoked rows are skipped and reported.
+        """
+        for subscription in queryset:
+            with transaction.atomic():
+                try:
+                    locked = Subscription.objects.select_for_update().get(pk=subscription.pk)
+                except Subscription.DoesNotExist:
+                    self.message_user(
+                        request,
+                        f"Skipped subscription {subscription.pk}: it no longer exists.",
+                        level=messages.WARNING,
+                    )
+                    continue
+                label = f"{locked.user} (subscription {locked.pk})"
+                if locked.status != "revoked":
+                    self.message_user(
+                        request,
+                        f"Skipped {label}: status is '{locked.status}', not 'revoked'.",
+                        level=messages.WARNING,
+                    )
+                    continue
+                locked.status = "none"
+                locked.save(update_fields=["status"])
+            logger.warning(
+                "Disputed account UNLOCKED: subscription %s (user %s) set revoked -> none by "
+                "admin user %s",
+                locked.pk,
+                locked.user_id,
+                request.user.pk,
+            )
+            self.message_user(
+                request,
+                f"Unlocked {label}: status is now 'none'; access stays lapsed until a new "
+                "subscription is paid.",
+                level=messages.SUCCESS,
+            )

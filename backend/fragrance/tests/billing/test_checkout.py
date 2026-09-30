@@ -11,6 +11,7 @@ from django.contrib.auth.models import User
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
+from fragrance.billing import AccountLockedError, create_checkout_session
 from fragrance.models import Plan, Subscription
 from fragrance.tests.support.bases import StripeClientTestCase
 from fragrance.tests.support.factories import (
@@ -53,11 +54,11 @@ class BillingCheckoutViewTests(StripeClientTestCase):
         self.stripe.v1.subscriptions.list.return_value = _empty_subscription_list()
         self.monthly = Plan.objects.create(
             name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
-            amount_cents=400, currency="usd", billing_interval="month", access_days_granted=30,
+            amount_cents=400, currency="usd", billing_interval="month",
         )
         self.annual = Plan.objects.create(
             name="Beta Annual", slug="beta-annual", stripe_price_id="price_yr",
-            amount_cents=4400, currency="usd", billing_interval="year", access_days_granted=365,
+            amount_cents=4400, currency="usd", billing_interval="year",
         )
         self.user = User.objects.create_user(
             username="checkoutuser", email="checkoutuser@example.com", password="pw12345!"
@@ -133,6 +134,81 @@ class BillingCheckoutViewTests(StripeClientTestCase):
         response = self.client.post(self.url, {"slug": "beta-monthly"})
         self.assertEqual(response.status_code, 409)
 
+    @override_settings(SUPPORT_EMAIL="help@example.test")
+    def test_post_revoked_account_returns_409_account_locked_with_no_stripe_calls(self) -> None:
+        Subscription.objects.create(
+            user=self.user, status="revoked", access_expires_at=timezone.now(),
+            stripe_customer_id="cus_locked", last_checkout_session_id="cs_before_dispute",
+        )
+
+        response = self.client.post(self.url, {"slug": "beta-monthly"})
+
+        self.assertEqual(response.status_code, 409)
+        body = response.json()
+        self.assertEqual(body["code"], "account_locked")
+        self.assertIn("help@example.test", body["detail"])
+        self.stripe.v1.checkout.sessions.retrieve.assert_not_called()
+        self.stripe.v1.checkout.sessions.expire.assert_not_called()
+        self.stripe.v1.checkout.sessions.create.assert_not_called()
+        self.stripe.v1.customers.create.assert_not_called()
+        subscription = Subscription.objects.get(user=self.user)
+        self.assertEqual(subscription.status, "revoked")
+        self.assertEqual(subscription.last_checkout_session_id, "cs_before_dispute")
+
+    def test_post_revoked_account_is_refused_even_with_a_reusable_open_session(self) -> None:
+        Subscription.objects.create(
+            user=self.user, status="revoked", stripe_customer_id="cus_locked_2",
+            last_checkout_session_id="cs_open",
+        )
+        self.stripe.v1.checkout.sessions.retrieve.return_value = _session(
+            session_id="cs_open", url="https://checkout.stripe.com/cs_open", status="open",
+            metadata={"plan_slug": "beta-monthly", "price_id": "price_mo"},
+        )
+
+        response = self.client.post(self.url, {"slug": "beta-monthly"})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["code"], "account_locked")
+
+    def test_post_unknown_slug_on_revoked_account_is_still_400(self) -> None:
+        Subscription.objects.create(user=self.user, status="revoked")
+        response = self.client.post(self.url, {"slug": "does-not-exist"})
+        self.assertEqual(response.status_code, 400)
+
+    def test_post_after_unlock_status_none_checks_out_normally(self) -> None:
+        Subscription.objects.create(
+            user=self.user, status="none", access_expires_at=timezone.now() - timedelta(days=3),
+            stripe_customer_id="cus_unlocked",
+        )
+        self.stripe.v1.checkout.sessions.create.return_value = _session(
+            session_id="cs_unlocked", url="https://checkout.stripe.com/cs_unlocked"
+        )
+
+        response = self.client.post(self.url, {"slug": "beta-monthly"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["url"], "https://checkout.stripe.com/cs_unlocked")
+
+    def test_post_session_created_without_a_url_returns_502_and_stores_nothing(self) -> None:
+        self.stripe.v1.customers.create.return_value = _customer(customer_id="cus_nourl")
+        for empty_url in ("", None):
+            with self.subTest(url=empty_url):
+                self.stripe.v1.checkout.sessions.create.return_value = stripe.checkout.Session.construct_from(
+                    {"id": "cs_nourl", "object": "checkout.session", "url": empty_url}, _KEY
+                )
+
+                with self.assertLogs("fragrance.billing", level="ERROR") as logs:
+                    response = self.client.post(self.url, {"slug": "beta-monthly"})
+
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(
+                    response.json(), {"detail": "Could not start checkout. Please try again shortly."}
+                )
+                self.assertIn("cs_nourl", logs.output[0])
+                subscription = Subscription.objects.get(user=self.user)
+                self.assertNotEqual(subscription.status, "checkout_started")
+                self.assertEqual(subscription.last_checkout_session_id, "")
+
     def test_post_reuses_open_session_for_same_plan(self) -> None:
         Subscription.objects.create(
             user=self.user, stripe_customer_id="cus_existing", last_checkout_session_id="cs_existing"
@@ -199,8 +275,8 @@ class BillingCheckoutViewTests(StripeClientTestCase):
 
     def test_post_expires_open_session_when_price_id_changed_under_same_slug(self) -> None:
         """
-        A stale open session for the *same slug* but an old Price (the
-        operator re-ran seed_plans with a new --monthly-price-id) must be
+        A stale open session for the *same slug* but an old Price (a Plan
+        row replaced on the same slug with a different Stripe Price) must be
         expired, not reused -- reuse must key on price, not just slug, or a
         user could complete checkout against a retired Price.
         """
@@ -226,6 +302,146 @@ class BillingCheckoutViewTests(StripeClientTestCase):
 
 
 @override_settings(**_STRIPE_TEST_SETTINGS)
+class CustomerCreateRetryOptionTests(StripeClientTestCase):
+    """Only customers.create carries the one-retry option; see also the wire-level proof in test_stripe_client_seam."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        _make_plan(slug="retry-plan", interval="month")
+        self.user = User.objects.create_user(username="retryopt", email="retryopt@example.com")
+
+    def test_customer_create_is_given_exactly_one_network_retry(self) -> None:
+        self.stripe.v1.customers.create.return_value = _customer(customer_id="cus_opt")
+        self.stripe.v1.checkout.sessions.create.return_value = _session(
+            session_id="cs_opt", url="https://checkout.stripe.com/cs_opt"
+        )
+        from fragrance.billing import create_checkout_session
+
+        create_checkout_session(user=self.user, plan_slug="retry-plan")
+
+        self.assertEqual(
+            self.stripe.v1.customers.create.call_args.kwargs["options"], {"max_network_retries": 1}
+        )
+        self.assertNotIn("options", self.stripe.v1.checkout.sessions.create.call_args.kwargs)
+
+    def test_existing_customer_is_reused_without_any_create_call(self) -> None:
+        Subscription.objects.create(user=self.user, stripe_customer_id="cus_have")
+        self.stripe.v1.checkout.sessions.create.return_value = _session(
+            session_id="cs_opt2", url="https://checkout.stripe.com/cs_opt2"
+        )
+        from fragrance.billing import create_checkout_session
+
+        create_checkout_session(user=self.user, plan_slug="retry-plan")
+
+        self.stripe.v1.customers.create.assert_not_called()
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
+class CheckoutDisputeRaceTests(StripeClientTestCase):
+    """
+    A dispute (revoke_for_dispute's single UPDATE) can land at any point during
+    create_checkout_session. It must never be overwritten with
+    "checkout_started", however slow Stripe is.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        _make_plan(slug="race-plan", interval="month")
+        self.user = User.objects.create_user(username="raceuser", email="raceuser@example.com")
+        self.subscription = Subscription.objects.create(
+            user=self.user, stripe_customer_id="cus_race", last_checkout_session_id="cs_before"
+        )
+        self.stripe.v1.checkout.sessions.retrieve.return_value = _session(
+            session_id="cs_before", url="https://checkout.stripe.com/cs_before", status="expired"
+        )
+
+    def _revoke(self) -> None:
+        Subscription.objects.filter(pk=self.subscription.pk).update(
+            status="revoked", access_expires_at=timezone.now()
+        )
+
+    def _assert_locked_and_untouched(self) -> None:
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "revoked")
+        self.assertEqual(self.subscription.last_checkout_session_id, "cs_before")
+
+    def test_revoke_between_the_customer_step_and_session_create_is_not_overwritten(self) -> None:
+        def _create_while_dispute_lands(**kwargs: object) -> stripe.checkout.Session:
+            self._revoke()
+            return _session(session_id="cs_mid", url="https://checkout.stripe.com/cs_mid")
+
+        self.stripe.v1.checkout.sessions.create.side_effect = _create_while_dispute_lands
+        self.stripe.v1.checkout.sessions.expire.return_value = None
+
+        with self.assertRaises(AccountLockedError), self.assertLogs("fragrance.billing", level="WARNING"):
+            create_checkout_session(user=self.user, plan_slug="race-plan")
+
+        self._assert_locked_and_untouched()
+        self.stripe.v1.checkout.sessions.expire.assert_called_once_with("cs_mid")
+
+    def test_the_view_answers_409_account_locked_for_a_mid_request_revoke(self) -> None:
+        def _create_while_dispute_lands(**kwargs: object) -> stripe.checkout.Session:
+            self._revoke()
+            return _session(session_id="cs_mid", url="https://checkout.stripe.com/cs_mid")
+
+        self.stripe.v1.checkout.sessions.create.side_effect = _create_while_dispute_lands
+        self.stripe.v1.checkout.sessions.expire.return_value = None
+        client = APIClient()
+        client.force_authenticate(user=self.user)
+
+        with self.assertLogs("fragrance.billing", level="WARNING"):
+            response = client.post("/api/v1/billing/checkout/", {"slug": "race-plan"})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["code"], "account_locked")
+        self._assert_locked_and_untouched()
+
+    def test_a_failing_expire_never_masks_the_lock(self) -> None:
+        def _create_while_dispute_lands(**kwargs: object) -> stripe.checkout.Session:
+            self._revoke()
+            return _session(session_id="cs_mid", url="https://checkout.stripe.com/cs_mid")
+
+        self.stripe.v1.checkout.sessions.create.side_effect = _create_while_dispute_lands
+        self.stripe.v1.checkout.sessions.expire.side_effect = stripe.APIConnectionError("down")
+
+        with self.assertRaises(AccountLockedError), self.assertLogs("fragrance.billing", level="ERROR") as logs:
+            create_checkout_session(user=self.user, plan_slug="race-plan")
+
+        self.stripe.v1.checkout.sessions.expire.assert_called_once_with("cs_mid")
+        self.assertTrue(any("cs_mid" in line and "could not expire" in line for line in logs.output))
+        self._assert_locked_and_untouched()
+
+    def test_revoke_between_the_first_check_and_the_lock_is_refused_before_any_stripe_write(self) -> None:
+        # The open-session lookup runs after the unlocked check and before the lock.
+        def _retrieve_while_dispute_lands(*args: object, **kwargs: object) -> stripe.checkout.Session:
+            self._revoke()
+            return _session(session_id="cs_before", url="https://checkout.stripe.com/cs_before", status="expired")
+
+        self.stripe.v1.checkout.sessions.retrieve.side_effect = _retrieve_while_dispute_lands
+
+        with self.assertRaises(AccountLockedError):
+            create_checkout_session(user=self.user, plan_slug="race-plan")
+
+        self.stripe.v1.customers.create.assert_not_called()
+        self.stripe.v1.checkout.sessions.create.assert_not_called()
+        self.stripe.v1.checkout.sessions.expire.assert_not_called()
+        self._assert_locked_and_untouched()
+
+    def test_without_a_race_the_row_moves_to_checkout_started(self) -> None:
+        self.stripe.v1.checkout.sessions.create.return_value = _session(
+            session_id="cs_fine", url="https://checkout.stripe.com/cs_fine"
+        )
+
+        url = create_checkout_session(user=self.user, plan_slug="race-plan")
+
+        self.assertEqual(url, "https://checkout.stripe.com/cs_fine")
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "checkout_started")
+        self.assertEqual(self.subscription.last_checkout_session_id, "cs_fine")
+        self.stripe.v1.checkout.sessions.expire.assert_not_called()
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
 class CheckoutCustomerRaceTests(TransactionTestCase):
     """
     Item 6: two concurrent double-submits of Checkout must not each create a
@@ -238,7 +454,7 @@ class CheckoutCustomerRaceTests(TransactionTestCase):
     def test_concurrent_checkout_creates_exactly_one_stripe_customer(self) -> None:
         Plan.objects.create(
             name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
-            amount_cents=400, currency="usd", billing_interval="month", access_days_granted=30,
+            amount_cents=400, currency="usd", billing_interval="month",
         )
         user = User.objects.create_user(
             username="racer_checkout", email="racer_checkout@example.com", password="pw12345!"
@@ -294,7 +510,7 @@ class CheckoutCustomerRaceTests(TransactionTestCase):
 class ExemptCheckoutRefusalTests(TestCase):
     def test_staff_not_superuser_gets_409_with_no_side_effects(self) -> None:
         user = _staff_not_superuser(username="exempt_checkout")
-        _make_plan(slug="ex-plan", interval="month", access_days=30)
+        _make_plan(slug="ex-plan", interval="month")
         client = APIClient()
         client.force_authenticate(user=user)
         with patch_stripe_clients() as (fake, _default, _interactive):
@@ -391,7 +607,7 @@ class BillingSubscriptionViewTests(TestCase):
     def test_active_subscription_reports_plan_and_access(self) -> None:
         plan = Plan.objects.create(
             name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
-            amount_cents=400, billing_interval="month", access_days_granted=30,
+            amount_cents=400, billing_interval="month",
         )
         expiry = timezone.now() + timedelta(days=10)
         Subscription.objects.create(
@@ -466,7 +682,7 @@ class BillingThrottleFailOpenTests(StripeClientTestCase):
         self.client.force_authenticate(user=self.user)
         self.plan = Plan.objects.create(
             name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_fo",
-            amount_cents=400, currency="usd", billing_interval="month", access_days_granted=30,
+            amount_cents=400, currency="usd", billing_interval="month",
         )
 
     def _down(self):

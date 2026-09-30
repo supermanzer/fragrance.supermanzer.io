@@ -76,11 +76,14 @@ logger = logging.getLogger(__name__)
 # value per socket read, not as a total deadline, so the per-call worst case is
 # roughly connect + read = ~13s (0 retries, so exactly one attempt). Per
 # request-path endpoint, worst case: BillingSessionView ~13s (1 call);
-# BillingCheckoutView ~52s (4 calls: reusable-session retrieve, expire a
-# stale session, create-customer, create-session); BillingPortalView and
+# BillingCheckoutView ~66s (4 calls: reusable-session retrieve, expire a
+# stale session, create-customer, create-session -- create-customer alone is
+# given ONE network retry, see _CUSTOMER_CREATE_MAX_NETWORK_RETRIES, so it is
+# ~13s x 2 attempts plus <=0.5s backoff, ~27s; the other three ~13s each);
+# BillingPortalView and
 # BillingChangePlanView up to ~91s (7 calls on the rare path where an existing
 # schedule must be released before a new one is built) -- all comfortably
-# under gunicorn's 120s.
+# under gunicorn's 120s (and nginx's 110s billing proxy_read_timeout).
 _INTERACTIVE_TIMEOUT_SECONDS: tuple[float, float] = (3.05, 10)
 
 
@@ -114,6 +117,15 @@ STUCK_EVENT_MAX_AGE = timedelta(days=3)
 
 
 STUCK_EVENT_MIN_AGE = timedelta(minutes=10)
+
+
+# Checkout runs on the interactive client with 0 retries, but a Customer
+# create that times out would otherwise 502 the whole checkout. This is safe
+# to retry: the SDK sends the same Idempotency-Key on every attempt of one
+# call (proven at the wire in tests/billing/test_stripe_client_seam.py), so a
+# request that reached Stripe before the timeout is not created twice. Applied
+# per request, only to customers.create, via RequestOptions.
+_CUSTOMER_CREATE_MAX_NETWORK_RETRIES = 1
 
 
 # Two module-level http_client instances, constructed once at import time and
@@ -185,6 +197,14 @@ class SessionLookupError(Exception):
     """Base for BillingSessionView errors."""
 
 
+class AccountLockedError(CheckoutError):
+    """
+    The Subscription is `revoked` (a dispute). Checkout is refused with a 409
+    until the operator unlocks the account in Django admin; a payment on a
+    locked account is recorded but never grants access.
+    """
+
+
 class CancellationScheduledError(PlanChangeError):
     code = "cancellation_scheduled"
 
@@ -197,6 +217,10 @@ class ChangeInProgressError(PlanChangeError):
     """Another plan-change request for this user holds the lock -- a 409 the client may retry."""
 
     code = "change_in_progress"
+
+
+class CheckoutSessionUrlMissingError(CheckoutError):
+    """Stripe returned a created Checkout Session with no url (typed Optional[str])."""
 
 
 class ComplimentaryGrantError(Exception):
@@ -343,6 +367,8 @@ def create_checkout_session(
         client = get_interactive_stripe_client()
 
     subscription, _ = Subscription.objects.get_or_create(user=user)  # ty: ignore[unresolved-attribute]
+    if subscription.status == "revoked":
+        raise AccountLockedError()
     if subscription.has_active_access:
         raise SubscriptionAlreadyActiveError()
 
@@ -353,7 +379,8 @@ def create_checkout_session(
         return reusable_url
 
     # Locked only for the check-and-create-if-missing Customer step. This
-    # does span one Stripe network call (Customer.create), but only the
+    # does span one Stripe network call (Customer.create, up to two attempts
+    # of ~13s each on the interactive client, ~27s), but only the
     # first time ever for a given user -- every subsequent checkout for them
     # finds stripe_customer_id already set and returns immediately, still
     # under the lock. It deliberately does NOT extend across Session.create
@@ -364,6 +391,10 @@ def create_checkout_session(
         subscription = Subscription.objects.select_for_update().get(  # ty: ignore[unresolved-attribute]
             pk=subscription.pk
         )
+        # The unlocked check above can be stale by now (a dispute may have
+        # landed while _reusable_open_session_url talked to Stripe).
+        if subscription.status == "revoked":
+            raise AccountLockedError()
         customer_id = _get_or_create_customer(
             user=user, subscription=subscription, client=client
         )
@@ -404,17 +435,39 @@ def create_checkout_session(
             raise TermsUrlNotConfiguredError() from exc
         raise
 
-    subscription.status = "checkout_started"
-    subscription.last_checkout_session_id = session.id
-    subscription.save(update_fields=["status", "last_checkout_session_id"])
-    # stripe-python types checkout.Session.url as Optional[str] (some session
-    # states can carry no url); this function's -> str contract assumes a
-    # freshly created session always has one, which holds in practice but is
-    # not enforced anywhere. Genuine business-logic question (raise if None,
-    # or loosen the return type and push the None-handling to the caller?)
-    # flagged for the operator rather than changed here -- ty's
-    # invalid-return-type check is what surfaced it.
-    return session.url  # ty: ignore[invalid-return-type]
+    # stripe-python types checkout.Session.url as Optional[str]. Checked
+    # before any local state is written: a session the user cannot be sent to
+    # must not leave the row at "checkout_started" pointing at it.
+    url = session.url
+    if not url:
+        logger.error(
+            "checkout session %s was created with no url; refusing", session.id
+        )
+        raise CheckoutSessionUrlMissingError()
+
+    # One conditional UPDATE, atomic against revoke_for_dispute's UPDATE, so a
+    # dispute that landed during Session.create is never overwritten with
+    # "checkout_started" (a stale save() here would silently unlock the account).
+    updated = (
+        Subscription.objects.filter(pk=subscription.pk)  # ty: ignore[unresolved-attribute]
+        .exclude(status="revoked")
+        .update(status="checkout_started", last_checkout_session_id=session.id)
+    )
+    if not updated:
+        logger.warning(
+            "checkout session %s created for a subscription revoked mid-request; expiring it",
+            session.id,
+        )
+        try:
+            client.v1.checkout.sessions.expire(session.id)
+        except stripe.StripeError as exc:
+            logger.error(
+                "could not expire checkout session %s on a locked account: %s",
+                session.id,
+                sanitize_sdk_error_message(exc),
+            )
+        raise AccountLockedError()
+    return url
 
 
 def create_portal_session(
@@ -532,11 +585,11 @@ def fulfill_checkout_session(
         )
 
     subscription, _ = Subscription.objects.get_or_create(user=user)  # ty: ignore[unresolved-attribute]
-    granted = False
+    recorded = False
     invoice = getattr(session, "invoice", None)
     if getattr(session, "payment_status", None) == "unpaid":
         logger.info(
-            "checkout session %s payment_status is unpaid; granting nothing",
+            "checkout session %s payment_status is unpaid; recording nothing",
             session_id,
         )
     elif invoice is not None:
@@ -548,7 +601,7 @@ def fulfill_checkout_session(
             if isinstance(session.customer, str) or session.customer is None
             else session.customer.id
         )
-        granted = _grant_period_for_invoice(
+        recorded = _grant_period_for_invoice(
             invoice=invoice, expected_customer_id=customer_id
         )
 
@@ -584,7 +637,10 @@ def fulfill_checkout_session(
     subscription.refresh_from_db()
     return {
         **subscription_status_payload(subscription=subscription),
-        "granted": granted,
+        # The JSON key stays "granted" (frontend contract); its value is
+        # "a payment was recorded", which is also True for a payment
+        # recorded on a locked account without extending access.
+        "granted": recorded,
     }
 
 
@@ -594,11 +650,13 @@ def fulfill_payment_intent(
     """
     payment_intent.succeeded handler (steps 1-4 of the plan's validation
     chain), invoked from tasks.process_stripe_event. Returns the number of
-    invoices successfully processed -- 0, 1, or more, since one PaymentIntent
-    can settle several invoices. "Processed" is not the same as "extended
-    access": grants are monotonic (see _grant_period_for_invoice), so an
-    invoice that is not the new maximum still counts here even though it
-    left access_expires_at, status and stripe_subscription_id unchanged.
+    invoices whose payment was recorded -- 0, 1, or more, since one
+    PaymentIntent can settle several invoices. "Recorded" is not the same as
+    "extended access": grants are monotonic (see _grant_period_for_invoice),
+    so an invoice that is not the new maximum still counts here even though
+    it left access_expires_at, status and stripe_subscription_id unchanged,
+    and so does a payment recorded on a locked (revoked) account or for an
+    invoice line with no period.
     Raises InvoiceNotSettledError (retryable) when a paid InvoicePayment's
     invoice is still not paid after a re-fetch.
     """
@@ -643,7 +701,7 @@ def fulfill_payment_intent(
         }
     ).auto_paging_iter()
 
-    granted = 0
+    recorded = 0
     saw_any = False
     unsettled: list[str] = []
     for invoice_payment in payments:
@@ -675,10 +733,10 @@ def fulfill_payment_intent(
             expected_customer_id=customer_id,
             payment_intent_id=pi.id,
         ):
-            granted += 1
+            recorded += 1
 
     if unsettled:
-        # Raised only after every settled sibling invoice has been granted.
+        # Raised only after every settled sibling invoice has been recorded.
         raise InvoiceNotSettledError(*unsettled)
 
     if not saw_any:
@@ -689,7 +747,7 @@ def fulfill_payment_intent(
             "payment_intent %s has no paid InvoicePayments; not a subscription payment",
             payment_intent_id,
         )
-    return granted
+    return recorded
 
 
 def get_active_plans() -> list[Plan]:
@@ -854,10 +912,15 @@ def reconcile_subscriptions(
     """
     Backstop for a lost webhook, the only recovery once Stripe's retry window
     has passed. Walks ONE account-wide, paginated list of recently PAID
-    invoices, keeps those whose customer maps to a known, non-revoked local
-    Subscription, skips any already in ProcessedPayment, and feeds the rest
-    through _grant_period_for_invoice -- the single grant path -- so a re-run
-    cannot double-grant. Cost is one Stripe call per 100 invoices regardless
+    invoices, keeps those whose customer maps to a known local Subscription
+    (revoked ones included), skips any already in ProcessedPayment, and feeds
+    the rest through _grant_period_for_invoice -- the single grant path -- so
+    a re-run cannot double-grant. summary["recorded"] counts payments
+    recorded, which includes one recorded on a locked (revoked) account
+    without granting access -- that case also logs at CRITICAL, so money paid
+    on a locked account is recorded and paged even when its webhook was lost,
+    and can never be granted by a later reconcile after an unlock. Cost is one
+    Stripe call per 100 invoices regardless
     of how many subscribers are abandoned or idle. Bounded by a wall-clock
     budget and an invoice-count sanity cap. In dry_run mode nothing is
     written or enqueued: an invoice counts as would_grant when it is paid,
@@ -868,7 +931,7 @@ def reconcile_subscriptions(
     summary = {
         "invoices_seen": 0,
         "invoices_matched": 0,
-        "grants": 0,
+        "recorded": 0,
         "would_grant": 0,
         "already_applied": 0,
         "rejected": 0,
@@ -892,8 +955,7 @@ def reconcile_subscriptions(
     now = timezone.now()
     deadline = time.monotonic() + time_budget_seconds
     known_customers = set(
-        Subscription.objects.exclude(status="revoked")  # ty: ignore[unresolved-attribute]
-        .exclude(stripe_customer_id__isnull=True)
+        Subscription.objects.exclude(stripe_customer_id__isnull=True)  # ty: ignore[unresolved-attribute]
         .exclude(stripe_customer_id="")
         .values_list("stripe_customer_id", flat=True)
     )
@@ -952,11 +1014,10 @@ def reconcile_subscriptions(
                 if _grant_period_for_invoice(
                     invoice=invoice,
                     expected_customer_id=customer_id,
-                    allow_revoked=False,
                 ):
-                    summary["grants"] += 1
+                    summary["recorded"] += 1
                     logger.warning(
-                        "reconcile: granted missed period for customer %s from invoice %s",
+                        "reconcile: recorded missed payment for customer %s from invoice %s",
                         customer_id,
                         invoice.id,
                     )
@@ -976,9 +1037,9 @@ def reconcile_subscriptions(
             sanitize_sdk_error_message(exc),
         )
 
-    if not dry_run and summary["errors"] and not summary["grants"] and pending:
+    if not dry_run and summary["errors"] and not summary["recorded"] and pending:
         logger.error(
-            "reconcile: %d error(s) and NO grants while %d paid invoice(s) were pending; "
+            "reconcile: %d error(s) and NO payments recorded while %d paid invoice(s) were pending; "
             "paying customers may still lack access",
             summary["errors"],
             pending,
@@ -987,12 +1048,12 @@ def reconcile_subscriptions(
     _requeue_stuck_events(summary=summary, now=now, dry_run=dry_run)
 
     logger.info(
-        "reconcile summary: invoices_seen=%d matched=%d grants=%d would_grant=%d "
+        "reconcile summary: invoices_seen=%d matched=%d recorded=%d would_grant=%d "
         "already_applied=%d rejected=%d errors=%d events_requeued=%d capped=%s "
         "deadline_exceeded=%s dry_run=%s",
         summary["invoices_seen"],
         summary["invoices_matched"],
-        summary["grants"],
+        summary["recorded"],
         summary["would_grant"],
         summary["already_applied"],
         summary["rejected"],
@@ -1165,17 +1226,38 @@ def revoke_for_dispute(
         status="revoked", access_expires_at=timezone.now()
     )
 
-    cancelled = _cancel_live_stripe_subscriptions(
-        customer_id=customer_id, client=client
-    )
+    # Both Stripe clean-ups are attempted whatever the other does; the first
+    # failure is raised afterwards so process_stripe_event retries the whole
+    # (idempotent) handler.
+    failure: stripe.StripeError | None = None
+    cancelled: list[str] = []
+    expired_sessions = 0
+    try:
+        cancelled = _cancel_live_stripe_subscriptions(
+            customer_id=customer_id, client=client
+        )
+    except stripe.StripeError as exc:
+        failure = exc
+    try:
+        expired_sessions = _expire_open_checkout_sessions(
+            customer_id=customer_id,
+            known_session_id=str(local.values_list("last_checkout_session_id", flat=True).first() or ""),
+            client=client,
+        )
+    except stripe.StripeError as exc:
+        failure = failure or exc
+    if failure is not None:
+        raise failure
     # This is the "flag for the operator" step from the plan -- there is
     # no ticketing/ops-alert integration in this codebase yet, so a
     # loud, unambiguous log line is the mechanism.
     logger.critical(
         "REVOKED subscription for stripe customer %s due to charge.dispute.created and "
-        "cancelled stripe subscription(s) %s immediately -- operator review required",
+        "cancelled stripe subscription(s) %s immediately and expired %d open checkout "
+        "session(s) -- operator review required",
         customer_id,
         ", ".join(cancelled) or "(none live)",
+        expired_sessions,
     )
 
 
@@ -1184,7 +1266,7 @@ def schedule_plan_change(
     user: User,
     plan_slug: str,
     client: stripe.StripeClient | None = None,
-) -> dict:
+) -> dict | None:
     """
     Schedules a switch to `plan_slug` at the end of the current period, with no
     proration. Verified recipe (sandbox, API 2026-08-26.dahlia): a schedule
@@ -1200,6 +1282,10 @@ def schedule_plan_change(
     interval, not from Plan.billing_interval alone; a disagreement between the
     two raises PlanPriceMismatchError before anything is created in Stripe.
     The whole Stripe sequence runs under the per-user plan-change lock.
+
+    Returns the pending-change payload, or None if the schedule Stripe handed
+    back has no pending phase (should not happen; the view then answers
+    {"pending": null} and the frontend refetches).
     """
     if is_exempt(user=user):
         raise ExemptAccountError()
@@ -1380,32 +1466,135 @@ def sync_customer_email(
     return True
 
 
-def _access_expires_at_for(
-    *, line: Any, plan: Plan, current_expiry: datetime | None
-) -> datetime:
+def validate_plan_price(
+    *,
+    price_id: str,
+    amount_cents: int,
+    currency: str,
+    billing_interval: str,
+    client: stripe.StripeClient | None = None,
+) -> list[str]:
     """
-    Prefers the matched line's own period.end (its billing-period boundary,
-    plus grace) over a locally computed offset, which would drift from
-    Stripe's actual billing date over successive renewals. Falls back to
-    extending from the *later* of now and the current expiry -- so early
-    renewal is safe -- only when period.end is absent. Deliberately reads
-    plan.access_days_granted here, never quota_period_days: the latter is
-    the run-quota window (30 days on every plan) and using it here would
-    hand an annual subscriber one month of access.
+    Checks a Plan's Stripe Price against what the operator typed in Django
+    admin, and returns every problem as a human-readable line (empty list ==
+    the price is acceptable). Fails closed: a missing key or an unreachable
+    Stripe is a problem too, never a silent skip. Runs inside an admin HTTP
+    request, so it uses the interactive client (fast fail, no retries).
+
+    Checks: the Price exists; is active; unit_amount and currency match the
+    Plan; it is recurring with the Plan's interval and interval_count 1; its
+    livemode matches the configured key's mode; it is licensed (not metered),
+    has no transform_quantity and no trial period; and its Product (expanded)
+    is not archived/deleted. Messages never contain the key or raw SDK error
+    text -- failures are logged through sanitize_sdk_error_message instead.
+    """
+    unverified = (
+        "The price could not be verified with Stripe, so nothing was saved. "
+    )
+    try:
+        if client is None:
+            client = get_interactive_stripe_client()
+        price = client.v1.prices.retrieve(
+            price_id, params={"expand": ["product"]}
+        )
+    except ImproperlyConfigured:
+        return [
+            unverified
+            + "Stripe is not configured on this server (STRIPE_SECRET_KEY is unset)."
+        ]
+    except stripe.InvalidRequestError as exc:
+        if exc.code == "resource_missing":
+            return [
+                f"Stripe has no Price with id {price_id!r} in this account and mode "
+                f"(a {'live' if _key_is_live() else 'test'}-mode key is configured)."
+            ]
+        logger.error(
+            "plan price check: Stripe rejected the lookup of %s: %s",
+            price_id,
+            sanitize_sdk_error_message(exc),
+        )
+        return [unverified + "Stripe rejected the lookup; check the price id."]
+    except stripe.StripeError as exc:
+        logger.error(
+            "plan price check: could not reach Stripe for %s: %s",
+            price_id,
+            sanitize_sdk_error_message(exc),
+        )
+        return [unverified + "Stripe could not be reached; try again shortly."]
+
+    problems: list[str] = []
+    if not price.active:
+        problems.append("The Price is not active in Stripe.")
+    if price.unit_amount is None:
+        problems.append("The Price has no fixed unit_amount (tiered or custom pricing).")
+    elif price.unit_amount != amount_cents:
+        problems.append(
+            f"Stripe's amount is {price.unit_amount} cents but this Plan says {amount_cents}."
+        )
+    if (price.currency or "").lower() != currency.lower():
+        problems.append(
+            f"Stripe's currency is {price.currency.upper()} but this Plan says {currency.upper()}."
+        )
+    recurring = price.recurring
+    if recurring is None:
+        problems.append("The Price is not recurring (a one-time Price cannot back a subscription).")
+    else:
+        if recurring.interval != billing_interval:
+            problems.append(
+                f"Stripe's billing interval is {recurring.interval!r} but this Plan says "
+                f"{billing_interval!r}."
+            )
+        if recurring.interval_count != 1:
+            problems.append(
+                f"The Price bills every {recurring.interval_count} {recurring.interval}s; "
+                "only an interval count of 1 is supported."
+            )
+        if recurring.usage_type != "licensed":
+            problems.append(
+                f"The Price is metered (usage_type {recurring.usage_type!r}); invoices would "
+                "not equal unit_amount. Only licensed pricing is supported."
+            )
+        if recurring.trial_period_days:
+            problems.append(
+                f"The Price carries a {recurring.trial_period_days}-day free trial "
+                "(trial_period_days); the first invoice would be for nothing. "
+                "Trials are not supported."
+            )
+    if price.transform_quantity:
+        problems.append(
+            "The Price has a transform_quantity, so what is billed would not equal unit_amount."
+        )
+    if price.livemode != _key_is_live():
+        problems.append(
+            f"The Price is {'live' if price.livemode else 'test'}-mode but the configured "
+            f"Stripe key is {'live' if _key_is_live() else 'test'}-mode."
+        )
+    product = price.product
+    if not isinstance(product, str) and (
+        getattr(product, "deleted", False)
+        or getattr(product, "active", True) is False
+    ):
+        problems.append("The Price's Product is archived or deleted in Stripe.")
+    return problems
+
+
+def _access_expires_at_for(*, line: Any) -> datetime | None:
+    """
+    The matched line's own period.end (its billing-period boundary) plus
+    grace, or None when the line carries no period. There is deliberately no
+    locally computed fallback: access is dated only by Stripe, and a locally
+    guessed date would drift from Stripe's billing date (and, being always
+    later than the current expiry, defeat the monotonic-grant guard). The
+    caller records the payment and grants nothing on None.
     """
     period = getattr(line, "period", None)
     period_end = getattr(period, "end", None) if period else None
-    if period_end:
-        return (
-            datetime.fromtimestamp(period_end, tz=dt_timezone.utc)
-            + _PERIOD_END_GRACE
-        )
-    base = max(timezone.now(), current_expiry or timezone.now())
-    # Django noise, not a Stripe params-shape issue: plan.access_days_granted
-    # is a PositiveIntegerField descriptor to ty (no django-stubs installed),
-    # and int() doesn't help -- the stub doesn't declare __int__/__index__
-    # either. It is a plain int at runtime.
-    return base + timedelta(days=plan.access_days_granted)  # ty: ignore[invalid-argument-type]
+    if not period_end:
+        return None
+    return (
+        datetime.fromtimestamp(period_end, tz=dt_timezone.utc)
+        + _PERIOD_END_GRACE
+    )
 
 
 def _cancel_live_stripe_subscriptions(
@@ -1487,6 +1676,63 @@ def _current_price_ids(*, stripe_subscription: Any) -> set[str]:
     }
 
 
+def _expire_open_checkout_sessions(
+    *, customer_id: str, known_session_id: str, client: stripe.StripeClient
+) -> int:
+    """
+    Expires every OPEN Checkout Session of a disputed customer (plus the
+    locally remembered last_checkout_session_id if Stripe still reports it
+    open), so a session created before the dispute cannot be paid into the
+    locked account. Returns how many this call expired. Idempotent: a session
+    that is already expired or complete counts as done (and is not counted).
+    Any other Stripe failure is raised after every session was attempted, so
+    process_stripe_event's retry re-runs the handler.
+    """
+    open_ids = [
+        session.id
+        for session in client.v1.checkout.sessions.list(
+            params={"customer": customer_id, "status": "open", "limit": 100}
+        ).auto_paging_iter()
+    ]
+    failure: stripe.StripeError | None = None
+    if known_session_id and known_session_id not in open_ids:
+        try:
+            if client.v1.checkout.sessions.retrieve(known_session_id).status == "open":
+                open_ids.append(known_session_id)
+        except stripe.InvalidRequestError:
+            pass
+        except stripe.StripeError as exc:
+            logger.error(
+                "dispute: could not look up checkout session %s", known_session_id
+            )
+            failure = exc
+    expired = 0
+    for session_id in open_ids:
+        try:
+            client.v1.checkout.sessions.expire(session_id)
+        except stripe.InvalidRequestError as exc:
+            try:
+                already_done = (
+                    client.v1.checkout.sessions.retrieve(session_id).status != "open"
+                )
+            except stripe.StripeError:
+                already_done = False
+            if not already_done:
+                logger.error(
+                    "dispute: could not expire checkout session %s", session_id
+                )
+                failure = failure or exc
+            continue
+        except stripe.StripeError as exc:
+            logger.error("dispute: could not expire checkout session %s", session_id)
+            failure = failure or exc
+            continue
+        expired += 1
+    if failure is not None:
+        raise failure
+    return expired
+
+
 def _get_or_create_customer(
     *, user: User, subscription: Subscription, client: stripe.StripeClient
 ) -> str:
@@ -1496,6 +1742,11 @@ def _get_or_create_customer(
     otherwise both read stripe_customer_id as empty and each create a
     separate Stripe Customer, with the last local .save() winning and
     orphaning the other Customer (see create_checkout_session).
+
+    The one call in checkout given a network retry (see
+    _CUSTOMER_CREATE_MAX_NETWORK_RETRIES): the retry reuses the call's
+    Idempotency-Key, so a create that timed out after reaching Stripe
+    returns the same Customer instead of making a second one.
     """
     if subscription.stripe_customer_id:
         return str(subscription.stripe_customer_id)
@@ -1506,7 +1757,8 @@ def _get_or_create_customer(
             # plain str at runtime -- see [tool.ty] in pyproject.toml.
             email=str(user.email),
             metadata={"user_id": str(user.id)},  # ty: ignore[unresolved-attribute]
-        )
+        ),
+        options={"max_network_retries": _CUSTOMER_CREATE_MAX_NETWORK_RETRIES},
     )
     subscription.stripe_customer_id = customer.id  # ty: ignore[invalid-assignment]
     subscription.save(update_fields=["stripe_customer_id"])
@@ -1518,15 +1770,18 @@ def _grant_period_for_invoice(
     invoice: Any,
     expected_customer_id: str | None = None,
     payment_intent_id: str = "",
-    allow_revoked: bool = True,
 ) -> bool:
     """
     Steps 5-10 of the payment_intent.succeeded validation chain -- shared by
-    fulfill_payment_intent (one call per invoice found via InvoicePayments)
-    and fulfill_checkout_session (a single invoice resolved directly from
-    the Checkout Session). Every rejection here is documented in the plan as
-    "log and grant nothing," never an exception -- this function returns
-    False rather than raising for any of them.
+    fulfill_payment_intent (one call per invoice found via InvoicePayments),
+    fulfill_checkout_session (a single invoice resolved directly from the
+    Checkout Session) and reconcile_subscriptions. Every rejection here is
+    documented in the plan as "log and grant nothing," never an exception.
+
+    Returns True when a payment was RECORDED (a ProcessedPayment row was
+    written by this call), whether or not access was extended; False when
+    nothing was recorded -- a rejection, or an invoice already applied. Both
+    "recorded but grants nothing" cases below return True.
 
     Gates on the invoice itself being paid (status == "paid" and
     amount_remaining == 0, per stripe==15.6.1 Invoice.status / amount_remaining)
@@ -1534,12 +1789,13 @@ def _grant_period_for_invoice(
     subscription whose first payment fails leaves an "open" invoice with
     amount_remaining > 0 attached to the Checkout Session.
 
-    allow_revoked defaults True: the webhook and success-page paths must let a
-    revoked customer subscribe again. Background reconciliation passes False,
-    and the check is made under the row lock so a dispute revoke landing
-    mid-loop cannot be overwritten. A revoke (see revoke_for_dispute) resets
-    access_expires_at to "now", so a re-subscribe's freshly computed expiry is
-    always the new maximum -- no special case needed here.
+    A `revoked` (disputed) Subscription can never gain access through a
+    payment, by any path, until the operator unlocks it in Django admin. The
+    check is made under the row lock so a dispute revoke landing mid-loop
+    cannot be overwritten. The payment is still recorded (never reprocessed)
+    and logged at CRITICAL: money reached a locked account and needs a manual
+    refund. Likewise an invoice line with no period.end is recorded, grants
+    nothing and logs at CRITICAL -- access is dated only by Stripe.
 
     Grants are monotonic: access_expires_at only ever moves to
     max(current, computed for this invoice). A ProcessedPayment row is
@@ -1550,8 +1806,7 @@ def _grant_period_for_invoice(
     and stripe_subscription_id, however, are only overwritten when this
     invoice *is* the new maximum -- they describe the subscription that
     earned the current expiry, and must not be dragged back to an older
-    subscription's values (or un-revoke a disputed row) just because its
-    payment settled late.
+    subscription's values just because its payment settled late.
     """
     if (
         getattr(invoice, "status", None) != "paid"
@@ -1591,7 +1846,7 @@ def _grant_period_for_invoice(
     matched = _match_plan_line(invoice=invoice)
     if matched is None:
         logger.warning(
-            "stripe invoice %s matches no active Plan price; skipping",
+            "stripe invoice %s matches no known Plan price; skipping",
             invoice.id,
         )
         return False
@@ -1640,17 +1895,43 @@ def _grant_period_for_invoice(
         locked = Subscription.objects.select_for_update().get(  # ty: ignore[unresolved-attribute]
             pk=local_subscription.pk
         )
-        if locked.status == "revoked" and not allow_revoked:
-            logger.warning(
-                "stripe invoice %s for revoked subscription %s; not re-granting",
-                invoice.id,
-                locked.pk,
-            )
+        new_expiry = _access_expires_at_for(line=line)
+        if not _record_payment(
+            invoice=invoice,
+            payment_intent_id=payment_intent_id,
+            stripe_subscription_id=stripe_subscription_id,
+            subscription=locked,
+            period_end=new_expiry,
+        ):
             return False
+
+        if locked.status == "revoked":
+            logger.critical(
+                "MONEY RECEIVED ON A LOCKED ACCOUNT: stripe invoice %s (%s cents paid) for "
+                "revoked subscription %s (stripe customer %s) was recorded but granted NOTHING. "
+                "Needs a manual refund in Stripe; unlock the account in Django admin only "
+                "after that is settled.",
+                invoice.id,
+                invoice.amount_paid,
+                locked.pk,
+                invoice_customer_id,
+            )
+            return True
+        if new_expiry is None:
+            logger.critical(
+                "PAID INVOICE WITH NO PERIOD: stripe invoice %s (%s cents paid) for "
+                "subscription %s (stripe customer %s) matched plan %s but its line carries no "
+                "period.end. The payment was recorded and access was NOT granted; the operator "
+                "must resolve it (comp access with grant_access, or refund).",
+                invoice.id,
+                invoice.amount_paid,
+                locked.pk,
+                invoice_customer_id,
+                plan.slug,
+            )
+            return True
+
         current_expiry = locked.access_expires_at
-        new_expiry = _access_expires_at_for(
-            line=line, plan=plan, current_expiry=current_expiry
-        )
         # Access is a projection over a set of payments, and payments can
         # arrive out of order (a lapsed subscriber's old subscription
         # settling late, a PaymentIntent that lists its invoices in no
@@ -1661,38 +1942,12 @@ def _grant_period_for_invoice(
         # commutative too. An invoice that isn't the new maximum still
         # proves a real, successful payment, so it still records a
         # ProcessedPayment row -- but it must not touch status, plan or
-        # stripe_subscription_id. Touching status="active" unconditionally
-        # would un-revoke a disputed row just because an old, lower invoice
-        # for it settled late; touching plan/stripe_subscription_id would
-        # roll them back to whatever that older invoice was billed against.
-        # All three must only ever be written by the invoice that actually
-        # produced the current (latest) expiry.
+        # stripe_subscription_id, which would roll them back to whatever
+        # that older invoice was billed against. All three must only ever
+        # be written by the invoice that actually produced the current
+        # (latest) expiry.
         produces_new_max = current_expiry is None or new_expiry > current_expiry
         final_expiry = new_expiry if produces_new_max else current_expiry
-        try:
-            # Nested atomic() -> a savepoint, not the outer transaction: an
-            # IntegrityError here (the unique constraint on
-            # stripe_invoice_id, i.e. this invoice was already applied)
-            # must only roll back this insert, not the Subscription lock
-            # acquired above. Scoped to this one statement so a later
-            # IntegrityError on locked.save() (e.g. a stripe_subscription_id
-            # collision -- a real data problem) is never caught here and
-            # misread as "already applied."
-            with transaction.atomic():
-                ProcessedPayment.objects.create(  # ty: ignore[unresolved-attribute]
-                    stripe_invoice_id=invoice.id,
-                    stripe_payment_intent_id=payment_intent_id,
-                    stripe_subscription_id=stripe_subscription_id,
-                    subscription=locked,
-                    amount_paid_cents=invoice.amount_paid,
-                    period_end=new_expiry,
-                )
-        except IntegrityError:
-            logger.info(
-                "stripe invoice %s already applied; no second grant", invoice.id
-            )
-            return False
-
         locked.access_expires_at = final_expiry
         locked.last_paid_at = timezone.now()
         if produces_new_max:
@@ -1710,8 +1965,8 @@ def _grant_period_for_invoice(
         )
         if not produces_new_max:
             logger.info(
-                "stripe invoice %s granted for subscription %s but did not extend "
-                "access (existing expiry %s >= this invoice's %s); recorded, "
+                "stripe invoice %s recorded for subscription %s but did not extend "
+                "access (existing expiry %s >= this invoice's %s); "
                 "status/plan/stripe_subscription_id left unchanged",
                 invoice.id,
                 locked.pk,
@@ -1733,6 +1988,11 @@ def _invoice_is_settled(*, invoice: Any) -> bool:
         getattr(invoice, "status", None) == "paid"
         and getattr(invoice, "amount_remaining", None) == 0
     )
+
+
+def _key_is_live() -> bool:
+    """Same test/live rule configure_stripe_portal uses: anything but an sk_test_/rk_test_ key is live."""
+    return not settings.STRIPE_SECRET_KEY.startswith(("sk_test_", "rk_test_"))
 
 
 def _live_schedule(
@@ -1765,7 +2025,7 @@ def _match_plan_line(*, invoice: Any) -> tuple[Plan, Any] | None:
 
     Deliberately not filtered to is_active=True: that flag means "offered at
     checkout / plan-change target", not "honoured at renewal". A retired
-    Plan row (see seed_plans --rotate-price) must stay matchable forever, or
+    Plan row (is_active switched off in admin) must stay matchable forever, or
     every existing subscriber still billing on the old Price would renew
     into a grant of nothing at their very next invoice.
     """
@@ -1895,6 +2155,44 @@ def _price_id_of(*, price: Any) -> str:
     return price if isinstance(price, str) else getattr(price, "id", "")
 
 
+def _record_payment(
+    *,
+    invoice: Any,
+    payment_intent_id: str,
+    stripe_subscription_id: str,
+    subscription: Subscription,
+    period_end: datetime | None,
+) -> bool:
+    """
+    Writes the ProcessedPayment row for `invoice`; False if it already exists
+    (this invoice was already applied). Must run inside the caller's
+    transaction.atomic() with the Subscription row locked.
+
+    Nested atomic() -> a savepoint, not the outer transaction: an
+    IntegrityError here (the unique constraint on stripe_invoice_id) must
+    only roll back this insert, not the Subscription lock acquired by the
+    caller. Scoped to this one statement so a later IntegrityError on
+    subscription.save() (e.g. a stripe_subscription_id collision -- a real
+    data problem) is never caught here and misread as "already applied."
+    """
+    try:
+        with transaction.atomic():
+            ProcessedPayment.objects.create(  # ty: ignore[unresolved-attribute]
+                stripe_invoice_id=invoice.id,
+                stripe_payment_intent_id=payment_intent_id,
+                stripe_subscription_id=stripe_subscription_id,
+                subscription=subscription,
+                amount_paid_cents=invoice.amount_paid,
+                period_end=period_end,
+            )
+    except IntegrityError:
+        logger.info(
+            "stripe invoice %s already applied; recording nothing", invoice.id
+        )
+        return False
+    return True
+
+
 def _release_spent_schedule(
     *, stripe_subscription: Any, client: stripe.StripeClient
 ) -> None:
@@ -1963,8 +2261,8 @@ def _reusable_open_session_url(
     if existing.status != "open":
         return None
     # Both the slug *and* the price id must match. The slug alone survives
-    # exactly the change that matters: if the operator re-runs seed_plans
-    # with a new --monthly-price-id (test -> live, or a genuine price
+    # exactly the change that matters: if a Plan row is replaced on the same
+    # slug with a different Stripe Price (test -> live, or a genuine price
     # change), a stale open session for "beta-monthly" would otherwise be
     # handed back and the user would check out against the old Price --
     # the same "validate the price, not a proxy for it" reasoning the plan
@@ -1990,7 +2288,7 @@ def _schedule_plan_change_locked(
     local: Subscription,
     target: Plan,
     client: stripe.StripeClient,
-) -> dict:
+) -> dict | None:
     stripe_sub = _stripe_subscription_with_schedule(
         stripe_subscription_id=str(local.stripe_subscription_id), client=client
     )
@@ -2084,15 +2382,9 @@ def _schedule_plan_change_locked(
         target.slug,
         payload["effective_at"] if payload else None,
     )
-    # _pending_change_payload can return None (no pending phase), which this
-    # function's -> dict contract doesn't allow for. It should be impossible
-    # here -- the schedule was just built two phases up above with the
-    # target as the later one -- but that relies on Stripe echoing back the
-    # phases in the order requested, not on anything this function proves
-    # itself. Genuine business-logic question (assert, or loosen the return
-    # type and let the view handle None) flagged for the operator rather
-    # than changed here.
-    return payload  # ty: ignore[invalid-return-type]
+    # None only if Stripe echoed the schedule back without a pending phase --
+    # not provable here, so it is returned as-is rather than asserted.
+    return payload
 
 
 def _stripe_subscription_with_schedule(

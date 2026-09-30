@@ -3,7 +3,6 @@ from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
 from unittest.mock import patch
 
-import stripe
 from django.contrib.auth.models import User
 from django.test import TestCase, override_settings
 from django.urls import reverse
@@ -325,17 +324,13 @@ class RevokedAndResendTests(StripeClientTestCase):
         self.client = APIClient()
         self.client.force_authenticate(user=self.user)
 
-    def test_revoked_user_can_start_checkout_again(self) -> None:
-        plan = _make_plan(slug="rev-plan", interval="month", access_days=30)
+    def test_revoked_user_checkout_is_refused_as_account_locked(self) -> None:
+        plan = _make_plan(slug="rev-plan", interval="month")
         Subscription.objects.create(
             user=self.user,
             status="revoked",
             access_expires_at=timezone.now(),
             stripe_customer_id="cus_rev",
-        )
-        self.stripe.v1.checkout.sessions.create.return_value = stripe.checkout.Session.construct_from(
-            {"id": "cs_1", "object": "checkout.session", "url": "https://checkout.example/x"},
-            "sk_test_x",
         )
         with override_settings(
             STRIPE_SECRET_KEY="sk_test_x",
@@ -344,8 +339,9 @@ class RevokedAndResendTests(StripeClientTestCase):
             response = self.client.post(
                 reverse("billing-checkout"), {"slug": plan.slug}, format="json"
             )
-        self.assertEqual(response.status_code, 200, response.content)
-        self.assertEqual(response.json()["url"], "https://checkout.example/x")
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertEqual(response.json()["code"], "account_locked")
+        self.stripe.v1.checkout.sessions.create.assert_not_called()
 
     def test_resend_email_is_402_for_lapsed_user(self) -> None:
         run = RecommendationRun.objects.create(user=self.user, status="done")

@@ -114,7 +114,7 @@ class StartRecommendationRunTests(TestCase):
             start_recommendation_run(user=self.user, source="test")
 
     def test_annual_plan_gets_one_run_per_30_days_not_twelve(self) -> None:
-        annual = _make_plan(slug="annual-q", interval="year", access_days=365)
+        annual = _make_plan(slug="annual-q", interval="year")
         active_subscription_for(self.user, plan=annual, days=365)
         start_recommendation_run(user=self.user, source="test")
         self._finish_latest(run_status="done")
@@ -124,7 +124,7 @@ class StartRecommendationRunTests(TestCase):
         start_recommendation_run(user=self.user, source="test")
 
     def test_larger_allowance_next_eligible_uses_correct_run(self) -> None:
-        plan = _make_plan(slug="three-q", interval="month", access_days=30)
+        plan = _make_plan(slug="three-q", interval="month")
         plan.max_runs_per_quota_period = 3
         plan.save()
         active_subscription_for(self.user, plan=plan)
@@ -573,7 +573,7 @@ class BeatQuotaToleranceTests(TestCase):
         self,
     ) -> None:
         """The beat tolerance is subtracted from quota_period_days, never billing_interval."""
-        annual = _make_plan(slug="annual-tol", interval="year", access_days=365)
+        annual = _make_plan(slug="annual-tol", interval="year")
         active_subscription_for(user=self.user, plan=annual, days=365)
         self._run_and_backdate(days_ago=28)
         run = start_recommendation_run(user=self.user, source="beat")
@@ -627,7 +627,7 @@ class QuotaSnapshotPayloadTests(TestCase):
         )
 
     def test_annual_plan_reports_one_run_allowed(self) -> None:
-        annual = _make_plan(slug="annual-s", interval="year", access_days=365)
+        annual = _make_plan(slug="annual-s", interval="year")
         active_subscription_for(self.user, plan=annual, days=365)
         self.assertEqual(self._quota()["runs_allowed"], 1)
 

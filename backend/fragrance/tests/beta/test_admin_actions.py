@@ -30,7 +30,6 @@ class BetaSignupAdminApproveTests(TestCase):
             stripe_price_id="price_default_monthly",
             amount_cents=400,
             billing_interval="month",
-            access_days_granted=30,
         )
 
     def _changelist_url(self) -> str:
@@ -57,7 +56,8 @@ class BetaSignupAdminApproveTests(TestCase):
         self.assertTrue(user.is_active)
         self.assertFalse(user.has_usable_password())
 
-    def test_approve_creates_subscription_with_default_plan_and_none_status(self) -> None:
+    def test_approve_creates_subscription_with_null_plan_and_none_status(self) -> None:
+        """Approval no longer assigns a plan, even when an active Plan exists: the first grant sets it."""
         signup = BetaSignup.objects.create(email="sub@example.com", normalized_email="sub@example.com")
         with patch.object(send_beta_invite_email, "delay"):
             self._approve([signup.pk])
@@ -65,7 +65,8 @@ class BetaSignupAdminApproveTests(TestCase):
         signup.refresh_from_db()
         sub = Subscription.objects.get(user=signup.invited_user)
         self.assertEqual(sub.status, "none")
-        self.assertEqual(sub.plan, self.plan)
+        self.assertIsNone(sub.plan)
+        self.assertTrue(Plan.objects.filter(pk=self.plan.pk, is_active=True).exists())
 
     def test_approve_with_no_plan_seeded_creates_subscription_with_null_plan(self) -> None:
         Plan.objects.all().delete()

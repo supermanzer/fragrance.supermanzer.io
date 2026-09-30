@@ -208,3 +208,92 @@ class FragranceConfigScheduleValidationTests(TestCase):
             run_month=1,
         )
         self.assertEqual(response.status_code, 200)
+
+
+class MonthlyOnlyFrequencyTests(TestCase):
+    """Only monthly is offered; the weekly/yearly columns and code stay for a later reintroduction."""
+
+    url = "/api/v1/config/"
+
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="freq", password="pw12345!")
+        active_subscription_for(self.user)
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def test_only_monthly_is_a_valid_choice(self) -> None:
+        from fragrance.models import FREQUENCIES
+
+        self.assertEqual(FREQUENCIES, [("monthly", "Monthly")])
+
+    def test_weekly_and_yearly_are_rejected_with_a_field_error(self) -> None:
+        for value in ("weekly", "yearly", "daily", "", "MONTHLY"):
+            with self.subTest(frequency=value):
+                response = self.client.patch(self.url, {"frequency": value}, format="json")
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("frequency", response.json())
+
+    def test_rejected_frequency_is_not_persisted(self) -> None:
+        self.client.get(self.url)
+        self.client.patch(self.url, {"frequency": "weekly"}, format="json")
+        self.assertEqual(FragranceConfig.objects.get(user=self.user).frequency, "monthly")
+
+    def test_monthly_is_accepted(self) -> None:
+        response = self.client.patch(self.url, {"frequency": "monthly"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["frequency"], "monthly")
+
+    def test_omitting_frequency_keeps_monthly(self) -> None:
+        response = self.client.patch(self.url, {"run_hour": 4}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["frequency"], "monthly")
+
+    def test_a_legacy_weekly_row_can_still_be_read_and_edited_without_touching_frequency(self) -> None:
+        FragranceConfig.objects.create(
+            user=self.user, recipient_email="legacy@example.com", frequency="weekly"
+        )
+        self.assertEqual(self.client.get(self.url).json()["frequency"], "weekly")
+        response = self.client.patch(self.url, {"run_hour": 5}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["frequency"], "weekly")
+
+
+class ScheduleSignalFrequencyTests(TestCase):
+    """What signals.sync_user_schedule builds for monthly, for legacy non-monthly rows, and for junk."""
+
+    def _crontab(self, *, frequency: str, **fields: object):
+        from django_celery_beat.models import PeriodicTask
+
+        user = User.objects.create_user(username=f"sig_{frequency or 'blank'}", password="pw12345!")
+        FragranceConfig.objects.create(
+            user=user, recipient_email="s@example.com", frequency=frequency, **fields
+        )
+        return PeriodicTask.objects.get(name=f"fragrance-run-{user.id}").crontab
+
+    def test_monthly_runs_on_its_day_of_month(self) -> None:
+        crontab = self._crontab(frequency="monthly", run_day_of_month=17, run_hour=6)
+        self.assertEqual(
+            (crontab.day_of_month, crontab.day_of_week, crontab.month_of_year, crontab.hour),
+            ("17", "*", "*", "6"),
+        )
+
+    def test_legacy_weekly_row_keeps_its_weekly_schedule(self) -> None:
+        crontab = self._crontab(frequency="weekly", run_day_of_week=3, run_hour=6)
+        self.assertEqual(
+            (crontab.day_of_week, crontab.day_of_month, crontab.month_of_year),
+            ("3", "*", "*"),
+        )
+
+    def test_legacy_yearly_row_keeps_its_yearly_schedule(self) -> None:
+        crontab = self._crontab(frequency="yearly", run_day_of_month=9, run_month=4)
+        self.assertEqual(
+            (crontab.day_of_month, crontab.month_of_year, crontab.day_of_week),
+            ("9", "4", "*"),
+        )
+
+    def test_an_unrecognised_frequency_falls_back_to_monthly_never_daily(self) -> None:
+        crontab = self._crontab(frequency="daily", run_day_of_month=12, run_hour=7)
+        self.assertEqual(
+            (crontab.day_of_month, crontab.day_of_week, crontab.month_of_year, crontab.hour),
+            ("12", "*", "*", "7"),
+        )

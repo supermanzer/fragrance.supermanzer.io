@@ -33,7 +33,7 @@ _SPEC_CLIENT = stripe.StripeClient(api_key="sk_test_autospec_dummy")
 # reaching a real, failing Stripe call).
 _GUARDED_METHODS: dict[str, list[str]] = {
     "customers": ["create", "retrieve", "update"],
-    "checkout.sessions": ["create", "retrieve", "expire"],
+    "checkout.sessions": ["create", "retrieve", "expire", "list"],
     "invoice_payments": ["list"],
     "invoices": ["list", "retrieve"],
     "payment_intents": ["retrieve"],
