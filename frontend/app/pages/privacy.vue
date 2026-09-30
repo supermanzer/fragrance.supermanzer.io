@@ -33,7 +33,7 @@ const summary: readonly string[] = [
   `We collect what's needed to run the service: your email, the fragrances and notes you enter, your recommendation history, and basic billing records. We never see your full card number.`,
   `To make recommendations we send your collection to an AI provider (Anthropic), and search the web through our own search engine. Emails go through Postmark and payments through Stripe.`,
   `We don't sell your data, we don't run advertising, and we don't use analytics trackers.`,
-  `You can export your collection as a CSV at any time, and ask us to correct or delete your data by emailing [CONTACT EMAIL].`,
+  `You can export your collection as a CSV at any time, and ask us to correct or delete your data by emailing support@supermanzer.io.`,
   `We use your browser's local storage to keep you signed in. There are no advertising or tracking cookies.`,
 ]
 
@@ -42,20 +42,20 @@ const sections: readonly LegalSection[] = [
     id: 'who-we-are',
     title: '1. Who we are',
     blocks: [
-      `[LEGAL NAME] ("we", "us") operates Fragrances at fragrances.supermanzer.io and is the controller of the personal information described here. Contact: [CONTACT EMAIL].`,
+      `Supermanzer LLC ("we", "us") operates Fragrances at fragrances.supermanzer.io and is the controller of the personal information described here. Contact: support@supermanzer.io.`,
     ],
   },
   {
     id: 'information-we-collect',
     title: '2. Information we collect',
     blocks: [
-      `Account information. Your email address (which also serves as your account name) and a password. Passwords are stored only as a salted hash, never in readable form. [CONFIRM: username collected separately?]`,
+      `Account information. Your email address (which also serves as your account name) and a password. Passwords are stored only as a salted hash, never in readable form.`,
       `Your collection. For each fragrance you add: its name, house (brand), whether you own it, like it, or dislike it, and any notes you write. You can also import a collection from a CSV file.`,
       `Delivery settings. The email address recommendations are sent to and your schedule preferences (frequency and time).`,
       `Recommendation history. For each monthly run: the taste profile generated from your collection (loved, liked, and disliked notes, and two search phrases), the five fragrances recommended with the explanation for each, the full text of the email we sent you, its delivery status, and timestamps. This history also stops us recommending the same fragrance twice.`,
       `Waitlist information. When you join the beta waitlist, your email address, the time of your request, and its approval status. To reduce abuse, we also store a one-way hash of your IP address. It cannot be turned back into your IP address.`,
       `Billing information. A customer and subscription reference from Stripe, your subscription status, the plan, payment dates and amounts, and the dates your access covers. Card details are entered on Stripe's pages and go to Stripe; we do not receive or store them. We also keep a record of the event notifications Stripe sends us about your account so payments are applied correctly.`,
-      `Technical information. When you use the Service, our servers and network providers process your IP address and standard request details (such as browser type and the pages requested). We use them to deliver the Service, limit abuse and repeated requests, and diagnose faults. [CONFIRM: web server log retention.]`,
+      `Technical information. When you use the Service, our servers and network providers process your IP address and standard request details (such as browser type and the pages requested). We use them to deliver the Service, limit abuse and repeated requests, and diagnose faults.`,
       `Communications. If you email us, we keep the message and our reply.`,
     ],
   },
@@ -110,11 +110,11 @@ const sections: readonly LegalSection[] = [
     title: '6. How long we keep information',
     blocks: [
       `We keep your account, collection, and recommendation history for as long as your account exists, including after a subscription lapses (in read-only mode), so that you can come back without starting over.`,
-      `Stripe event records: the detailed notification content is removed after 90 days; a summary record (event type and time) is kept. Payment records needed for accounting are kept for [BILLING RECORDS RETENTION PERIOD, e.g. 7 years].`,
-      `Waitlist entries: [WAITLIST RETENTION PERIOD, e.g. kept while pending or approved; rejected entries removed after N months].`,
-      `Server and network logs: [LOG RETENTION PERIOD].`,
-      `Backups: deleted data may remain in backups for up to [BACKUP RETENTION PERIOD] before being overwritten.`,
-      `Emails you send us: [SUPPORT EMAIL RETENTION PERIOD].`,
+      `Stripe event records: the detailed notification content is removed after 90 days; a summary record (event type and time) is kept. Payment records needed for accounting are kept for 7 years.`,
+      `Waitlist entries: kept while pending or approved; rejected entries are removed after 6 months.`,
+      `Server and network logs: 30 days.`,
+      `Backups: deleted data may remain in backups for up to 30 days before being overwritten.`,
+      `Emails you send us: kept for up to 2 years.`,
     ],
   },
   {
@@ -122,7 +122,7 @@ const sections: readonly LegalSection[] = [
     title: '7. Your choices and rights',
     blocks: [
       `You can view and edit your collection in the app, and export it as a CSV file at any time, including after a subscription lapses. You can change your delivery email and schedule in Settings.`,
-      `You can ask us to give you a copy of your information, correct it, or delete your account and the data linked to it, by emailing [CONTACT EMAIL]. We'll respond within [RESPONSE TIME, e.g. 30 days]. We may need to keep limited records (for example, payment records) where the law requires.`,
+      `You can ask us to give you a copy of your information, correct it, or delete your account and the data linked to it, by emailing support@supermanzer.io. We'll respond within 30 days. We may need to keep limited records (for example, payment records) where the law requires.`,
       `Depending on where you live, you may also have rights to object to or restrict certain processing, to data portability, and to complain to your local data protection authority. [JURISDICTION-SPECIFIC RIGHTS SECTION, e.g. GDPR / UK GDPR / CCPA, per counsel.]`,
       `We can't currently delete your account from within the app; deletion is handled by request.`,
     ],
@@ -145,21 +145,21 @@ const sections: readonly LegalSection[] = [
     id: 'children',
     title: '10. Children',
     blocks: [
-      `The Service is not for anyone under 18, and we don't knowingly collect information from children. If you believe a child has given us information, tell us at [CONTACT EMAIL] and we'll delete it.`,
+      `The Service is not for anyone under 18, and we don't knowingly collect information from children. If you believe a child has given us information, tell us at support@supermanzer.io and we'll delete it.`,
     ],
   },
   {
     id: 'changes-to-this-policy',
     title: '11. Changes to this policy',
     blocks: [
-      `We may update this policy. For material changes we'll email you or show a notice at least [POLICY CHANGE NOTICE PERIOD] days before they take effect. The date and version above show the current version.`,
+      `We may update this policy. For material changes we'll email you or show a notice at least 30 days before they take effect. The date and version above show the current version.`,
     ],
   },
   {
     id: 'contact',
     title: '12. Contact',
     blocks: [
-      `Privacy questions or requests: [CONTACT EMAIL]. [LEGAL NAME], [POSTAL ADDRESS OR 'available on request'].`,
+      `Privacy questions or requests: support@supermanzer.io. Supermanzer LLC; postal address available on request.`,
     ],
   },
 ]

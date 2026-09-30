@@ -42,7 +42,7 @@ const sections: readonly LegalSection[] = [
     id: 'about-these-terms',
     title: '1. About these terms',
     blocks: [
-      `These Terms of Service ("Terms") are an agreement between you and [LEGAL NAME] ("we", "us", "our"), which operates Fragrances at fragrances.supermanzer.io (the "Service").`,
+      `These Terms of Service ("Terms") are an agreement between you and Supermanzer LLC ("we", "us", "our"), which operates Fragrances at fragrances.supermanzer.io (the "Service").`,
       `By accepting an invitation, creating an account, subscribing, or otherwise using the Service, you agree to these Terms and to our Privacy Policy. If you don't agree, please don't use the Service.`,
       `You must be at least 18 years old to use the Service.`,
     ],
@@ -65,7 +65,7 @@ const sections: readonly LegalSection[] = [
           `Features, plans, prices, and limits may change, be added, or be removed.`,
           `The Service may be unavailable, slow, or produce errors, including failed or missing monthly runs.`,
           `We do not guarantee any level of uptime, availability, or delivery time for emails.`,
-          `We may end the beta or the Service, in whole or in part, at any time. If we end the Service while you have paid time remaining, we will [REFUND POLICY ON SERVICE SHUTDOWN, e.g. refund the unused portion of your current period].`,
+          `We may end the beta or the Service, in whole or in part, at any time. If we end the Service while you have paid time remaining, we will refund the unused portion of your current period.`,
         ],
       },
     ],
@@ -75,7 +75,7 @@ const sections: readonly LegalSection[] = [
     title: '4. Accounts and invitations',
     blocks: [
       `Access to the beta is by invitation. When we approve your waitlist request we email you a personal invitation link, which you use to set a password and create your account. The link is for you only and expires.`,
-      `You are responsible for keeping your password confidential and for activity under your account. Tell us promptly at [CONTACT EMAIL] if you think someone else has accessed it.`,
+      `You are responsible for keeping your password confidential and for activity under your account. Tell us promptly at support@supermanzer.io if you think someone else has accessed it.`,
       `Provide accurate information, including a working email address, because the recommendations are delivered by email. One person, one account. Please don't create accounts to get around limits.`,
     ],
   },
@@ -83,12 +83,12 @@ const sections: readonly LegalSection[] = [
     id: 'subscriptions-and-billing',
     title: '5. Subscriptions and billing',
     blocks: [
-      `Using the Service after the invitation stage requires a paid subscription. We offer a monthly plan and an annual plan. Current prices and what each plan includes are shown on the billing page before you pay. Prices are in [CURRENCY, e.g. US dollars] and [TAX STATEMENT, e.g. exclusive of any applicable taxes].`,
+      `Using the Service after the invitation stage requires a paid subscription. We offer a monthly plan and an annual plan. Current prices and what each plan includes are shown on the billing page before you pay. Prices are in USD and exclusive of any taxes (currently there are no taxes for this service).`,
       `Payments are processed by Stripe. We never see or store your full card number. Stripe's own terms apply to the payment itself.`,
       `Subscriptions renew automatically at the end of each billing period (each month or each year) until you cancel. By subscribing you authorise us, through Stripe, to charge your payment method at each renewal.`,
       `Your access is tied to payment. Each successful payment gives you access up to the end of the period it covers. If a payment fails or is not received, your access will lapse when the paid period ends (see section 8).`,
       `Each plan includes one recommendation run every 30 days. Runs cannot be saved up or carried over. If a run fails because of a fault on our side, we may retry it or [FAILED-RUN POLICY, e.g. allow one replacement run].`,
-      `We may change prices or plans. We'll give you at least [PRICE CHANGE NOTICE PERIOD] days' notice by email before a change affects your next renewal, and you may cancel before it takes effect.`,
+      `We may change prices or plans. We'll give you at least 30 days' notice by email before a change affects your next renewal, and you may cancel before it takes effect.`,
     ],
   },
   {
@@ -104,14 +104,14 @@ const sections: readonly LegalSection[] = [
     title: '7. Refunds',
     blocks: [
       `Except where the law requires otherwise, payments are non-refundable. We don't give refunds or prorated credits for unused time, for partial periods, for a cancellation part-way through a period, for a plan change, or for months in which you chose not to use the Service.`,
-      `If something went wrong on our side, for example you were charged and a run was never delivered, write to us at [CONTACT EMAIL] and we'll look at it in good faith. [CONSUMER RIGHTS CLAUSE, e.g. Nothing in these Terms limits any refund rights you have under the law where you live.]`,
+      `If something went wrong on our side, for example you were charged and a run was never delivered, write to us at support@supermanzer.io and we'll look at it in good faith. [CONSUMER RIGHTS CLAUSE, e.g. Nothing in these Terms limits any refund rights you have under the law where you live.]`,
     ],
   },
   {
     id: 'disputes-and-chargebacks',
     title: '8. Disputes and chargebacks',
     blocks: [
-      `If you believe a charge is wrong, please contact us first at [CONTACT EMAIL]. We would much rather fix it directly.`,
+      `If you believe a charge is wrong, please contact us first at support@supermanzer.io. We would much rather fix it directly.`,
       `If you file a payment dispute (a chargeback) with your bank or card issuer, we will cancel your subscription and end your paid access immediately, without waiting for the end of the period. If the dispute is later resolved in your favour and you'd like to return, contact us; restoring access is at our discretion.`,
     ],
   },
@@ -164,7 +164,7 @@ const sections: readonly LegalSection[] = [
     id: 'intellectual-property',
     title: '13. Intellectual property',
     blocks: [
-      `The Service, including its software, design, text, and the way recommendations are produced, belongs to [LEGAL NAME] or its licensors and is protected by law. These Terms give you a personal, non-exclusive, non-transferable right to use the Service while your account is active. They don't transfer any ownership to you.`,
+      `The Service, including its software, design, text, and the way recommendations are produced, belongs to Supermanzer LLC or its licensors and is protected by law. These Terms give you a personal, non-exclusive, non-transferable right to use the Service while your account is active. They don't transfer any ownership to you.`,
       `If you send us feedback or suggestions, we may use them without obligation to you.`,
     ],
   },
@@ -173,7 +173,7 @@ const sections: readonly LegalSection[] = [
     title: '14. Suspension and termination',
     blocks: [
       `You can stop using the Service, and cancel, at any time.`,
-      `We may suspend or end your access if you break these Terms, if your use puts the Service or other people at risk, if a payment dispute is filed (section 8), or if we end the Service. Where reasonable we'll tell you why. If we end your access for reasons other than your breach or a dispute, [TERMINATION REFUND POLICY].`,
+      `We may suspend or end your access if you break these Terms, if your use puts the Service or other people at risk, if a payment dispute is filed (section 8), or if we end the Service. Where reasonable we'll tell you why. If we end your access for reasons other than your breach or a dispute, we will provide prorated refunds for any remaining time.`,
       `Sections that by their nature should continue after termination (including 7, 8, 12, 15, 16, and 17) do.`,
     ],
   },
@@ -188,8 +188,8 @@ const sections: readonly LegalSection[] = [
     id: 'limitation-of-liability',
     title: '16. Limitation of liability',
     blocks: [
-      `To the fullest extent permitted by law, [LEGAL NAME] will not be liable for any indirect, incidental, special, consequential, or punitive damages, or for lost profits, lost data, or purchases made in reliance on a recommendation, arising from your use of the Service.`,
-      `Our total liability to you for any claim relating to the Service is limited to the amount you paid us in the [LIABILITY CAP PERIOD, e.g. twelve (12)] months before the claim arose.`,
+      `To the fullest extent permitted by law, Supermanzer LLC will not be liable for any indirect, incidental, special, consequential, or punitive damages, or for lost profits, lost data, or purchases made in reliance on a recommendation, arising from your use of the Service.`,
+      `Our total liability to you for any claim relating to the Service is limited to the amount you paid us in the 12 months before the claim arose.`,
       `Nothing in these Terms excludes or limits liability that cannot be excluded or limited by law. [JURISDICTION-SPECIFIC CARVE-OUTS, per counsel.]`,
     ],
   },
@@ -204,14 +204,14 @@ const sections: readonly LegalSection[] = [
     id: 'changes-to-these-terms',
     title: '18. Changes to these Terms',
     blocks: [
-      `We may update these Terms from time to time. If a change is material, we'll email you or show a notice in the Service at least [TERMS CHANGE NOTICE PERIOD] days before it takes effect. The date and version at the top of this page will always show the current version. Using the Service after a change takes effect means you accept it.`,
+      `We may update these Terms from time to time. If a change is material, we'll email you or show a notice in the Service at least 30 days before it takes effect. The date and version at the top of this page will always show the current version. Using the Service after a change takes effect means you accept it.`,
     ],
   },
   {
     id: 'contact',
     title: '19. Contact',
     blocks: [
-      `Questions about these Terms: [CONTACT EMAIL]. [LEGAL NAME], [POSTAL ADDRESS OR 'available on request'].`,
+      `Questions about these Terms: support@supermanzer.io. Supermanzer LLC; postal address available on request.`,
     ],
   },
 ]
