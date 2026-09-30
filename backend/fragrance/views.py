@@ -972,7 +972,9 @@ class RecommendationRunViewSet(viewsets.ReadOnlyModelViewSet):
         # SubscriptionRequired propagates: DRF renders it as the 402 body.
         try:
             task = monthly_fragrance_run.delay(
-                user_id=request.user.id, run_id=run.id  # ty: ignore[unresolved-attribute]
+                user_id=request.user.id,
+                run_id=run.id,  # ty: ignore[unresolved-attribute]
+                attempt=run.attempt,
             )
         except OperationalError:
             # Broker down: don't leave a 'pending' run that would block this

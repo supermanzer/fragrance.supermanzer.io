@@ -12,6 +12,7 @@ from django.conf import settings
 
 from .ai_providers.base import StructuredLLMProvider
 from .models import PreferenceProfile, Recommendation
+from .services import http_url_or_empty
 
 
 def run_discovery_searches(user_id: int, profile_id: int) -> str:
@@ -102,6 +103,7 @@ def verify_candidates(
         )
 
         if matching:
+            source_url = http_url_or_empty(url=matching["url"])
             Recommendation.objects.create(
                 user_id=user_id,
                 run_id=run_id,
@@ -109,13 +111,13 @@ def verify_candidates(
                 house=candidate["house"],
                 status="confirmed",
                 rationale="",
-                search_source_url=matching["url"],
+                search_source_url=source_url,
             )
             all_picks.append(
                 {
                     **candidate,
                     "status": "confirmed",
-                    "search_source_url": matching["url"],
+                    "search_source_url": source_url,
                 }
             )
         else:

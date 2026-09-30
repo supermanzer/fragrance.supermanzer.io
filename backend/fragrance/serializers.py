@@ -7,7 +7,7 @@ from django.utils.http import urlsafe_base64_decode
 from rest_framework import serializers
 
 from .models import FRAGRANCE_STATUSES, FragranceConfig, Fragrance, Plan, PreferenceProfile, Recommendation, RecommendationRun
-from .services import MAX_RUN_DAY_OF_MONTH, MAX_RUN_RETRIES, resolve_beta_invite_signup
+from .services import MAX_RUN_DAY_OF_MONTH, MAX_RUN_RETRIES, http_url_or_empty, resolve_beta_invite_signup
 
 
 class RecommendationSerializer(serializers.ModelSerializer):
@@ -17,6 +17,12 @@ class RecommendationSerializer(serializers.ModelSerializer):
         model = Recommendation
         fields = '__all__'
         read_only_fields = ['user', 'run']
+
+    def to_representation(self, instance: Recommendation) -> dict:
+        # Rows stored before the scheme check may hold a non-http(s) URL.
+        data = super().to_representation(instance)
+        data['search_source_url'] = http_url_or_empty(url=data.get('search_source_url'))
+        return data
 
     def get_rating(self, obj: Recommendation) -> str | None:
         # promoted_fragrance is a reverse OneToOneField accessor; it raises

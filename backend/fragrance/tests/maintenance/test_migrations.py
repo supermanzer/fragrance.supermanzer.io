@@ -119,3 +119,34 @@ class DropOrphanedGmailColumnsMigrationTests(TestCase):
         user = User.objects.create_user(username="no-drift", password="pw12345!")
         config = get_or_create_fragrance_config(user=user)
         self.assertEqual(config.user_id, user.id)
+
+
+class BackwardCompatibleColumnDefaultsTests(TestCase):
+    """
+    The migrate-first deploy runs the previous release's code against the new
+    schema for a while. That code never names these NOT NULL columns, so the
+    database itself must default them (db_default), or every insert fails.
+    """
+
+    EXPECTED = {
+        "fragrance_recommendationrun": {"attempt": "1", "retry_state": "''"},
+        "fragrance_subscription": {"payment_recovery_state": "''"},
+    }
+
+    def test_new_not_null_columns_on_existing_tables_have_a_database_default(self) -> None:
+        with connection.cursor() as cursor:
+            for table, columns in self.EXPECTED.items():
+                described = {
+                    column.name: column
+                    for column in connection.introspection.get_table_description(cursor=cursor, table_name=table)
+                }
+                for name, expected_default in columns.items():
+                    self.assertFalse(described[name].null_ok, msg=f"{table}.{name}")
+                    self.assertIn(expected_default, str(described[name].default), msg=f"{table}.{name}")
+
+    def test_the_model_fields_declare_the_same_db_defaults(self) -> None:
+        from fragrance.models import RecommendationRun, Subscription
+
+        self.assertEqual(RecommendationRun._meta.get_field("attempt").db_default, 1)
+        self.assertEqual(RecommendationRun._meta.get_field("retry_state").db_default, "")
+        self.assertEqual(Subscription._meta.get_field("payment_recovery_state").db_default, "")

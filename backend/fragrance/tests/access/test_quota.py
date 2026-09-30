@@ -247,7 +247,7 @@ class TriggerViewQuotaTests(TestCase):
         self.assertEqual(response.status_code, 202)
         run = RecommendationRun.objects.get(user=self.user)
         self.assertEqual(response.json(), {"run_id": run.id})
-        delay.assert_called_once_with(user_id=self.user.id, run_id=run.id)
+        delay.assert_called_once_with(user_id=self.user.id, run_id=run.id, attempt=1)
         self.assertEqual(run.celery_task_id, "task-1")
 
     def test_a_quota_block_without_a_done_run_is_429_quota_exceeded(self) -> None:
@@ -427,7 +427,7 @@ class BeatPathQuotaTests(TestCase):
         run = RecommendationRun.objects.get(user=self.user)
         self.assertEqual(
             mock_retry.call_args.kwargs["kwargs"],
-            {"user_id": self.user.id, "run_id": run.id},
+            {"user_id": self.user.id, "run_id": run.id, "attempt": 1},
         )
 
 
@@ -729,3 +729,39 @@ class CanTriggerQuotaPayloadTests(TestCase):
             except (QuotaExceeded, RunInProgress):
                 started = False
             self.assertEqual(can, started, statuses)
+
+
+class QuotaSnapshotSingleWindowFetchTests(TestCase):
+    """quota_snapshot reads the run window once and derives the strict and beat-tolerant verdicts from it."""
+
+    def setUp(self) -> None:
+        self.user = User.objects.create_user(username="snap", password="pw12345!")
+        self.subscription = active_subscription_for(self.user)
+        FragranceConfig.objects.create(user=self.user, recipient_email="snap@example.com")
+
+    def test_the_window_is_fetched_once(self) -> None:
+        start_recommendation_run(user=self.user, source="api")
+        from fragrance import services
+
+        with patch.object(services, "_quota_window_runs", wraps=services._quota_window_runs) as fetch:
+            quota_snapshot(user=self.user, subscription=self.subscription)
+
+        self.assertEqual(fetch.call_count, 1)
+
+    def test_sharing_the_window_gives_the_same_verdicts_as_separate_fetches(self) -> None:
+        from fragrance import services
+
+        run = start_recommendation_run(user=self.user, source="api")
+        RecommendationRun.objects.filter(pk=run.pk).update(status="done")
+        # 27 days old: inside the strict 30-day window, outside the 26-day beat window.
+        _backdate_runs(user=self.user, days_ago=27)
+        now = timezone.now()
+        period = timedelta(days=30)
+        shared = services._quota_window_runs(user=self.user, period=period, now=now)
+
+        for source in ("api", "beat"):
+            self.assertEqual(
+                services._evaluate_quota(user=self.user, plan=None, now=now, source=source, window_runs=shared),
+                services._evaluate_quota(user=self.user, plan=None, now=now, source=source),
+                msg=source,
+            )

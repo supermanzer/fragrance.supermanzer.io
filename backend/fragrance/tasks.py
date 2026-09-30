@@ -5,7 +5,7 @@ Implements Celery tasks for Fragrance Recommendation Runs
 """
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from celery import shared_task
 from celery.exceptions import SoftTimeLimitExceeded
@@ -42,14 +42,17 @@ from .search import run_discovery_searches, verify_candidates
 from .permissions import SubscriptionRequired
 from .services import (
     MAX_RUN_RETRIES,
+    RETRY_OVERDUE_GRACE,
     QuotaExceeded,
     RunFailureOutcome,
     RunInProgress,
     claim_run_retry,
+    expire_overdue_retry,
     format_price,
     generate_beta_invite_token,
     generate_recommendation_token,
     get_or_create_fragrance_config,
+    http_url_or_empty,
     record_run_failure,
     stale_in_flight_runs,
     start_recommendation_run,
@@ -138,7 +141,15 @@ def flush_expired_jwt_tokens() -> None:
 
 
 @shared_task(bind=True, max_retries=2, soft_time_limit=1200, time_limit=1500)
-def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: int | None = None) -> None:
+def monthly_fragrance_run(
+    self: 'monthly_fragrance_run', user_id: int, run_id: int | None = None, attempt: int | None = None
+) -> None:
+    """
+    attempt is the chain attempt number the message was queued for; a message
+    for an older attempt than the row's current one (a late duplicate, after a
+    worker outage let the reaper and the sweep move the chain on) is ignored.
+    None (beat path, older callers) skips that check.
+    """
     from .models import Recommendation
     if run_id is None:
         # Beat path. The API view path arrives with a run_id its own call to
@@ -176,6 +187,12 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
             # row that was reaped into the retry chain meanwhile: the chain
             # owns the row now.
             logger.warning("run %s is %s, not in flight; ignoring task", run_id, run.status)
+            return
+        if attempt is not None and attempt != run.attempt:
+            logger.warning(
+                "run %s is on attempt %s, message was for attempt %s; ignoring task",
+                run_id, run.attempt, attempt,
+            )
             return
         run.status = 'running'
         run.error_message = ''
@@ -238,7 +255,7 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
         raise self.retry(
             exc=exc,
             countdown=300,
-            kwargs={'user_id': user_id, 'run_id': run.id},  # ty: ignore[unresolved-attribute]
+            kwargs={'user_id': user_id, 'run_id': run.id, 'attempt': run.attempt},  # ty: ignore[unresolved-attribute]
         )
 
 
@@ -347,8 +364,12 @@ def reap_stale_runs() -> int:
     early-ack worker that dies mid-run strands its row; a failed run does not
     burn quota, so this also releases the allowance the stranded row was
     holding. Each reaped run enters the retry chain like any other failure.
+    Also ends scheduled retries the sweep has left overdue past
+    RETRY_OVERDUE_GRACE (they have already stopped blocking the user), through
+    the chain's own exhausted/stopped handling; those count in the return value.
     """
-    stale_ids = list(stale_in_flight_runs(now=timezone.now()).values_list('id', flat=True))
+    now = timezone.now()
+    stale_ids = list(stale_in_flight_runs(now=now).values_list('id', flat=True))
     reaped = 0
     for run_id in stale_ids:
         outcome = fail_run_and_notify(run_id=run_id, error_message=STALE_RUN_ERROR_MESSAGE)
@@ -356,6 +377,7 @@ def reap_stale_runs() -> int:
             reaped += 1
     if reaped:
         logger.warning("reaped %d stale in-flight run(s)", reaped)
+    reaped += _expire_overdue_retries(now=now)
     return reaped
 
 
@@ -385,6 +407,7 @@ def render_and_send_email(user_id: int, run_id: int) -> None:
     # query or a parallel context structure. Only 'confirmed' picks are rated from the
     # email — 'replaced' picks are never shown, so they get no tokens.
     for pick in run.picks.all():
+        pick.search_source_url = http_url_or_empty(url=pick.search_source_url)
         if pick.status != 'confirmed':
             continue
         for rating_action in RATING_ACTIONS:
@@ -477,20 +500,29 @@ def retry_failed_runs() -> int:
     dispatched = 0
     for run_id, user_id in due_ids:
         now = timezone.now()
-        outcome = claim_run_retry(run_id=run_id, now=now)
-        if outcome == 'exhausted':
-            _enqueue_failure_notices(run_id=run_id, outcome='exhausted')
-            continue
-        if outcome != 'dispatch':
-            continue
+        claimed = False
         try:
-            task = monthly_fragrance_run.delay(user_id=user_id, run_id=run_id)
+            outcome = claim_run_retry(run_id=run_id, now=now)
+            if outcome == 'exhausted':
+                _enqueue_failure_notices(run_id=run_id, outcome='exhausted')
+                continue
+            if outcome != 'dispatch':
+                continue
+            claimed = True
+            attempt = RecommendationRun.objects.values_list('attempt', flat=True).get(id=run_id)  # ty: ignore[unresolved-attribute]
+            task = monthly_fragrance_run.delay(user_id=user_id, run_id=run_id, attempt=attempt)
+            claimed = False
+            RecommendationRun.objects.filter(id=run_id).update(celery_task_id=task.id)  # ty: ignore[unresolved-attribute]
+            dispatched += 1
         except OperationalError:
             logger.warning("could not queue retry of run %s; will try again", run_id)
-            unclaim_run_retry(run_id=run_id, retry_at=now + RETRY_REQUEUE_DELAY)
-            continue
-        RecommendationRun.objects.filter(id=run_id).update(celery_task_id=task.id)  # ty: ignore[unresolved-attribute]
-        dispatched += 1
+            if claimed:
+                unclaim_run_retry(run_id=run_id, retry_at=now + RETRY_REQUEUE_DELAY)
+        except Exception:
+            # One bad row must not abort the sweep for everyone behind it.
+            logger.exception("retry of run %s failed; will try again", run_id)
+            if claimed:
+                unclaim_run_retry(run_id=run_id, retry_at=now + RETRY_REQUEUE_DELAY)
     return dispatched
 
 
@@ -857,6 +889,26 @@ def _enqueue_failure_notices(*, run_id: int, outcome: RunFailureOutcome) -> None
             send_operator_run_exhausted_alert.delay(run_id=run_id)
     except Exception:
         logger.exception("could not queue failure notices for run %s", run_id)
+
+
+def _expire_overdue_retries(*, now: datetime) -> int:
+    """Ends every scheduled retry overdue past RETRY_OVERDUE_GRACE and queues the notices each verdict calls for. Returns how many ended."""
+    overdue_ids = list(
+        RecommendationRun.objects.filter(  # ty: ignore[unresolved-attribute]
+            status='failed', retry_state='scheduled', next_retry_at__lt=now - RETRY_OVERDUE_GRACE
+        ).values_list('id', flat=True)
+    )
+    ended = 0
+    for run_id in overdue_ids:
+        try:
+            outcome = expire_overdue_retry(run_id=run_id, now=now)
+            if outcome == 'exhausted':
+                _enqueue_failure_notices(run_id=run_id, outcome='exhausted')
+            if outcome != 'skip':
+                ended += 1
+        except Exception:
+            logger.exception("could not end overdue retry of run %s", run_id)
+    return ended
 
 
 def _resolve_profile(

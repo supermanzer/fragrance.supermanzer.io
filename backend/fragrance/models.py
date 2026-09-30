@@ -236,10 +236,12 @@ class RecommendationRun(models.Model):
     provider_model_id = models.CharField(max_length=255, blank=True)
     # Retry chain (see services.record_run_failure / claim_run_retry).
     # `attempt` is the number of the most recent attempt started, 1-based.
-    attempt = models.PositiveSmallIntegerField(default=1)
+    # db_default on the NOT NULL columns lets code from before this schema
+    # (which never names them) keep inserting during a migrate-first deploy.
+    attempt = models.PositiveSmallIntegerField(default=1, db_default=1)
     attempt_started_at = models.DateTimeField(null=True, blank=True)
     retry_state = models.CharField(
-        max_length=10, choices=RUN_RETRY_STATES, blank=True, default=""
+        max_length=10, choices=RUN_RETRY_STATES, blank=True, default="", db_default=""
     )
     next_retry_at = models.DateTimeField(null=True, blank=True)
     last_failed_at = models.DateTimeField(null=True, blank=True)
@@ -282,7 +284,7 @@ class Subscription(models.Model):
     # billing.payment_recovery_payload, which hides it once a later payment
     # has been recorded (last_paid_at).
     payment_recovery_state = models.CharField(
-        max_length=10, choices=PAYMENT_RECOVERY_STATES, blank=True, default=""
+        max_length=10, choices=PAYMENT_RECOVERY_STATES, blank=True, default="", db_default=""
     )
     payment_recovery_attempted_at = models.DateTimeField(null=True, blank=True)
 

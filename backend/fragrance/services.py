@@ -2,9 +2,11 @@ import csv
 import hashlib
 import hmac
 import logging
+from collections.abc import Iterable
 from datetime import date, datetime, timedelta
 from datetime import timezone as dt_timezone
-from typing import IO, Literal
+from typing import Literal
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from django.conf import settings
@@ -102,6 +104,13 @@ RECOMMENDATION_FEEDBACK_SALT = "recommendation-feedback"
 
 
 REQUIRED_COLUMNS = {"fragrance", "status", "house", "notes"}
+
+
+# How long a scheduled retry may sit overdue before it stops blocking the user
+# and the chain is ended. The beat sweep runs every few minutes, so a retry
+# still waiting this long means the sweep is not running; without the bound
+# that would block scheduled, first and manual runs indefinitely.
+RETRY_OVERDUE_GRACE = timedelta(hours=2)
 
 
 # claim_run_retry's verdict: "dispatch" = the row is now pending and the
@@ -295,7 +304,10 @@ def claim_run_retry(*, run_id: int, now: datetime) -> RetryClaimOutcome:
     on purpose: the retry reuses its own row, so the in-flight guard would
     refuse it and the quota would count it twice. Runs under a row lock, so
     two overlapping sweeps dispatch a run once. Access is re-checked here: a
-    lapse since the failure ends the chain as "stopped" (no email).
+    lapse since the failure ends the chain as "stopped" (no email), and a
+    retry overdue by more than RETRY_OVERDUE_GRACE ends it as "exhausted": it
+    has already stopped blocking the user (see in_flight_runs), so it must not
+    start now alongside whatever the user did meanwhile.
     """
     with transaction.atomic():
         run = (
@@ -306,6 +318,8 @@ def claim_run_retry(*, run_id: int, now: datetime) -> RetryClaimOutcome:
         if run is None:
             return "skip"
         verdict = _retry_verdict(run=run, retry_at=now)
+        if verdict == "scheduled" and _is_overdue_retry(run=run, now=now):
+            verdict = "exhausted"
         if verdict != "scheduled":
             run.retry_state = verdict
             run.next_retry_at = None
@@ -353,6 +367,31 @@ def derive_unique_username(*, email: str) -> str:
         suffix += 1
         candidate = f"{base}_{suffix}"[:_MAX_USERNAME_LENGTH]
     return candidate
+
+
+def expire_overdue_retry(*, run_id: int, now: datetime) -> Literal["exhausted", "stopped", "skip"]:
+    """
+    Ends a scheduled retry that is overdue by more than RETRY_OVERDUE_GRACE
+    (the sweep is not running), through the same chain rules as everything
+    else: "stopped" if access lapsed (no email), else "exhausted" (the caller
+    queues the exhausted notices). Runs under a row lock and re-checks the
+    overdue test there, so a retry that was just rescheduled is left alone.
+    """
+    with transaction.atomic():
+        run = (
+            RecommendationRun.objects.select_for_update()
+            .filter(pk=run_id, status="failed", retry_state="scheduled")
+            .first()
+        )
+        if run is None or not _is_overdue_retry(run=run, now=now):
+            return "skip"
+        verdict = _retry_verdict(run=run, retry_at=now)
+        ended = "stopped" if verdict == "stopped" else "exhausted"
+        run.retry_state = ended
+        run.next_retry_at = None
+        run.save(update_fields=["retry_state", "next_retry_at"])
+    logger.warning("overdue retry of run %s for user %s ended: %s", run.id, run.user_id, ended)
+    return ended
 
 
 def format_price(*, amount_cents: int, currency: str, billing_interval: str) -> str:
@@ -447,7 +486,20 @@ def hash_signup_ip(*, ip: str) -> str:
 
 
 @transaction.atomic
-def import_collection_from_csv(user: User, file_obj: IO[str]) -> dict:
+def http_url_or_empty(*, url: object) -> str:
+    """The URL if it is an absolute http(s) URL, else "": stops a `javascript:` or `data:` link from a search result reaching an href."""
+    if not isinstance(url, str):
+        return ""
+    try:
+        parts = urlsplit(url.strip())
+    except ValueError:
+        return ""
+    if parts.scheme.lower() in ("http", "https") and parts.netloc:
+        return url.strip()
+    return ""
+
+
+def import_collection_from_csv(user: User, file_obj: Iterable[str]) -> dict:
     """
     Parse a CSV and upsert Fragrance records for the given user.
 
@@ -506,13 +558,19 @@ def in_flight_runs(*, user: User, now: datetime):
     cannot drift. Two shapes count: an attempt that is pending/running and not
     yet presumed stranded, and a failed run whose automatic retry is
     scheduled (the chain is still alive, so it must block a second run and
-    must not read as "no run yet" to the first-run gate).
+    must not read as "no run yet" to the first-run gate) and not overdue by
+    more than RETRY_OVERDUE_GRACE (a retry the sweep has not picked up for
+    that long must not block the user; expire_overdue_retry ends it).
     """
     return _annotated_with_attempt_clock().filter(
         Q(user=user)
         & (
             Q(status__in=_IN_FLIGHT_STATUSES, attempt_clock__gte=now - IN_FLIGHT_MAX_AGE)
-            | Q(status="failed", retry_state="scheduled")
+            | Q(
+                status="failed",
+                retry_state="scheduled",
+                next_retry_at__gte=now - RETRY_OVERDUE_GRACE,
+            )
         )
     )
 
@@ -587,9 +645,13 @@ def quota_snapshot(*, user: User, subscription: Subscription | None) -> dict:
     now = timezone.now()
     staff = _is_staff(user=user)
     plan = subscription.plan if subscription else None
-    _, max_runs, _ = _quota_terms(plan=plan)
+    period, max_runs, _ = _quota_terms(plan=plan)
     has_access = staff or bool(subscription and subscription.has_active_access)
-    consumed, blocked, quota_next = _evaluate_quota(user=user, plan=plan, now=now)
+    # The strict window contains the beat-tolerant one, so one query serves both evaluations.
+    window_runs = _quota_window_runs(user=user, period=period, now=now)
+    consumed, blocked, quota_next = _evaluate_quota(
+        user=user, plan=plan, now=now, window_runs=window_runs
+    )
     refusal, next_eligible_at = _check_can_start(
         user=user, subscription=subscription, now=now, quota=(consumed, blocked, quota_next)
     )
@@ -611,7 +673,7 @@ def quota_snapshot(*, user: User, subscription: Subscription | None) -> dict:
             and not has_completed_run(user=user)
         ),
         "next_run_at": _next_run_at(
-            user=user, plan=plan, has_access=has_access, exempt=staff, now=now
+            user=user, plan=plan, has_access=has_access, exempt=staff, now=now, window_runs=window_runs
         ),
     }
 
@@ -685,7 +747,10 @@ def send_price_change_notice(*, notice: PriceChangeNotice, created_by: User | No
     recipient, queued only after the record commits. The plan row is locked
     so the "current price" frozen on the notice cannot race an edit, and the
     unique constraint turns a concurrent duplicate into PriceChangeNoticeError.
-    Changes nothing at Stripe and does not edit the Plan.
+    If queueing fails after the commit the record is deleted again (so the
+    notice can be re-sent) and PriceChangeNoticeError is raised from the
+    commit hook, i.e. from the outermost atomic block's exit. Changes nothing
+    at Stripe and does not edit the Plan.
     """
     from .tasks import send_price_change_notice_email
 
@@ -710,11 +775,23 @@ def send_price_change_notice(*, notice: PriceChangeNotice, created_by: User | No
             )
 
         def queue_emails() -> None:
-            for user_id in user_ids:
-                try:
+            queued = 0
+            try:
+                for user_id in user_ids:
                     send_price_change_notice_email.delay(notice_id=notice.pk, user_id=user_id)
-                except Exception:
-                    logger.exception("could not queue price-change notice %s for user %s", notice.pk, user_id)
+                    queued += 1
+            except Exception:
+                logger.exception(
+                    "could not queue price-change notice %s (%d of %d queued)", notice.pk, queued, len(user_ids)
+                )
+                # The unique constraint would otherwise make the notice impossible to send again.
+                PriceChangeNotice.objects.filter(pk=notice.pk).delete()
+                raise PriceChangeNoticeError(
+                    problems=[
+                        f"The emails could not be queued ({queued} of {len(user_ids)} were queued before the "
+                        "queue failed) and the notice was not recorded. Check the message broker, then send it again."
+                    ]
+                )
 
         transaction.on_commit(queue_emails)
     logger.info("price-change notice %s recorded: %d recipient(s)", notice.pk, notice.recipient_count)
@@ -884,7 +961,12 @@ def _check_can_start(
 
 
 def _evaluate_quota(
-    *, user: User, plan: Plan | None, now: datetime, source: TriggerSource = "api"
+    *,
+    user: User,
+    plan: Plan | None,
+    now: datetime,
+    source: TriggerSource = "api",
+    window_runs: list[tuple[datetime, str]] | None = None,
 ) -> tuple[int, bool, datetime | None]:
     """
     Returns (consumed, blocked, next_eligible_at) for the rolling window.
@@ -903,17 +985,18 @@ def _evaluate_quota(
     monthly scheduled run is never refused just because the rolling window
     hasn't quite finished elapsing (see BEAT_QUOTA_TOLERANCE). Manual/API
     triggers always use the full, strict quota_period_days.
+
+    window_runs is a caller's already-fetched _quota_window_runs result for
+    the strict period; it saves the query and is filtered down to this call's
+    own window.
     """
     period, max_runs, grace = _quota_terms(plan=plan)
     if source == "beat":
         period = period - BEAT_QUOTA_TOLERANCE
-    windowed = list(
-        RecommendationRun.objects.filter(
-            user=user, triggered_at__gte=now - period
-        )
-        .order_by("triggered_at")
-        .values_list("triggered_at", "status")
-    )
+    if window_runs is None:
+        windowed = _quota_window_runs(user=user, period=period, now=now)
+    else:
+        windowed = [(at, run_status) for at, run_status in window_runs if at >= now - period]
     counted = [at for at, run_status in windowed if run_status in _QUOTA_CONSUMING_STATUSES]
     consumed = len(counted)
 
@@ -929,6 +1012,11 @@ def _evaluate_quota(
         if len(windowed) - dispatch_limit < len(windowed):
             frees_at.append(windowed[len(windowed) - dispatch_limit][0] + period)
     return consumed, blocked, (max(frees_at) if frees_at else None)
+
+
+def _is_overdue_retry(*, run: RecommendationRun, now: datetime) -> bool:
+    """A scheduled retry the sweep has left waiting longer than RETRY_OVERDUE_GRACE."""
+    return run.next_retry_at is not None and run.next_retry_at < now - RETRY_OVERDUE_GRACE
 
 
 def _is_staff(*, user: User) -> bool:
@@ -959,7 +1047,13 @@ def _next_monthly_slot(
 
 
 def _next_run_at(
-    *, user: User, plan: Plan | None, has_access: bool, exempt: bool, now: datetime
+    *,
+    user: User,
+    plan: Plan | None,
+    has_access: bool,
+    exempt: bool,
+    now: datetime,
+    window_runs: list[tuple[datetime, str]] | None = None,
 ) -> datetime | None:
     """
     When the beat scheduler will next start this user's run, or None when
@@ -978,7 +1072,9 @@ def _next_run_at(
         return None
     not_before: datetime | None = None
     if not exempt:
-        _, blocked, eligible_at = _evaluate_quota(user=user, plan=plan, now=now, source="beat")
+        _, blocked, eligible_at = _evaluate_quota(
+            user=user, plan=plan, now=now, source="beat", window_runs=window_runs
+        )
         if blocked:
             if eligible_at is None:
                 return None
@@ -998,6 +1094,17 @@ def _quota_terms(*, plan: Plan | None) -> tuple[timedelta, int, int]:
         timedelta(days=plan.quota_period_days),
         plan.max_runs_per_quota_period,
         plan.failed_run_grace,
+    )
+
+
+def _quota_window_runs(
+    *, user: User, period: timedelta, now: datetime
+) -> list[tuple[datetime, str]]:
+    """The user's (triggered_at, status) rows inside the rolling window, oldest first."""
+    return list(
+        RecommendationRun.objects.filter(user=user, triggered_at__gte=now - period)
+        .order_by("triggered_at")
+        .values_list("triggered_at", "status")
     )
 
 

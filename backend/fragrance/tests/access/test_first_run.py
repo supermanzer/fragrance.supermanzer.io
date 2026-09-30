@@ -62,7 +62,7 @@ class FirstRunTriggerTests(TestCase):
 
         self.assertEqual(response.status_code, 202)
         run = RecommendationRun.objects.get(user=self.user)
-        delay.assert_called_once_with(user_id=self.user.id, run_id=run.id)
+        delay.assert_called_once_with(user_id=self.user.id, run_id=run.id, attempt=1)
 
     def test_non_staff_after_a_done_run_gets_403_manual_runs_staff_only(self) -> None:
         RecommendationRun.objects.create(user=self.user, status="done")

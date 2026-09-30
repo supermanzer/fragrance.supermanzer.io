@@ -448,6 +448,32 @@ class PriceChangeNoticeAdmin(admin.ModelAdmin):
     def has_delete_permission(self, request: HttpRequest, obj: PriceChangeNotice | None = None) -> bool:
         return False
 
+    def add_view(
+        self, request: HttpRequest, form_url: str = "", extra_context: dict | None = None
+    ) -> HttpResponse:
+        """
+        The emails are queued in a commit hook, which runs when the admin's
+        transaction exits, after save_model and response_add. A queue failure
+        (the service has already deleted the record) therefore surfaces here.
+        """
+        try:
+            response = super().add_view(request, form_url=form_url, extra_context=extra_context)
+        except PriceChangeNoticeError as exc:
+            # Drop the "added successfully" message queued before the commit hook failed.
+            list(messages.get_messages(request))
+            self.message_user(
+                request, f"Notice NOT sent: {'; '.join(exc.problems)}", level=messages.ERROR
+            )
+            return HttpResponseRedirect(reverse("admin:fragrance_pricechangenotice_changelist"))
+        notice = getattr(request, "_price_change_notice", None)
+        if notice is not None:
+            self.message_user(
+                request,
+                f"Price-change notice queued for {notice.recipient_count} subscriber(s) of {notice.plan}.",
+                level=messages.SUCCESS,
+            )
+        return response
+
     def log_addition(self, request: HttpRequest, obj: PriceChangeNotice, message: object) -> object:
         if obj.pk is None:
             return None
@@ -470,11 +496,9 @@ class PriceChangeNoticeAdmin(admin.ModelAdmin):
                 request, f"Notice NOT sent: {'; '.join(exc.problems)}", level=messages.ERROR
             )
             return
-        self.message_user(
-            request,
-            f"Price-change notice queued for {obj.recipient_count} subscriber(s) of {obj.plan}.",
-            level=messages.SUCCESS,
-        )
+        # The emails are queued after the admin's own transaction commits, so a
+        # queue failure surfaces in add_view, not here; the result is reported there.
+        request._price_change_notice = obj  # ty: ignore[unresolved-attribute]
 
 
 @admin.register(PreferenceProfile)
