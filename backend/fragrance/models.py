@@ -46,6 +46,12 @@ FREQUENCIES = [
 ]
 
 
+PAYMENT_RECOVERY_STATES = [
+    ("retrying", "Retrying"),
+    ("failed", "Failed"),
+]
+
+
 PICK_STATUSES = [("confirmed", "Confirmed"), ("replaced", "Replaced")]
 
 
@@ -222,6 +228,16 @@ class Subscription(models.Model):
     access_expires_at = models.DateTimeField(null=True, blank=True)
     last_paid_at = models.DateTimeField(null=True, blank=True)
     last_checkout_session_id = models.CharField(max_length=255, blank=True)
+    # Outcome of the last retry WE started by paying an open past_due invoice
+    # with a newly attached payment method (billing.recover_past_due_invoice).
+    # Not derivable from anything else stored locally, and not fetchable from
+    # Stripe inside the polled GET /billing/subscription/. Read only through
+    # billing.payment_recovery_payload, which hides it once a later payment
+    # has been recorded (last_paid_at).
+    payment_recovery_state = models.CharField(
+        max_length=10, choices=PAYMENT_RECOVERY_STATES, blank=True, default=""
+    )
+    payment_recovery_attempted_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self) -> str:
         return f"{self.user} ({self.status})"

@@ -598,7 +598,7 @@ class BillingSessionViewTests(StripeClientTestCase):
             set(body.keys()),
             {
             "status", "plan", "access_expires_at", "has_active_access", "exempt", "is_staff",
-            "can_manage_billing", "quota", "granted",
+            "can_manage_billing", "quota", "lapse_reason", "payment_recovery", "granted",
         },
         )
         self.assertTrue(body["granted"])
@@ -621,7 +621,7 @@ class BillingSessionViewTests(StripeClientTestCase):
             set(body.keys()),
             {
             "status", "plan", "access_expires_at", "has_active_access", "exempt", "is_staff",
-            "can_manage_billing", "quota", "granted",
+            "can_manage_billing", "quota", "lapse_reason", "payment_recovery", "granted",
         },
         )
         self.assertTrue(body["has_active_access"])

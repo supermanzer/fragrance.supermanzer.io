@@ -53,7 +53,7 @@ class BillingPortalViewTests(StripeClientTestCase):
         self.stripe.v1.billing_portal.sessions.create.assert_called_once_with(
             params={
                 "customer": "cus_mine",
-                "return_url": "https://app.example.test/billing",
+                "return_url": "https://app.example.test/billing?from=portal",
                 "configuration": "bpc_test_config",
             }
         )
@@ -76,7 +76,7 @@ class BillingPortalViewTests(StripeClientTestCase):
         params = self.stripe.v1.billing_portal.sessions.create.call_args.kwargs["params"]
         self.assertEqual(params["customer"], "cus_mine")
         self.assertEqual(params["configuration"], "bpc_test_config")
-        self.assertEqual(params["return_url"], "https://app.example.test/billing")
+        self.assertEqual(params["return_url"], "https://app.example.test/billing?from=portal")
         self.assertNotIn("flow_data", params)
 
     @override_settings(STRIPE_PORTAL_CONFIGURATION_ID="", DEBUG=True)

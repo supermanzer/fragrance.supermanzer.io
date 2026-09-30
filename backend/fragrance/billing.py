@@ -92,6 +92,20 @@ DISPUTE_LIVE_SUBSCRIPTION_STATUSES = frozenset(
 )
 
 
+# Stripe subscription statuses in which an open invoice is a failed renewal a
+# new card can settle. `incomplete` (first checkout, where payment_method.attached
+# also fires) and `canceled` (paying would take money for a subscription that
+# never renews) are deliberately absent.
+PAYMENT_RECOVERY_PAYABLE_STATUSES = frozenset({"past_due", "unpaid"})
+
+
+# How long a "retrying" recovery keeps showing after the invoice was paid: the
+# grant arrives by payment_intent.succeeded within seconds, so anything older
+# is a lost webhook the nightly reconcile will repair, not something to keep
+# telling the customer is in progress.
+PAYMENT_RECOVERY_RETRYING_WINDOW = timedelta(hours=1)
+
+
 # Far longer than Stripe's 3-day smart-retry window and tolerant of six missed
 # nightly runs; --days widens it for a manual sweep.
 RECONCILE_INVOICE_LOOKBACK = timedelta(days=7)
@@ -544,7 +558,7 @@ def create_portal_session(
 
     params: PortalSessionCreateParams = {
         "customer": subscription.stripe_customer_id,
-        "return_url": f"{settings.FRONTEND_URL}/billing",
+        "return_url": f"{settings.FRONTEND_URL}/billing?from=portal",
     }
     if configuration_id:
         params["configuration"] = configuration_id
@@ -919,6 +933,32 @@ def is_exempt(*, user: User) -> bool:
     return bool(user.is_staff or user.is_superuser)
 
 
+def payment_recovery_payload(*, subscription: Subscription) -> dict | None:
+    """
+    The `payment_recovery` block of the subscription payload: non-null only for
+    a retry recover_past_due_invoice started after a payment method was added.
+    Hidden once access is back, on exempt or revoked accounts, and whenever a
+    payment has been recorded since the attempt (last_paid_at), which is what
+    clears it after recovery without touching the grant path and keeps a stale
+    decline from resurfacing on a later lapse. A "retrying" older than
+    PAYMENT_RECOVERY_RETRYING_WINDOW is dropped too.
+    """
+    attempted_at = subscription.payment_recovery_attempted_at
+    state = subscription.payment_recovery_state
+    if not state or attempted_at is None:
+        return None
+    user = subscription.user
+    if subscription.status == "revoked" or user.is_staff or user.is_superuser:  # ty: ignore[unresolved-attribute]
+        return None
+    if subscription.has_active_access:
+        return None
+    if subscription.last_paid_at is not None and attempted_at <= subscription.last_paid_at:
+        return None
+    if state == "retrying" and timezone.now() - attempted_at > PAYMENT_RECOVERY_RETRYING_WINDOW:
+        return None
+    return {"state": state, "attempted_at": attempted_at}
+
+
 def reconcile_subscriptions(
     *,
     dry_run: bool = False,
@@ -1081,6 +1121,112 @@ def reconcile_subscriptions(
         dry_run,
     )
     return summary
+
+
+def recover_past_due_invoice(
+    *, payment_method: dict, client: stripe.StripeClient | None = None
+) -> str:
+    """
+    payment_method.attached handler, invoked from tasks.process_stripe_event
+    with the event's stored `data.object`. When the customer's Stripe
+    subscription is past_due, pays its open invoice(s) with the NEW payment
+    method explicitly: left alone, Stripe keeps retrying the subscription's own
+    default_payment_method. A no-op in every other case, notably the first
+    checkout (subscription `incomplete`), a `canceled` subscription, a disputed
+    or exempt account, and an unknown customer. Returns the outcome name.
+
+    Idempotent: the pay call carries an idempotency key of invoice + method, a
+    replay finds no open invoice once it is paid, and an invoice Stripe's own
+    retry paid first is treated as success. A declined or unauthenticated card
+    is recorded (payment_recovery_state="failed") and returns normally, since
+    replaying it cannot succeed; connection and server errors are raised so
+    the task retries. Access itself is granted by the payment_intent.succeeded
+    the payment produces (or the nightly reconcile), never here.
+    """
+    customer_id = payment_method.get("customer")
+    if isinstance(customer_id, dict):
+        customer_id = customer_id.get("id")
+    payment_method_id = payment_method.get("id")
+    if not customer_id or not payment_method_id:
+        logger.info("payment_method.attached had no customer or id; nothing to recover")
+        return "ignored"
+
+    local = (
+        Subscription.objects.select_related("user")  # ty: ignore[unresolved-attribute]
+        .filter(stripe_customer_id=customer_id)
+        .first()
+    )
+    if local is None:
+        logger.info("payment_method.attached for customer %s has no local Subscription", customer_id)
+        return "unknown_customer"
+    if local.status == "revoked" or is_exempt(user=cast(User, local.user)):
+        return "not_eligible"
+    if not local.stripe_subscription_id:
+        return "no_subscription"
+
+    if client is None:
+        client = get_stripe_client()
+
+    stripe_subscription = client.v1.subscriptions.retrieve(local.stripe_subscription_id)
+    if stripe_subscription.status not in PAYMENT_RECOVERY_PAYABLE_STATUSES:
+        return "not_past_due"
+
+    open_invoices = [
+        invoice
+        for invoice in client.v1.invoices.list(
+            params={
+                "customer": customer_id,
+                "subscription": local.stripe_subscription_id,
+                "status": "open",
+                "limit": 10,
+            }
+        ).auto_paging_iter()
+        if invoice.amount_remaining > 0
+    ]
+    if not open_invoices:
+        return "no_open_invoice"
+
+    attempted_at = timezone.now()
+    Subscription.objects.filter(pk=local.pk).exclude(status="revoked").update(  # ty: ignore[unresolved-attribute]
+        payment_recovery_state="retrying", payment_recovery_attempted_at=attempted_at
+    )
+
+    def _settle(*, state: str) -> None:
+        Subscription.objects.filter(  # ty: ignore[unresolved-attribute]
+            pk=local.pk, payment_recovery_attempted_at=attempted_at
+        ).update(payment_recovery_state=state)
+
+    outcome = "paid"
+    for invoice in reversed(open_invoices):
+        try:
+            client.v1.invoices.pay(
+                invoice=invoice.id,
+                params={"payment_method": payment_method_id},
+                options={"idempotency_key": f"recover-{invoice.id}-{payment_method_id}"},
+            )
+        except stripe.CardError:
+            logger.warning(
+                "payment recovery for customer %s: card declined on invoice %s",
+                customer_id,
+                invoice.id,
+            )
+            _settle(state="failed")
+            return "declined"
+        except stripe.InvalidRequestError:
+            if client.v1.invoices.retrieve(invoice.id).status == "paid":
+                continue
+            logger.warning(
+                "payment recovery for customer %s: invoice %s could not be paid with %s",
+                customer_id,
+                invoice.id,
+                payment_method_id,
+            )
+            _settle(state="")
+            outcome = "rejected"
+            break
+    if outcome == "paid":
+        logger.info("payment recovery for customer %s: paid %d invoice(s)", customer_id, len(open_invoices))
+    return outcome
 
 
 def revert_customer_email(*, token: object) -> bool:
@@ -1351,6 +1497,12 @@ def subscription_status_payload(*, subscription: Subscription) -> dict:
         "quota": quota_snapshot(
             user=cast(User, subscription.user), subscription=subscription
         ),
+        # Not derivable locally: nothing here records whether the lapse was a
+        # failed payment or a cancellation (that needs Stripe's subscription
+        # status and cancellation_details.reason, which no handled event
+        # delivers). Null is the frontend's defined "unknown" fallback.
+        "lapse_reason": None,
+        "payment_recovery": payment_recovery_payload(subscription=subscription),
     }
 
 

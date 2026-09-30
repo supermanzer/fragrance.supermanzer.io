@@ -726,6 +726,8 @@ class BillingSubscriptionViewTests(TestCase):
                     "first_run_available": False,
                     "next_run_at": None,
                 },
+                "lapse_reason": None,
+                "payment_recovery": None,
             },
         )
         self.assertFalse(Subscription.objects.filter(user=self.user).exists())

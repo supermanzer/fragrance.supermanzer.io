@@ -35,7 +35,7 @@ _GUARDED_METHODS: dict[str, list[str]] = {
     "customers": ["create", "retrieve", "update"],
     "checkout.sessions": ["create", "retrieve", "expire", "list"],
     "invoice_payments": ["list"],
-    "invoices": ["list", "retrieve"],
+    "invoices": ["list", "retrieve", "pay"],
     "payment_intents": ["retrieve"],
     "subscriptions": ["list", "retrieve", "cancel"],
     "subscription_schedules": ["create", "update", "release", "retrieve"],

@@ -97,6 +97,7 @@ STRIPE_HANDLED_EVENT_TYPES = {
     "payment_intent.succeeded",
     "charge.dispute.created",
     "customer.updated",
+    "payment_method.attached",
 }
 
 
@@ -251,6 +252,7 @@ def process_stripe_event(self: 'process_stripe_event', stripe_event_id: str) -> 
     from .billing import (
         InvoiceNotSettledError,
         fulfill_payment_intent,
+        recover_past_due_invoice,
         revoke_for_dispute,
         sync_customer_email,
     )
@@ -272,6 +274,8 @@ def process_stripe_event(self: 'process_stripe_event', stripe_event_id: str) -> 
                 customer=data_object,
                 previous_attributes=event_row.payload.get('data', {}).get('previous_attributes'),
             )
+        elif event_row.event_type == 'payment_method.attached':
+            recover_past_due_invoice(payment_method=data_object)
         elif event_row.event_type not in STRIPE_HANDLED_EVENT_TYPES:
             pass  # unsubscribed event type reached the endpoint anyway -- ignored, not an error
         event_row.status = 'processed'
