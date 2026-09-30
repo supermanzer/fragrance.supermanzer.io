@@ -6,7 +6,7 @@
           class="text-h5 font-weight-regular text-primary"
           style="letter-spacing: 0.06em"
         >
-          Fragrances
+          Fragrance Journey
         </div>
       </NuxtLink>
     </v-app-bar-title>
@@ -49,7 +49,7 @@
           class="text-caption font-weight-medium"
           style="letter-spacing: 0.1em"
         >
-          Fragrances
+          Fragrance Journey
         </div>
         <div class="text-caption text-medium-emphasis">
           your personal scent journal
@@ -107,7 +107,7 @@
             class="text-caption font-weight-medium"
             style="letter-spacing: 0.1em"
           >
-            Fragrances
+            Fragrance Journey
           </div>
           <div class="text-caption text-medium-emphasis">
             your personal scent journal

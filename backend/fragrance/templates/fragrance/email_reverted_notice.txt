@@ -1,6 +1,6 @@
 {% autoescape off %}Hi {{ username }},
 
-The email address on your Fragrances account has been restored to this one, and all sessions on the account were signed out.
+The email address on your Fragrance Journey account has been restored to this one, and all sessions on the account were signed out.
 
 Please reset your password now, in case someone else has access:
 
@@ -8,4 +8,4 @@ Please reset your password now, in case someone else has access:
 
 If you need help, contact us at {{ support_email }}.
 
-— Fragrances{% endautoescape %}
+— Fragrance Journey{% endautoescape %}

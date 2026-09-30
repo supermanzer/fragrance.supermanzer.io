@@ -8,7 +8,7 @@
               class="text-h4 font-weight-regular mb-1"
               style="color: #4A6DB5; letter-spacing: 0.06em"
             >
-              Fragrances
+              Fragrance Journey
             </div>
             <div class="text-caption text-medium-emphasis" style="letter-spacing: 0.1em">
               your personal scent journal

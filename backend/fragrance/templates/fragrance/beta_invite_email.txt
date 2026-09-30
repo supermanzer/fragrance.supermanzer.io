@@ -1,6 +1,6 @@
 {% autoescape off %}Hi,
 
-You're in! Your spot in the Fragrances beta has been approved.
+You're in! Your spot in the Fragrance Journey beta has been approved.
 
 Click the link below to set your password and get started. This link expires in 14 days and can only be used once.
 
@@ -8,4 +8,4 @@ Click the link below to set your password and get started. This link expires in 
 
 If you weren't expecting this, you can safely ignore this email.
 
-— Fragrances{% endautoescape %}
+— Fragrance Journey{% endautoescape %}

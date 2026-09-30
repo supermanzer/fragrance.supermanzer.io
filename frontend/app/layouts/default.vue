@@ -1,6 +1,6 @@
 <template>
   <v-app-bar elevation="0" border="b">
-    <v-app-bar-title>Fragrances</v-app-bar-title>
+    <v-app-bar-title>Fragrance Journey</v-app-bar-title>
 
     <v-btn :to="{ path: '/fragrance' }" variant="text" active-color="primary">Collection</v-btn>
     <v-btn :to="{ path: '/runs' }" variant="text" active-color="primary">Runs</v-btn>

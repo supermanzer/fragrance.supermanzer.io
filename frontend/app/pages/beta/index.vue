@@ -2,7 +2,7 @@
   <v-card class="pa-6 w-100" elevation="1" rounded="lg">
     <p class="text-h6 font-weight-regular mb-2">Join the beta</p>
     <p class="text-body-2 text-medium-emphasis mb-6">
-      Fragrances is in a small, closed beta. Leave your email and we'll be in touch if a place opens up.
+      Fragrance Journey is in a small, closed beta. Leave your email and we'll be in touch if a place opens up.
     </p>
 
     <VFadeTransition mode="out-in">
