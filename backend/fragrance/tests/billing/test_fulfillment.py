@@ -596,7 +596,10 @@ class BillingSessionViewTests(StripeClientTestCase):
         body = response.json()
         self.assertEqual(
             set(body.keys()),
-            {"status", "plan", "access_expires_at", "has_active_access", "exempt", "can_manage_billing", "quota", "granted"},
+            {
+            "status", "plan", "access_expires_at", "has_active_access", "exempt", "is_staff",
+            "can_manage_billing", "quota", "granted",
+        },
         )
         self.assertTrue(body["granted"])
         self.assertEqual(body["status"], "active")
@@ -616,7 +619,10 @@ class BillingSessionViewTests(StripeClientTestCase):
         body = response.json()
         self.assertEqual(
             set(body.keys()),
-            {"status", "plan", "access_expires_at", "has_active_access", "exempt", "can_manage_billing", "quota", "granted"},
+            {
+            "status", "plan", "access_expires_at", "has_active_access", "exempt", "is_staff",
+            "can_manage_billing", "quota", "granted",
+        },
         )
         self.assertTrue(body["has_active_access"])
         self.assertFalse(body["granted"])

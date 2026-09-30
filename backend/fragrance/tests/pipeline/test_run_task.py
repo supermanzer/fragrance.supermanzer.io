@@ -194,10 +194,48 @@ class RenderAndSendEmailTests(TestCase):
         self.run.refresh_from_db()
         self.assertEqual(self.run.email_status, "sent")
 
-    def test_missing_config_propagates_for_celery_retry(self) -> None:
-        self.config.delete()
-        with self.assertRaises(FragranceConfig.DoesNotExist):
+    def test_configured_recipient_wins_over_the_account_email(self) -> None:
+        User.objects.filter(pk=self.user.pk).update(email="account@example.com")
+
+        render_and_send_email(user_id=self.user.id, run_id=self.run.id)
+
+        self.assertEqual(mail.outbox[0].to, ["dave@example.com"])
+
+    def test_blank_recipient_falls_back_to_the_account_email_with_a_warning(self) -> None:
+        User.objects.filter(pk=self.user.pk).update(email="account@example.com")
+        FragranceConfig.objects.filter(pk=self.config.pk).update(recipient_email="")
+
+        with self.assertLogs("fragrance.tasks", level="WARNING") as logs:
             render_and_send_email(user_id=self.user.id, run_id=self.run.id)
+
+        self.assertEqual(mail.outbox[0].to, ["account@example.com"])
+        self.assertTrue(any("blank recipient_email" in line for line in logs.output))
+        self.config.refresh_from_db()
+        self.assertEqual(self.config.recipient_email, "")
+
+    def test_missing_config_is_created_from_the_account_email_and_the_email_still_sends(self) -> None:
+        from django_celery_beat.models import PeriodicTask
+
+        User.objects.filter(pk=self.user.pk).update(email="account@example.com")
+        self.config.delete()
+        PeriodicTask.objects.filter(name=f"fragrance-run-{self.user.id}").delete()
+
+        with self.assertLogs("fragrance.tasks", level="WARNING") as logs:
+            render_and_send_email(user_id=self.user.id, run_id=self.run.id)
+
+        self.assertEqual(mail.outbox[0].to, ["account@example.com"])
+        self.assertTrue(any("no FragranceConfig" in line for line in logs.output))
+        created = FragranceConfig.objects.get(user=self.user)
+        self.assertEqual(created.recipient_email, "account@example.com")
+        self.assertTrue(PeriodicTask.objects.filter(name=f"fragrance-run-{self.user.id}").exists())
+
+    def test_no_address_anywhere_raises_instead_of_sending_to_a_blank_recipient(self) -> None:
+        FragranceConfig.objects.filter(pk=self.config.pk).update(recipient_email="")
+
+        with self.assertRaises(ValueError), self.assertLogs("fragrance.tasks", level="WARNING"):
+            render_and_send_email(user_id=self.user.id, run_id=self.run.id)
+
+        self.assertEqual(mail.outbox, [])
 
 
 # ---------------------------------------------------------------------------

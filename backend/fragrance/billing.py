@@ -445,28 +445,45 @@ def create_checkout_session(
         )
         raise CheckoutSessionUrlMissingError()
 
-    # One conditional UPDATE, atomic against revoke_for_dispute's UPDATE, so a
-    # dispute that landed during Session.create is never overwritten with
-    # "checkout_started" (a stale save() here would silently unlock the account).
-    updated = (
-        Subscription.objects.filter(pk=subscription.pk)  # ty: ignore[unresolved-attribute]
-        .exclude(status="revoked")
-        .update(status="checkout_started", last_checkout_session_id=session.id)
-    )
-    if not updated:
+    # A dispute (revoke) or a payment grant can land while Session.create was
+    # talking to Stripe, so the row is re-read under a short lock and the
+    # decision made on that fresh state. The lock covers only local writes:
+    # the Stripe expire call for a refused session happens after it is released.
+    # checkout_started is set only from "none" -- a lapsed customer's "active"
+    # row must stay "active" so the frontend still sees a lapsed subscriber.
+    refusal: AccountLockedError | SubscriptionAlreadyActiveError | None = None
+    reason = ""
+    with transaction.atomic():
+        locked = Subscription.objects.select_for_update().get(  # ty: ignore[unresolved-attribute]
+            pk=subscription.pk
+        )
+        if locked.status == "revoked":
+            refusal = AccountLockedError()
+            reason = "revoked"
+        elif locked.has_active_access:
+            refusal = SubscriptionAlreadyActiveError()
+            reason = "active"
+        else:
+            changes: dict[str, str] = {"last_checkout_session_id": session.id}
+            if locked.status == "none":
+                changes["status"] = "checkout_started"
+            Subscription.objects.filter(pk=locked.pk).update(**changes)  # ty: ignore[unresolved-attribute]
+    if refusal is not None:
         logger.warning(
-            "checkout session %s created for a subscription revoked mid-request; expiring it",
+            "checkout session %s created for a subscription that became %s mid-request; expiring it",
             session.id,
+            reason,
         )
         try:
             client.v1.checkout.sessions.expire(session.id)
         except stripe.StripeError as exc:
             logger.error(
-                "could not expire checkout session %s on a locked account: %s",
+                "could not expire checkout session %s on a %s account: %s",
                 session.id,
+                reason,
                 sanitize_sdk_error_message(exc),
             )
-        raise AccountLockedError()
+        raise refusal
     return url
 
 
@@ -1320,6 +1337,9 @@ def subscription_status_payload(*, subscription: Subscription) -> dict:
         "access_expires_at": subscription.access_expires_at,
         "has_active_access": exempt or subscription.has_active_access,
         "exempt": exempt,
+        # Strictly User.is_staff, unlike `exempt` (staff or superuser): only
+        # staff get the manual Run Now button.
+        "is_staff": bool(subscription.user.is_staff),  # ty: ignore[unresolved-attribute]
         # True once a Stripe Customer exists and there is billing to manage.
         # Reads only the in-memory row, so the unsaved placeholder used by
         # BillingSubscriptionView stays DB-free.

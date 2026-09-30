@@ -82,6 +82,43 @@ class FragranceConfigCreationJitterTests(TestCase):
         self.assertEqual(response.json()["run_hour"], 9)
 
 
+class FragranceConfigDeliveryAddressTests(TestCase):
+    def test_lazy_creation_defaults_the_recipient_to_the_account_email(self) -> None:
+        from fragrance.services import get_or_create_fragrance_config
+
+        user = User.objects.create_user(username="addr", email="addr@example.com", password="pw12345!")
+
+        config = get_or_create_fragrance_config(user=user)
+
+        self.assertEqual(config.recipient_email, "addr@example.com")
+        self.assertEqual(
+            (config.run_day_of_month, config.run_hour), default_schedule_for(user_id=user.id)
+        )
+
+    def test_an_existing_row_is_never_overwritten(self) -> None:
+        from fragrance.services import get_or_create_fragrance_config
+
+        user = User.objects.create_user(username="keep", email="keep@example.com", password="pw12345!")
+        FragranceConfig.objects.create(
+            user=user, recipient_email="chosen@example.com", run_day_of_month=15, run_hour=3
+        )
+
+        config = get_or_create_fragrance_config(user=user)
+
+        self.assertEqual(config.recipient_email, "chosen@example.com")
+        self.assertEqual((config.run_day_of_month, config.run_hour), (15, 3))
+
+    def test_first_config_get_returns_the_account_email_as_recipient(self) -> None:
+        user = User.objects.create_user(username="addr2", email="addr2@example.com", password="pw12345!")
+        active_subscription_for(user)
+        client = APIClient()
+        client.force_authenticate(user=user)
+
+        response = client.get(reverse("fragrance-config"))
+
+        self.assertEqual(response.json()["recipient_email"], "addr2@example.com")
+
+
 class RebalanceRunSchedulesCommandTests(TestCase):
     def setUp(self) -> None:
         self.untouched = User.objects.create_user(
@@ -168,6 +205,8 @@ class FragranceConfigScheduleValidationTests(TestCase):
             ("run_day_of_week", 7),
             ("run_day_of_week", -1),
             ("run_day_of_month", 0),
+            ("run_day_of_month", 29),
+            ("run_day_of_month", 31),
             ("run_day_of_month", 32),
             ("run_month", 0),
             ("run_month", 13),
@@ -184,7 +223,7 @@ class FragranceConfigScheduleValidationTests(TestCase):
             ("run_day_of_week", 0),
             ("run_day_of_week", 6),
             ("run_day_of_month", 1),
-            ("run_day_of_month", 31),
+            ("run_day_of_month", 28),
             ("run_month", 1),
             ("run_month", 12),
         ):
@@ -261,10 +300,10 @@ class MonthlyOnlyFrequencyTests(TestCase):
 class ScheduleSignalFrequencyTests(TestCase):
     """What signals.sync_user_schedule builds for monthly, for legacy non-monthly rows, and for junk."""
 
-    def _crontab(self, *, frequency: str, **fields: object):
+    def _crontab(self, *, frequency: str, suffix: str = "", **fields: object):
         from django_celery_beat.models import PeriodicTask
 
-        user = User.objects.create_user(username=f"sig_{frequency or 'blank'}", password="pw12345!")
+        user = User.objects.create_user(username=f"sig_{frequency or 'blank'}{suffix}", password="pw12345!")
         FragranceConfig.objects.create(
             user=user, recipient_email="s@example.com", frequency=frequency, **fields
         )
@@ -290,6 +329,37 @@ class ScheduleSignalFrequencyTests(TestCase):
             (crontab.day_of_month, crontab.month_of_year, crontab.day_of_week),
             ("9", "4", "*"),
         )
+
+    def test_a_stored_day_above_28_is_clamped_to_28_in_the_crontab(self) -> None:
+        for day in (29, 30, 31):
+            with self.subTest(day=day):
+                crontab = self._crontab(frequency="monthly", run_day_of_month=day, run_hour=6, suffix=str(day))
+                self.assertEqual(crontab.day_of_month, "28")
+
+    def test_the_clamp_never_touches_a_day_at_or_below_28(self) -> None:
+        for day in (1, 27, 28):
+            with self.subTest(day=day):
+                crontab = self._crontab(frequency="monthly", run_day_of_month=day, run_hour=6, suffix=str(day))
+                self.assertEqual(crontab.day_of_month, str(day))
+
+    def test_a_legacy_row_resaved_through_the_signal_is_clamped(self) -> None:
+        from django_celery_beat.models import PeriodicTask
+
+        user = User.objects.create_user(username="legacy31", password="pw12345!")
+        config = FragranceConfig.objects.create(user=user, recipient_email="l@example.com")
+        FragranceConfig.objects.filter(pk=config.pk).update(run_day_of_month=31)
+
+        config.refresh_from_db()
+        config.save()
+
+        crontab = PeriodicTask.objects.get(name=f"fragrance-run-{user.id}").crontab
+        self.assertEqual(crontab.day_of_month, "28")
+        config.refresh_from_db()
+        self.assertEqual(config.run_day_of_month, 31)
+
+    def test_clamp_applies_to_legacy_yearly_rows_too(self) -> None:
+        crontab = self._crontab(frequency="yearly", run_day_of_month=30, run_month=2, suffix="y30")
+        self.assertEqual((crontab.day_of_month, crontab.month_of_year), ("28", "2"))
 
     def test_an_unrecognised_frequency_falls_back_to_monthly_never_daily(self) -> None:
         crontab = self._crontab(frequency="daily", run_day_of_month=12, run_hour=7)

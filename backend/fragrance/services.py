@@ -3,7 +3,9 @@ import hashlib
 import hmac
 import logging
 from datetime import datetime, timedelta
+from datetime import timezone as dt_timezone
 from typing import IO, Literal
+from zoneinfo import ZoneInfo
 
 from django.conf import settings
 from django.contrib.auth.models import User
@@ -11,6 +13,7 @@ from django.core import signing
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 from django.utils.text import slugify
+from django_celery_beat.models import crontab_schedule_celery_timezone
 from rest_framework.request import Request
 
 from .models import (
@@ -69,6 +72,12 @@ EMAIL_REVERT_SALT = "email-revert"
 # reap_stale_runs task marks it failed. Comfortably above the task's worst
 # case: 3 attempts x 1500s hard limit + 2 x 300s retry backoff.
 IN_FLIGHT_MAX_AGE = timedelta(hours=2)
+
+
+# Days 29-31 do not exist in every month, so a crontab on one of them would
+# silently skip short months. Shared by the serializer, the beat schedule
+# builder (signals.py) and the next-run computation below.
+MAX_RUN_DAY_OF_MONTH = 28
 
 
 RECOMMENDATION_FEEDBACK_MAX_AGE = 60 * 60 * 24 * 90  # 90 days
@@ -330,15 +339,26 @@ def get_client_ip(*, request: Request) -> str:
 
 def get_or_create_fragrance_config(*, user: User) -> FragranceConfig:
     """
-    The one place a FragranceConfig is first created with a jittered schedule.
-    Applied only at creation via `defaults` -- get_or_create never overwrites
-    an existing row, so a user's own choice is never touched.
+    The one place a FragranceConfig is first created, with a jittered schedule
+    and the account email as the delivery address. Applied only at creation
+    via `defaults` -- get_or_create never overwrites an existing row, so a
+    user's own choice is never touched.
     """
     day, hour = default_schedule_for(user_id=user.pk)
     config, _ = FragranceConfig.objects.get_or_create(
-        user=user, defaults={"run_day_of_month": day, "run_hour": hour}
+        user=user,
+        defaults={
+            "run_day_of_month": day,
+            "run_hour": hour,
+            "recipient_email": user.email,
+        },
     )
     return config
+
+
+def has_completed_run(*, user: User) -> bool:
+    """True once the user has had a successful ("done") run; failed runs never count."""
+    return RecommendationRun.objects.filter(user=user, status="done").exists()
 
 
 def hash_signup_ip(*, ip: str) -> str:
@@ -461,6 +481,17 @@ def quota_snapshot(*, user: User, subscription: Subscription | None) -> dict:
         "runs_used": consumed,
         "next_eligible_at": next_eligible_at,
         "can_trigger": refusal is None,
+        # The one manual run a non-staff user gets: refusal already covers
+        # access, an in-flight run and quota. Decided on is_staff alone (a
+        # non-staff superuser follows the non-staff rule).
+        "first_run_available": (
+            refusal is None
+            and not user.is_staff
+            and not has_completed_run(user=user)
+        ),
+        "next_run_at": _next_run_at(
+            user=user, plan=plan, has_access=has_access, exempt=staff, now=now
+        ),
     }
 
 
@@ -589,6 +620,11 @@ def verify_recommendation_token(token: str) -> dict | None:
     return payload
 
 
+def _beat_timezone() -> ZoneInfo:
+    """The timezone the per-user crontabs are evaluated in (django-celery-beat's default for new schedules)."""
+    return ZoneInfo(crontab_schedule_celery_timezone())
+
+
 def _check_can_start(
     *,
     user: User,
@@ -669,6 +705,57 @@ def _evaluate_quota(
 
 def _is_staff(*, user: User) -> bool:
     return bool(user.is_staff or user.is_superuser)
+
+
+def _next_monthly_slot(
+    *, config: FragranceConfig, after: datetime, not_before: datetime | None
+) -> datetime | None:
+    """
+    First monthly slot strictly after `after` and at or after `not_before`,
+    in UTC; None for a legacy weekly/yearly row (its slot is not modelled).
+    The day is capped exactly as signals.py caps it when building the crontab.
+    """
+    if config.frequency in ("weekly", "yearly"):
+        return None
+    tz = _beat_timezone()
+    day = max(1, min(config.run_day_of_month, MAX_RUN_DAY_OF_MONTH))
+    local_after = after.astimezone(tz)
+    year, month = local_after.year, local_after.month
+    # 26 months covers the longest quota period (an annual plan's 365 days) plus slack.
+    for _ in range(26):
+        slot = datetime(year, month, day, config.run_hour, tzinfo=tz)
+        if slot > after and (not_before is None or slot >= not_before):
+            return slot.astimezone(dt_timezone.utc)
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return None
+
+
+def _next_run_at(
+    *, user: User, plan: Plan | None, has_access: bool, exempt: bool, now: datetime
+) -> datetime | None:
+    """
+    When the beat scheduler will next start this user's run, or None when
+    that is unknown (lapsed/revoked, no FragranceConfig yet, a legacy
+    non-monthly schedule, or a quota block that never lifts). Read-only.
+
+    The scheduled path is quota-checked with source="beat", so eligibility
+    comes from _evaluate_quota(source="beat"). Beat only fires at slots and
+    does not retry a refused one, so this is the first slot at or after
+    eligibility, not eligibility itself.
+    """
+    if not has_access:
+        return None
+    config = FragranceConfig.objects.filter(user=user).first()
+    if config is None:
+        return None
+    not_before: datetime | None = None
+    if not exempt:
+        _, blocked, eligible_at = _evaluate_quota(user=user, plan=plan, now=now, source="beat")
+        if blocked:
+            if eligible_at is None:
+                return None
+            not_before = eligible_at
+    return _next_monthly_slot(config=config, after=now, not_before=not_before)
 
 
 def _quota_terms(*, plan: Plan | None) -> tuple[timedelta, int, int]:

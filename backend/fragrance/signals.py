@@ -12,6 +12,7 @@ from django.dispatch import receiver
 from django_celery_beat.models import CrontabSchedule, PeriodicTask
 
 from .models import FragranceConfig
+from .services import MAX_RUN_DAY_OF_MONTH
 
 
 @receiver(signal=post_save, sender=FragranceConfig)
@@ -34,6 +35,9 @@ def _create_or_update_user_schedule(config: FragranceConfig) -> None:
     Changing frequency in the UI takes effect on the next Celery Beat tick without
     any redeploy.
     """
+    # A stored day above the cap (a legacy row, or a value typed in admin) is
+    # clamped so the schedule never skips a short month.
+    day_of_month = str(min(config.run_day_of_month, MAX_RUN_DAY_OF_MONTH))
     # Monthly-shaped by default: only monthly is offered, so a row whose
     # frequency matches no branch below must never fall through to a crontab
     # with only minute/hour set (which would run daily).
@@ -41,7 +45,7 @@ def _create_or_update_user_schedule(config: FragranceConfig) -> None:
         'minute': '0',
         'hour': str(config.run_hour),
         'day_of_week': '*',
-        'day_of_month': str(config.run_day_of_month),
+        'day_of_month': day_of_month,
         'month_of_year': '*',
     }
 
@@ -54,13 +58,13 @@ def _create_or_update_user_schedule(config: FragranceConfig) -> None:
     elif config.frequency == 'monthly':
         crontab_kwargs.update({
             'day_of_week': '*',
-            'day_of_month': str(config.run_day_of_month),
+            'day_of_month': day_of_month,
             'month_of_year': '*',
         })
     elif config.frequency == 'yearly':
         crontab_kwargs.update({
             'day_of_week': '*',
-            'day_of_month': str(config.run_day_of_month),
+            'day_of_month': day_of_month,
             'month_of_year': str(config.run_month),
         })
 

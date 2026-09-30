@@ -68,6 +68,51 @@ class BetaSignupAdminApproveTests(TestCase):
         self.assertIsNone(sub.plan)
         self.assertTrue(Plan.objects.filter(pk=self.plan.pk, is_active=True).exists())
 
+    def test_approve_creates_the_fragrance_config_and_periodic_task(self) -> None:
+        from django_celery_beat.models import PeriodicTask
+        from fragrance.models import FragranceConfig
+        from fragrance.services import default_schedule_for
+
+        signup = BetaSignup.objects.create(email="cfg@example.com", normalized_email="cfg@example.com")
+        with patch.object(send_beta_invite_email, "delay"):
+            self._approve([signup.pk])
+
+        signup.refresh_from_db()
+        user = signup.invited_user
+        config = FragranceConfig.objects.get(user=user)
+        self.assertEqual(config.recipient_email, "cfg@example.com")
+        self.assertEqual(
+            (config.run_day_of_month, config.run_hour), default_schedule_for(user_id=user.id)
+        )
+        task = PeriodicTask.objects.get(name=f"fragrance-run-{user.id}")
+        self.assertEqual(task.crontab.day_of_month, str(config.run_day_of_month))
+        self.assertTrue(task.enabled)
+
+    def test_a_skipped_approval_creates_no_config(self) -> None:
+        from fragrance.models import FragranceConfig
+
+        signup = BetaSignup.objects.create(
+            email="skipcfg@example.com", normalized_email="skipcfg@example.com", status="rejected"
+        )
+        with patch.object(send_beta_invite_email, "delay"):
+            self._approve([signup.pk])
+
+        self.assertEqual(FragranceConfig.objects.count(), 0)
+
+    def test_a_config_failure_rolls_the_whole_approval_back(self) -> None:
+        from fragrance.models import FragranceConfig
+
+        signup = BetaSignup.objects.create(email="atomic@example.com", normalized_email="atomic@example.com")
+        with patch.object(send_beta_invite_email, "delay"), patch(
+            "fragrance.admin.get_or_create_fragrance_config", side_effect=RuntimeError("boom")
+        ):
+            self._approve([signup.pk])
+
+        signup.refresh_from_db()
+        self.assertEqual(signup.status, "pending")
+        self.assertFalse(User.objects.filter(email="atomic@example.com").exists())
+        self.assertEqual(FragranceConfig.objects.count(), 0)
+
     def test_approve_with_no_plan_seeded_creates_subscription_with_null_plan(self) -> None:
         Plan.objects.all().delete()
         signup = BetaSignup.objects.create(

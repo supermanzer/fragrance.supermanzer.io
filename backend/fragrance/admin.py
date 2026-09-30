@@ -25,7 +25,7 @@ from .models import (
     StripeEvent,
     Subscription,
 )
-from .services import default_schedule_for, derive_unique_username
+from .services import default_schedule_for, derive_unique_username, get_or_create_fragrance_config
 
 # Register your models here.
 
@@ -223,6 +223,12 @@ class BetaSignupAdmin(admin.ModelAdmin):
                     # No plan yet: the first payment sets it
                     # (billing._grant_period_for_invoice).
                     Subscription.objects.create(user=user, status="none")
+
+                    # Created here, not lazily by the first GET /config/: a
+                    # subscriber who never opens Settings would otherwise have
+                    # no schedule (the config's post_save creates the beat
+                    # PeriodicTask) and no delivery address.
+                    get_or_create_fragrance_config(user=user)
 
                     locked.approved_at = timezone.now()
                     locked.approved_by = request.user

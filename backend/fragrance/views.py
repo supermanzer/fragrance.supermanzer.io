@@ -67,6 +67,7 @@ from .services import (
     apply_recommendation_rating,
     get_client_ip,
     get_or_create_fragrance_config,
+    has_completed_run,
     hash_signup_ip,
     import_collection_from_csv,
     normalize_email,
@@ -941,6 +942,17 @@ class RecommendationRunViewSet(viewsets.ReadOnlyModelViewSet):
     def trigger(self, request):
         from fragrance.tasks import monthly_fragrance_run
 
+        # Manual runs are staff-only, except the one first run a non-staff
+        # user gets until they have had a successful run. Strictly is_staff:
+        # a superuser who is not staff follows the non-staff rule.
+        if not request.user.is_staff and has_completed_run(user=request.user):
+            return Response(
+                {
+                    "code": "manual_runs_staff_only",
+                    "detail": "Your picks are delivered automatically each month.",
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
         try:
             run = start_recommendation_run(user=request.user, source="api")
         except QuotaExceeded as exc:

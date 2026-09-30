@@ -44,6 +44,7 @@ from .services import (
     generate_beta_invite_token,
     IN_FLIGHT_MAX_AGE,
     generate_recommendation_token,
+    get_or_create_fragrance_config,
     start_recommendation_run,
 )
 
@@ -321,7 +322,17 @@ def render_and_send_email(user_id: int, run_id: int) -> None:
         .prefetch_related('picks')
         .get(id=run_id)
     )
-    config = FragranceConfig.objects.get(user_id=user_id)  # ty: ignore[unresolved-attribute]
+    user = User.objects.get(pk=user_id)
+    config = FragranceConfig.objects.filter(user_id=user_id).first()  # ty: ignore[unresolved-attribute]
+    if config is None:
+        logger.warning('user %s has no FragranceConfig at send time; creating it', user_id)
+        config = get_or_create_fragrance_config(user=user)
+    recipient = config.recipient_email
+    if not recipient:
+        logger.warning('user %s has a blank recipient_email; delivering to the account email', user_id)
+        recipient = user.email
+    if not recipient:
+        raise ValueError(f'user {user_id} has no delivery address (blank recipient_email and account email)')
 
     # Attach ad-hoc confirm_url_* attributes directly onto the prefetched pick instances
     # so the template can reference pick.confirm_url_own/_like/_dislike without a second
@@ -349,7 +360,7 @@ def render_and_send_email(user_id: int, run_id: int) -> None:
         subject=f'Fragrance Picks — {run.triggered_at.strftime("%B %Y")}',
         body=html,
         from_email=settings.DEFAULT_FROM_EMAIL,
-        to=[config.recipient_email],
+        to=[recipient],
     )
     email.content_subtype = 'html'
     email.send()

@@ -7,7 +7,7 @@ from django.utils.http import urlsafe_base64_decode
 from rest_framework import serializers
 
 from .models import FRAGRANCE_STATUSES, FragranceConfig, Fragrance, Plan, PreferenceProfile, Recommendation, RecommendationRun
-from .services import resolve_beta_invite_signup
+from .services import MAX_RUN_DAY_OF_MONTH, resolve_beta_invite_signup
 
 
 class RecommendationSerializer(serializers.ModelSerializer):
@@ -115,10 +115,11 @@ class FragranceConfigSerializer(serializers.ModelSerializer):
         exclude = ['user']
         # An out-of-range value would save and then yield an invalid crontab;
         # django-celery-beat swallows that error, silently losing the run.
+        # Day of month stops at 28: 29-31 would skip short months.
         extra_kwargs = {
             'run_hour': {'min_value': 0, 'max_value': 23},
             'run_day_of_week': {'min_value': 0, 'max_value': 6},
-            'run_day_of_month': {'min_value': 1, 'max_value': 31},
+            'run_day_of_month': {'min_value': 1, 'max_value': MAX_RUN_DAY_OF_MONTH},
             'run_month': {'min_value': 1, 'max_value': 12},
         }
 

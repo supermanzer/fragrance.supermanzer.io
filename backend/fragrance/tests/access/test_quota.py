@@ -250,17 +250,21 @@ class TriggerViewQuotaTests(TestCase):
         delay.assert_called_once_with(user_id=self.user.id, run_id=run.id)
         self.assertEqual(run.celery_task_id, "task-1")
 
-    def test_second_trigger_in_window_is_429_quota_exceeded(self) -> None:
+    def test_a_quota_block_without_a_done_run_is_429_quota_exceeded(self) -> None:
+        # Two failed dispatches use up max_runs + failed_run_grace without a
+        # "done" run, so the first-run gate lets the request reach the quota.
         self._post()
-        RecommendationRun.objects.filter(user=self.user).update(status="done")
+        RecommendationRun.objects.filter(user=self.user).update(status="failed")
+        self._post()
+        RecommendationRun.objects.filter(user=self.user).update(status="failed")
         response, delay = self._post()
         self.assertEqual(response.status_code, 429)
         body = response.json()
         self.assertEqual(body["code"], "quota_exceeded")
         self.assertIn("detail", body)
-        run = RecommendationRun.objects.get(user=self.user)
+        first = RecommendationRun.objects.filter(user=self.user).earliest("triggered_at")
         expected = (
-            (run.triggered_at + timedelta(days=30))
+            (first.triggered_at + timedelta(days=30))
             .isoformat()
             .replace("+00:00", "Z")
         )
@@ -599,6 +603,8 @@ class QuotaSnapshotPayloadTests(TestCase):
                 "runs_used": 0,
                 "next_eligible_at": None,
                 "can_trigger": False,
+                "first_run_available": False,
+                "next_run_at": None,
             },
         )
 
@@ -611,6 +617,8 @@ class QuotaSnapshotPayloadTests(TestCase):
                 "runs_used": 0,
                 "next_eligible_at": None,
                 "can_trigger": True,
+                "first_run_available": True,
+                "next_run_at": None,
             },
         )
 

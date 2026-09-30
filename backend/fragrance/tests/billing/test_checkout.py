@@ -8,10 +8,16 @@ import redis
 import stripe
 from django.conf import settings
 from django.contrib.auth.models import User
+from django.db import connection
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
-from fragrance.billing import AccountLockedError, create_checkout_session
+from fragrance.billing import (
+    AccountLockedError,
+    CheckoutSessionUrlMissingError,
+    SubscriptionAlreadyActiveError,
+    create_checkout_session,
+)
 from fragrance.models import Plan, Subscription
 from fragrance.tests.support.bases import StripeClientTestCase
 from fragrance.tests.support.factories import (
@@ -442,6 +448,158 @@ class CheckoutDisputeRaceTests(StripeClientTestCase):
 
 
 @override_settings(**_STRIPE_TEST_SETTINGS)
+class CheckoutGrantRaceTests(StripeClientTestCase):
+    """
+    A payment grant can land during Session.create. The final write must not
+    turn "active" into "checkout_started" (has_active_access needs "active"),
+    and a lapsed "active" row must stay "active" so the frontend keeps
+    treating the customer as lapsed rather than never-subscribed.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        _make_plan(slug="race-plan", interval="month")
+        self.stripe.v1.subscriptions.list.return_value = _empty_subscription_list()
+        self.user = User.objects.create_user(username="grantuser", email="grantuser@example.com")
+        self.subscription = Subscription.objects.create(
+            user=self.user, stripe_customer_id="cus_grant", last_checkout_session_id="cs_before"
+        )
+        self.stripe.v1.checkout.sessions.retrieve.return_value = _session(
+            session_id="cs_before", url="https://checkout.stripe.com/cs_before", status="expired"
+        )
+        self.grant_expiry = timezone.now() + timedelta(days=30)
+
+    def _grant(self) -> None:
+        Subscription.objects.filter(pk=self.subscription.pk).update(
+            status="active", access_expires_at=self.grant_expiry
+        )
+
+    def _create_while_grant_lands(self, **kwargs: object) -> stripe.checkout.Session:
+        self._grant()
+        return _session(session_id="cs_mid", url="https://checkout.stripe.com/cs_mid")
+
+    def _assert_grant_untouched(self) -> None:
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "active")
+        self.assertEqual(self.subscription.access_expires_at, self.grant_expiry)
+        self.assertEqual(self.subscription.last_checkout_session_id, "cs_before")
+        self.assertTrue(self.subscription.has_active_access)
+
+    def test_a_grant_during_session_create_is_kept_and_the_new_session_expired(self) -> None:
+        self.stripe.v1.checkout.sessions.create.side_effect = self._create_while_grant_lands
+        self.stripe.v1.checkout.sessions.expire.return_value = None
+
+        with self.assertRaises(SubscriptionAlreadyActiveError), self.assertLogs(
+            "fragrance.billing", level="WARNING"
+        ):
+            create_checkout_session(user=self.user, plan_slug="race-plan")
+
+        self._assert_grant_untouched()
+        self.stripe.v1.checkout.sessions.expire.assert_called_once_with("cs_mid")
+
+    def test_the_view_answers_409_already_active_for_a_mid_request_grant(self) -> None:
+        self.stripe.v1.checkout.sessions.create.side_effect = self._create_while_grant_lands
+        self.stripe.v1.checkout.sessions.expire.return_value = None
+        client = APIClient()
+        client.force_authenticate(user=self.user)
+
+        with self.assertLogs("fragrance.billing", level="WARNING"):
+            response = client.post("/api/v1/billing/checkout/", {"slug": "race-plan"})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json(), {"detail": "You already have an active subscription."})
+        self._assert_grant_untouched()
+
+    def test_a_failing_expire_is_logged_and_never_masks_the_refusal(self) -> None:
+        self.stripe.v1.checkout.sessions.create.side_effect = self._create_while_grant_lands
+        self.stripe.v1.checkout.sessions.expire.side_effect = stripe.APIConnectionError("down")
+
+        with self.assertRaises(SubscriptionAlreadyActiveError), self.assertLogs(
+            "fragrance.billing", level="ERROR"
+        ) as logs:
+            create_checkout_session(user=self.user, plan_slug="race-plan")
+
+        self.assertTrue(any("cs_mid" in line and "could not expire" in line for line in logs.output))
+        self._assert_grant_untouched()
+
+    def test_the_session_is_expired_after_the_row_lock_is_released(self) -> None:
+        self.stripe.v1.checkout.sessions.create.side_effect = self._create_while_grant_lands
+        # TestCase wraps each test in savepoints, so compare depth to the baseline:
+        # an expire call made inside create_checkout_session's own atomic() block
+        # would see one more.
+        baseline_depth = len(connection.savepoint_ids)
+        depth_at_expire: list[int] = []
+
+        def _expire(session_id: str) -> None:
+            depth_at_expire.append(len(connection.savepoint_ids))
+
+        self.stripe.v1.checkout.sessions.expire.side_effect = _expire
+        with self.assertRaises(SubscriptionAlreadyActiveError), self.assertLogs(
+            "fragrance.billing", level="WARNING"
+        ):
+            create_checkout_session(user=self.user, plan_slug="race-plan")
+
+        self.assertEqual(depth_at_expire, [baseline_depth])
+
+    def test_a_lapsed_active_row_stays_active_and_stores_the_session_id(self) -> None:
+        lapsed_at = timezone.now() - timedelta(days=3)
+        Subscription.objects.filter(pk=self.subscription.pk).update(
+            status="active", access_expires_at=lapsed_at
+        )
+        self.stripe.v1.checkout.sessions.create.return_value = _session(
+            session_id="cs_lapsed", url="https://checkout.stripe.com/cs_lapsed"
+        )
+
+        url = create_checkout_session(user=self.user, plan_slug="race-plan")
+
+        self.assertEqual(url, "https://checkout.stripe.com/cs_lapsed")
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "active")
+        self.assertEqual(self.subscription.access_expires_at, lapsed_at)
+        self.assertEqual(self.subscription.last_checkout_session_id, "cs_lapsed")
+        self.assertFalse(self.subscription.has_active_access)
+        self.stripe.v1.checkout.sessions.expire.assert_not_called()
+
+    def test_a_none_row_moves_to_checkout_started(self) -> None:
+        self.stripe.v1.checkout.sessions.create.return_value = _session(
+            session_id="cs_none", url="https://checkout.stripe.com/cs_none"
+        )
+
+        create_checkout_session(user=self.user, plan_slug="race-plan")
+
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "checkout_started")
+        self.assertEqual(self.subscription.last_checkout_session_id, "cs_none")
+
+    def test_a_checkout_started_row_keeps_its_status_and_gets_the_new_session_id(self) -> None:
+        Subscription.objects.filter(pk=self.subscription.pk).update(status="checkout_started")
+        self.stripe.v1.checkout.sessions.create.return_value = _session(
+            session_id="cs_again", url="https://checkout.stripe.com/cs_again"
+        )
+
+        create_checkout_session(user=self.user, plan_slug="race-plan")
+
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "checkout_started")
+        self.assertEqual(self.subscription.last_checkout_session_id, "cs_again")
+
+    def test_a_session_without_a_url_writes_nothing_even_when_a_grant_landed(self) -> None:
+        def _create_without_url_while_grant_lands(**kwargs: object) -> stripe.checkout.Session:
+            self._grant()
+            return _session(session_id="cs_nourl", url="")
+
+        self.stripe.v1.checkout.sessions.create.side_effect = _create_without_url_while_grant_lands
+
+        with self.assertRaises(CheckoutSessionUrlMissingError), self.assertLogs(
+            "fragrance.billing", level="ERROR"
+        ):
+            create_checkout_session(user=self.user, plan_slug="race-plan")
+
+        self._assert_grant_untouched()
+        self.stripe.v1.checkout.sessions.expire.assert_not_called()
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS)
 class CheckoutCustomerRaceTests(TransactionTestCase):
     """
     Item 6: two concurrent double-submits of Checkout must not each create a
@@ -558,8 +716,16 @@ class BillingSubscriptionViewTests(TestCase):
                 "access_expires_at": None,
                 "has_active_access": False,
                 "exempt": False,
+                "is_staff": False,
                 "can_manage_billing": False,
-                "quota": {"runs_allowed": 0, "runs_used": 0, "next_eligible_at": None, "can_trigger": False},
+                "quota": {
+                    "runs_allowed": 0,
+                    "runs_used": 0,
+                    "next_eligible_at": None,
+                    "can_trigger": False,
+                    "first_run_available": False,
+                    "next_run_at": None,
+                },
             },
         )
         self.assertFalse(Subscription.objects.filter(user=self.user).exists())
