@@ -1,0 +1,12 @@
+{% autoescape off %}Hi,
+
+This month's fragrance picks didn't finish. The problem was on our side, not yours, and nothing you did caused it.
+
+We're already working on it. We'll try again automatically in about 24 hours, and keep trying if we need to. You don't need to do anything. As soon as your picks are ready, they'll arrive in your inbox as usual.
+
+You can see where things stand any time on your Runs page:
+{{ runs_url }}
+
+If you'd rather hear from us directly, just write to {{ support_email }}.
+
+— Fragrance Journey{% endautoescape %}

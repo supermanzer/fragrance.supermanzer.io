@@ -11,6 +11,8 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.core import signing
 from django.db import IntegrityError, transaction
+from django.db.models import F, Q
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from django.utils.text import slugify
 from django_celery_beat.models import crontab_schedule_celery_timezone
@@ -67,10 +69,12 @@ EMAIL_REVERT_MAX_TOKEN_LENGTH = 2048
 EMAIL_REVERT_SALT = "email-revert"
 
 
-# A pending/running row older than this is presumed stranded (worker OOM,
-# SIGKILL, container recreate) and no longer blocks a new trigger; the
-# reap_stale_runs task marks it failed. Comfortably above the task's worst
-# case: 3 attempts x 1500s hard limit + 2 x 300s retry backoff.
+# A pending/running attempt older than this (measured from attempt_started_at,
+# falling back to triggered_at, never from triggered_at alone: a retry runs
+# days after the chain began) is presumed stranded (worker OOM, SIGKILL,
+# container recreate) and no longer blocks a new trigger; the reap_stale_runs
+# task fails it, which enters it into the retry chain. Comfortably above the
+# task's worst case: 3 attempts x 1500s hard limit + 2 x 300s retry backoff.
 IN_FLIGHT_MAX_AGE = timedelta(hours=2)
 
 
@@ -80,6 +84,11 @@ IN_FLIGHT_MAX_AGE = timedelta(hours=2)
 MAX_RUN_DAY_OF_MONTH = 28
 
 
+# Automatic retries after a failed first attempt: one chain is at most
+# MAX_RUN_RETRIES + 1 attempts, all on one RecommendationRun row.
+MAX_RUN_RETRIES = 4
+
+
 RECOMMENDATION_FEEDBACK_MAX_AGE = 60 * 60 * 24 * 90  # 90 days
 
 
@@ -87,6 +96,21 @@ RECOMMENDATION_FEEDBACK_SALT = "recommendation-feedback"
 
 
 REQUIRED_COLUMNS = {"fragrance", "status", "house", "notes"}
+
+
+# claim_run_retry's verdict: "dispatch" = the row is now pending and the
+# caller must queue the task; "exhausted"/"stopped" = the chain ended instead;
+# "skip" = nothing due (already claimed, moved on, or not scheduled).
+RetryClaimOutcome = Literal["dispatch", "exhausted", "stopped", "skip"]
+
+
+# Wait between a failed attempt and its retry.
+RUN_RETRY_INTERVAL = timedelta(hours=24)
+
+
+# record_run_failure's verdict for the chain; "ignored" = the run was already
+# out of flight (reaped or failed elsewhere), so nothing changed.
+RunFailureOutcome = Literal["scheduled", "exhausted", "stopped", "ignored"]
 
 
 # Maps normalized CSV values → internal status. Keys are lowercased + stripped.
@@ -249,6 +273,40 @@ def apply_recommendation_rating(recommendation: Recommendation, action: str) -> 
             raise RatingConflict(existing_action=existing.status)
     except IntegrityError as exc:
         return _resolve_after_race(recommendation=recommendation, action=action, original=exc)
+
+
+def claim_run_retry(*, run_id: int, now: datetime) -> RetryClaimOutcome:
+    """
+    Claims one due, scheduled retry for dispatch. Bypasses start_recommendation_run
+    on purpose: the retry reuses its own row, so the in-flight guard would
+    refuse it and the quota would count it twice. Runs under a row lock, so
+    two overlapping sweeps dispatch a run once. Access is re-checked here: a
+    lapse since the failure ends the chain as "stopped" (no email).
+    """
+    with transaction.atomic():
+        run = (
+            RecommendationRun.objects.select_for_update()
+            .filter(pk=run_id, status="failed", retry_state="scheduled", next_retry_at__lte=now)
+            .first()
+        )
+        if run is None:
+            return "skip"
+        verdict = _retry_verdict(run=run, retry_at=now)
+        if verdict != "scheduled":
+            run.retry_state = verdict
+            run.next_retry_at = None
+            run.save(update_fields=["retry_state", "next_retry_at"])
+            return verdict
+        run.status = "pending"
+        run.attempt += 1
+        run.attempt_started_at = now
+        run.retry_state = ""
+        run.next_retry_at = None
+        run.save(
+            update_fields=["status", "attempt", "attempt_started_at", "retry_state", "next_retry_at"]
+        )
+    logger.info("claimed retry (attempt %s) of run %s for user %s", run.attempt, run.id, run.user_id)
+    return "dispatch"
 
 
 def default_schedule_for(*, user_id: int) -> tuple[int, int]:
@@ -423,11 +481,19 @@ def import_collection_from_csv(user: User, file_obj: IO[str]) -> dict:
 
 
 def in_flight_runs(*, user: User, now: datetime):
-    """Sole definition of "a run is in flight", shared by every guard so they cannot drift."""
-    return RecommendationRun.objects.filter(
-        user=user,
-        status__in=_IN_FLIGHT_STATUSES,
-        triggered_at__gte=now - IN_FLIGHT_MAX_AGE,
+    """
+    Sole definition of "a run is in flight", shared by every guard so they
+    cannot drift. Two shapes count: an attempt that is pending/running and not
+    yet presumed stranded, and a failed run whose automatic retry is
+    scheduled (the chain is still alive, so it must block a second run and
+    must not read as "no run yet" to the first-run gate).
+    """
+    return _annotated_with_attempt_clock().filter(
+        Q(user=user)
+        & (
+            Q(status__in=_IN_FLIGHT_STATUSES, attempt_clock__gte=now - IN_FLIGHT_MAX_AGE)
+            | Q(status="failed", retry_state="scheduled")
+        )
     )
 
 
@@ -495,6 +561,39 @@ def quota_snapshot(*, user: User, subscription: Subscription | None) -> dict:
     }
 
 
+def record_run_failure(
+    *, run_id: int, error_message: str, now: datetime | None = None
+) -> RunFailureOutcome:
+    """
+    The one place a run attempt is recorded as failed (the task's failure
+    branches and the stale-run reaper both come here). Decides the chain's
+    fate under a row lock: "stopped" if access lapsed, "exhausted" if the
+    retries are used up or the next retry would fall outside the quota period
+    (the period anchors on triggered_at, the chain start), else "scheduled"
+    with next_retry_at = now + RUN_RETRY_INTERVAL. Idempotent: a run that is
+    no longer pending/running is left alone.
+    """
+    now = now or timezone.now()
+    with transaction.atomic():
+        run = RecommendationRun.objects.select_for_update().filter(pk=run_id).first()
+        if run is None or run.status not in _IN_FLIGHT_STATUSES:
+            return "ignored"
+        retry_at = now + RUN_RETRY_INTERVAL
+        verdict = _retry_verdict(run=run, retry_at=retry_at)
+        run.status = "failed"
+        run.error_message = error_message
+        run.last_failed_at = now
+        run.retry_state = verdict
+        run.next_retry_at = retry_at if verdict == "scheduled" else None
+        run.save(
+            update_fields=["status", "error_message", "last_failed_at", "retry_state", "next_retry_at"]
+        )
+    logger.info(
+        "run %s (attempt %s) for user %s failed: chain %s", run.id, run.attempt, run.user_id, verdict
+    )
+    return verdict
+
+
 def resolve_beta_invite_signup(*, token: str) -> BetaSignup:
     """
     Decodes a beta-invite token and resolves it to a still-invitable
@@ -525,6 +624,13 @@ def resolve_beta_invite_signup(*, token: str) -> BetaSignup:
     return signup
 
 
+def stale_in_flight_runs(*, now: datetime):
+    """Pending/running attempts presumed stranded: the complement of the age test in in_flight_runs."""
+    return _annotated_with_attempt_clock().filter(
+        status__in=_IN_FLIGHT_STATUSES, attempt_clock__lt=now - IN_FLIGHT_MAX_AGE
+    )
+
+
 def start_recommendation_run(*, user: User, source: TriggerSource) -> RecommendationRun:
     """
     The single chokepoint both trigger paths (the API view and the beat task)
@@ -545,9 +651,24 @@ def start_recommendation_run(*, user: User, source: TriggerSource) -> Recommenda
         )
         if refusal is not None:
             raise refusal
-        run = RecommendationRun.objects.create(user=user, status="pending")
+        run = RecommendationRun.objects.create(
+            user=user, status="pending", attempt_started_at=timezone.now()
+        )
     logger.info("started recommendation run %s for user %s (source=%s)", run.id, user.id, source)
     return run
+
+
+def unclaim_run_retry(*, run_id: int, retry_at: datetime) -> None:
+    """
+    Puts a claimed retry back to "scheduled" when the task could not be queued
+    (broker down), without spending the attempt claim_run_retry counted.
+    """
+    RecommendationRun.objects.filter(pk=run_id, status="pending", attempt__gt=1).update(
+        status="failed",
+        retry_state="scheduled",
+        attempt=F("attempt") - 1,
+        next_retry_at=retry_at,
+    )
 
 
 def verify_beta_invite_token(*, token: str) -> dict | None:
@@ -620,6 +741,13 @@ def verify_recommendation_token(token: str) -> dict | None:
     return payload
 
 
+def _annotated_with_attempt_clock():
+    """RecommendationRun rows with `attempt_clock` = when the current attempt began (legacy rows: triggered_at)."""
+    return RecommendationRun.objects.annotate(
+        attempt_clock=Coalesce("attempt_started_at", "triggered_at")
+    )
+
+
 def _beat_timezone() -> ZoneInfo:
     """The timezone the per-user crontabs are evaluated in (django-celery-beat's default for new schedules)."""
     return ZoneInfo(crontab_schedule_celery_timezone())
@@ -665,9 +793,12 @@ def _evaluate_quota(
     Returns (consumed, blocked, next_eligible_at) for the rolling window.
 
     consumed = pending/running/done runs in the window; blocked once that
-    reaches max_runs, or once *all* dispatched runs (failures included) reach
-    max_runs + failed_run_grace -- so one failure earns one retry and two
-    stop it. next_eligible_at is when enough of the oldest relevant runs
+    reaches max_runs, or once *all* runs (failures included) reach
+    max_runs + failed_run_grace. A run row is a whole retry chain, so this
+    cap bounds how many chains may START per period: one failed chain earns
+    one fresh chain, two stop it. Automatic retries never add rows and go
+    through claim_run_retry, so they neither count against this cap nor are
+    refused by it. next_eligible_at is when enough of the oldest relevant runs
     have left the window to drop back under the limit; None if not blocked
     (or if a zero allowance means it never will be).
 
@@ -790,3 +921,17 @@ def _resolve_after_race(
         raise RatingConflict(existing_action=existing.status)
 
     raise original
+
+
+def _retry_verdict(
+    *, run: RecommendationRun, retry_at: datetime
+) -> Literal["scheduled", "exhausted", "stopped"]:
+    """Whether a chain may run again at `retry_at`; the single rule behind record_run_failure and claim_run_retry."""
+    user = User.objects.get(pk=run.user_id)
+    subscription = Subscription.objects.select_related("plan").filter(user=user).first()
+    if not (_is_staff(user=user) or (subscription is not None and subscription.has_active_access)):
+        return "stopped"
+    period, _, _ = _quota_terms(plan=subscription.plan if subscription else None)
+    if run.attempt > MAX_RUN_RETRIES or retry_at >= run.triggered_at + period:
+        return "exhausted"
+    return "scheduled"

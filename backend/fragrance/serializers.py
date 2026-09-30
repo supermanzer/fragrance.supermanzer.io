@@ -7,7 +7,7 @@ from django.utils.http import urlsafe_base64_decode
 from rest_framework import serializers
 
 from .models import FRAGRANCE_STATUSES, FragranceConfig, Fragrance, Plan, PreferenceProfile, Recommendation, RecommendationRun
-from .services import MAX_RUN_DAY_OF_MONTH, resolve_beta_invite_signup
+from .services import MAX_RUN_DAY_OF_MONTH, MAX_RUN_RETRIES, resolve_beta_invite_signup
 
 
 class RecommendationSerializer(serializers.ModelSerializer):
@@ -184,9 +184,58 @@ class RecommendationRatingSerializer(serializers.Serializer):
 
 
 class RecommendationRunSerializer(serializers.ModelSerializer):
+    """
+    A run is a whole retry chain (one row). Retry bookkeeping columns are
+    excluded and re-exposed as `attempt`, `max_attempts` and `retry`;
+    `error_message` is blank unless the requester is staff (strictly
+    is_staff, like the subscription payload's is_staff), and blank when there
+    is no request to prove otherwise.
+    """
+
     picks = RecommendationSerializer(many=True, read_only=True)
+    max_attempts = serializers.SerializerMethodField()
+    retry = serializers.SerializerMethodField()
 
     class Meta:
         model = RecommendationRun
-        exclude = ['user']
-        read_only_fields = ['triggered_at', 'status', 'email_status', 'celery_task_id', 'error_message', 'sent_at']
+        exclude = [
+            'user',
+            'attempt_started_at',
+            'retry_state',
+            'next_retry_at',
+            'last_failed_at',
+            'retry_notice_sent_at',
+            'exhausted_notice_sent_at',
+            'operator_notified_at',
+        ]
+        read_only_fields = ['triggered_at', 'status', 'email_status', 'celery_task_id', 'error_message', 'sent_at', 'attempt']
+
+    def get_max_attempts(self, obj: RecommendationRun) -> int:
+        return MAX_RUN_RETRIES + 1
+
+    def get_retry(self, obj: RecommendationRun) -> dict | None:
+        if obj.status != 'failed' or not obj.retry_state:
+            return None
+        return {
+            'state': obj.retry_state,
+            'retries_remaining': (
+                0 if obj.retry_state == 'exhausted' else max(0, MAX_RUN_RETRIES - (obj.attempt - 1))
+            ),
+            'next_retry_at': (
+                serializers.DateTimeField().to_representation(value=obj.next_retry_at)
+                if obj.retry_state == 'scheduled' and obj.next_retry_at
+                else None
+            ),
+            'last_failed_at': (
+                serializers.DateTimeField().to_representation(value=obj.last_failed_at)
+                if obj.last_failed_at
+                else None
+            ),
+        }
+
+    def to_representation(self, instance: RecommendationRun) -> dict:
+        data = super().to_representation(instance=instance)
+        request = self.context.get('request')
+        if not (request is not None and request.user.is_staff):
+            data['error_message'] = ''
+        return data

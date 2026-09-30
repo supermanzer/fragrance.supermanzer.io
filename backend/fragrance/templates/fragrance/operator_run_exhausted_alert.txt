@@ -1,0 +1,8 @@
+{% autoescape off %}Run {{ run.id }} (user {{ run.user_id }}, {{ username }}) exhausted its retry chain after {{ run.attempt }} of {{ max_attempts }} attempts.
+
+Chain state: {{ run.retry_state }}
+Chain started: {{ run.triggered_at|date:"Y-m-d H:i" }} UTC
+Last failure: {{ run.last_failed_at|date:"Y-m-d H:i" }} UTC
+Last error: {{ run.error_message }}
+
+The customer has been emailed. Nothing further will retry automatically.{% endautoescape %}

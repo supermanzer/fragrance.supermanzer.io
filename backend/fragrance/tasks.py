@@ -13,11 +13,12 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import EmailMessage, EmailMultiAlternatives, send_mail
-from django.db.models import Max
+from django.db.models import F, Max, Q
 from django.template.loader import render_to_string
 from django.utils import timezone
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
+from kombu.exceptions import OperationalError
 
 from .ai_providers import registry
 from .ai_providers.base import StructuredLLMProvider, sanitize_sdk_error_message
@@ -39,13 +40,18 @@ from .models import (
 from .search import run_discovery_searches, verify_candidates
 from .permissions import SubscriptionRequired
 from .services import (
+    MAX_RUN_RETRIES,
     QuotaExceeded,
+    RunFailureOutcome,
     RunInProgress,
+    claim_run_retry,
     generate_beta_invite_token,
-    IN_FLIGHT_MAX_AGE,
     generate_recommendation_token,
     get_or_create_fragrance_config,
+    record_run_failure,
+    stale_in_flight_runs,
     start_recommendation_run,
+    unclaim_run_retry,
 )
 
 
@@ -65,6 +71,11 @@ NON_RETRYABLE_CONFIG_EXCEPTIONS = (
 
 
 RATING_ACTIONS = ('own', 'like', 'dislike')
+
+
+# How long a retry that could not be queued (broker down) waits before the
+# next sweep tries it again.
+RETRY_REQUEUE_DELAY = timedelta(minutes=15)
 
 
 STALE_RUN_ERROR_MESSAGE = "Run did not finish (worker restarted or timed out)."
@@ -93,6 +104,18 @@ STRIPE_HANDLED_EVENT_TYPES = {
 # finalization race that clears in seconds, so it must not wait the generic 300s.
 # Used only by process_stripe_event.
 STRIPE_UNSETTLED_RETRY_COUNTDOWNS = (30, 60, 120)
+
+
+def fail_run_and_notify(*, run_id: int, error_message: str) -> RunFailureOutcome:
+    """
+    Every run-attempt failure goes through here: records it (which decides the
+    retry chain's fate, see services.record_run_failure) and queues the
+    notifications that outcome calls for. Queuing never raises: this runs in
+    failure branches that must not mask the original error.
+    """
+    outcome = record_run_failure(run_id=run_id, error_message=error_message)
+    _enqueue_failure_notices(run_id=run_id, outcome=outcome)
+    return outcome
 
 
 @shared_task
@@ -140,6 +163,12 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
         # assignments as invalid-assignment as it does on the create() path
         # a few lines up -- an inference-order quirk, not a real difference.
         run = RecommendationRun.objects.get(id=run_id)  # ty: ignore[unresolved-attribute]
+        if run.status not in ('pending', 'running'):
+            # A late in-memory Celery retry (or a duplicate delivery) for a
+            # row that was reaped into the retry chain meanwhile: the chain
+            # owns the row now.
+            logger.warning("run %s is %s, not in flight; ignoring task", run_id, run.status)
+            return
         run.status = 'running'
         run.error_message = ''
         run.save(update_fields=['status', 'error_message'])
@@ -181,9 +210,7 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
     except SoftTimeLimitExceeded:
         # A run that overran its budget is a failure, not a transient error:
         # retrying would just burn another 20 minutes.
-        run.status = 'failed'  # ty: ignore[invalid-assignment]
-        run.error_message = STALE_RUN_TIMEOUT_MESSAGE  # ty: ignore[invalid-assignment]
-        run.save(update_fields=['status', 'error_message'])
+        fail_run_and_notify(run_id=run.id, error_message=STALE_RUN_TIMEOUT_MESSAGE)  # ty: ignore[unresolved-attribute]
         logger.error("run %s for user %s exceeded its soft time limit", run.id, user_id)  # ty: ignore[unresolved-attribute]
         return
     except Exception as exc:
@@ -196,9 +223,7 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
         is_config_error = isinstance(exc, NON_RETRYABLE_CONFIG_EXCEPTIONS)
         is_final_attempt = self.request.retries >= self.max_retries
         if is_config_error or is_final_attempt:
-            run.status = 'failed'  # ty: ignore[invalid-assignment]
-            run.error_message = sanitize_sdk_error_message(exc)  # ty: ignore[invalid-assignment]
-            run.save(update_fields=['status', 'error_message'])
+            fail_run_and_notify(run_id=run.id, error_message=sanitize_sdk_error_message(exc))  # ty: ignore[unresolved-attribute]
             raise
         # Retry against the run we already own: re-entering the beat path would
         # be refused by the in-flight guard and strand this run as 'running'.
@@ -290,14 +315,18 @@ def prune_stripe_event_payloads() -> int:
 @shared_task
 def reap_stale_runs() -> int:
     """
-    Fails pending/running runs older than IN_FLIGHT_MAX_AGE. An early-ack
-    worker that dies mid-run strands its row; a failed run does not burn
-    quota, so this also releases the allowance the stranded row was holding.
+    Fails pending/running attempts older than IN_FLIGHT_MAX_AGE (measured from
+    the attempt's own start, so a retry is not reaped for the chain's age). An
+    early-ack worker that dies mid-run strands its row; a failed run does not
+    burn quota, so this also releases the allowance the stranded row was
+    holding. Each reaped run enters the retry chain like any other failure.
     """
-    cutoff = timezone.now() - IN_FLIGHT_MAX_AGE
-    reaped = RecommendationRun.objects.filter(  # ty: ignore[unresolved-attribute]
-        status__in=('pending', 'running'), triggered_at__lt=cutoff
-    ).update(status='failed', error_message=STALE_RUN_ERROR_MESSAGE)
+    stale_ids = list(stale_in_flight_runs(now=timezone.now()).values_list('id', flat=True))
+    reaped = 0
+    for run_id in stale_ids:
+        outcome = fail_run_and_notify(run_id=run_id, error_message=STALE_RUN_ERROR_MESSAGE)
+        if outcome != 'ignored':
+            reaped += 1
     if reaped:
         logger.warning("reaped %d stale in-flight run(s)", reaped)
     return reaped
@@ -322,17 +351,7 @@ def render_and_send_email(user_id: int, run_id: int) -> None:
         .prefetch_related('picks')
         .get(id=run_id)
     )
-    user = User.objects.get(pk=user_id)
-    config = FragranceConfig.objects.filter(user_id=user_id).first()  # ty: ignore[unresolved-attribute]
-    if config is None:
-        logger.warning('user %s has no FragranceConfig at send time; creating it', user_id)
-        config = get_or_create_fragrance_config(user=user)
-    recipient = config.recipient_email
-    if not recipient:
-        logger.warning('user %s has a blank recipient_email; delivering to the account email', user_id)
-        recipient = user.email
-    if not recipient:
-        raise ValueError(f'user {user_id} has no delivery address (blank recipient_email and account email)')
+    recipient = _delivery_address(user_id=user_id)
 
     # Attach ad-hoc confirm_url_* attributes directly onto the prefetched pick instances
     # so the template can reference pick.confirm_url_own/_like/_dislike without a second
@@ -412,6 +431,42 @@ def restore_stripe_customer_email(
         raise self.retry(exc=exc, countdown=300)
 
 
+@shared_task
+def retry_failed_runs() -> int:
+    """
+    Beat sweep behind the automatic retry of a failed run: dispatches every
+    run whose scheduled retry is due. The schedule lives in the database
+    (next_retry_at), not in a broker ETA, so it survives worker and broker
+    restarts; a missed tick only delays a retry until the next one. Returns
+    the number dispatched.
+    """
+    due_ids = list(
+        RecommendationRun.objects.filter(  # ty: ignore[unresolved-attribute]
+            status='failed', retry_state='scheduled', next_retry_at__lte=timezone.now()
+        )
+        .order_by('next_retry_at')
+        .values_list('id', 'user_id')
+    )
+    dispatched = 0
+    for run_id, user_id in due_ids:
+        now = timezone.now()
+        outcome = claim_run_retry(run_id=run_id, now=now)
+        if outcome == 'exhausted':
+            _enqueue_failure_notices(run_id=run_id, outcome='exhausted')
+            continue
+        if outcome != 'dispatch':
+            continue
+        try:
+            task = monthly_fragrance_run.delay(user_id=user_id, run_id=run_id)
+        except OperationalError:
+            logger.warning("could not queue retry of run %s; will try again", run_id)
+            unclaim_run_retry(run_id=run_id, retry_at=now + RETRY_REQUEUE_DELAY)
+            continue
+        RecommendationRun.objects.filter(id=run_id).update(celery_task_id=task.id)  # ty: ignore[unresolved-attribute]
+        dispatched += 1
+    return dispatched
+
+
 @shared_task(bind=True, max_retries=5)
 def send_account_email_change_notice(
     self: 'send_account_email_change_notice',
@@ -449,7 +504,7 @@ def send_account_email_change_notice(
     }
     try:
         message = EmailMultiAlternatives(
-            subject='Your Fragrances account email was changed',
+            subject='Your Fragrance Journey account email was changed',
             body=render_to_string(template_name='fragrance/email_changed_notice.txt', context=context),
             from_email=settings.DEFAULT_FROM_EMAIL,
             to=[recipient],
@@ -480,7 +535,7 @@ def send_beta_invite_email(self: 'send_beta_invite_email', signup_id: int) -> No
     accept_url = f"{settings.FRONTEND_URL}/beta/accept?token={token}"
     try:
         send_mail(
-            subject="You're in — set up your Fragrances account",
+            subject="You're in — set up your Fragrance Journey account",
             message=render_to_string(
                 template_name='fragrance/beta_invite_email.txt',
                 context={'accept_url': accept_url},
@@ -513,7 +568,7 @@ def send_email_reverted_notice(self: 'send_email_reverted_notice', user_id: int,
     }
     try:
         message = EmailMultiAlternatives(
-            subject='Your Fragrances account email was restored',
+            subject='Your Fragrance Journey account email was restored',
             body=render_to_string(template_name='fragrance/email_reverted_notice.txt', context=context),
             from_email=settings.DEFAULT_FROM_EMAIL,
             to=[recipient],
@@ -527,6 +582,80 @@ def send_email_reverted_notice(self: 'send_email_reverted_notice', user_id: int,
         if self.request.retries >= self.max_retries:
             raise
         raise self.retry(exc=exc, countdown=300)
+
+
+@shared_task
+def send_operator_failure_digest() -> int:
+    """
+    Beat task, every 4 hours: one email listing every run failure the operator
+    has not been told about yet (an exhausted chain is alerted immediately by
+    send_operator_run_exhausted_alert and normally is not here). Sends nothing
+    when there is nothing new, or ADMIN_EMAIL is unset. Returns the number of
+    failures reported.
+    """
+    recipient = settings.ADMIN_EMAIL
+    if not recipient:
+        logger.warning("ADMIN_EMAIL is not set; run-failure digest not sent")
+        return 0
+    now = timezone.now()
+    runs = list(
+        RecommendationRun.objects.filter(last_failed_at__isnull=False, last_failed_at__lte=now)  # ty: ignore[unresolved-attribute]
+        .filter(_unnotified_failure_q())
+        .order_by('last_failed_at')
+    )
+    if not runs:
+        return 0
+    send_mail(
+        subject=f"[Fragrance Journey] {len(runs)} run failure(s) in the last 4 hours",
+        message=render_to_string(
+            template_name='fragrance/operator_failure_digest.txt',
+            context={'runs': runs, 'max_attempts': MAX_RUN_RETRIES + 1},
+        ),
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        recipient_list=[recipient],
+        fail_silently=False,
+    )
+    RecommendationRun.objects.filter(pk__in=[run.id for run in runs]).filter(  # ty: ignore[unresolved-attribute]
+        _unnotified_failure_q()
+    ).update(operator_notified_at=now)
+    return len(runs)
+
+
+@shared_task(bind=True, max_retries=5)
+def send_operator_run_exhausted_alert(self: 'send_operator_run_exhausted_alert', run_id: int) -> None:
+    """
+    Immediate alert to ADMIN_EMAIL when a run's retry chain is exhausted. Sent
+    once per failure: skipped if the operator was already told about it (the
+    digest may have got there first) and stamped only after a successful send.
+    """
+    recipient = settings.ADMIN_EMAIL
+    if not recipient:
+        logger.warning("ADMIN_EMAIL is not set; exhausted-run alert for run %s not sent", run_id)
+        return
+    run = (
+        RecommendationRun.objects.filter(pk=run_id)  # ty: ignore[unresolved-attribute]
+        .filter(_unnotified_failure_q())
+        .first()
+    )
+    if run is None:
+        return
+    username = User.objects.filter(pk=run.user_id).values_list('username', flat=True).first()
+    try:
+        send_mail(
+            subject=f"[Fragrance Journey] Run {run.id} exhausted its retries",
+            message=render_to_string(
+                template_name='fragrance/operator_run_exhausted_alert.txt',
+                context={'run': run, 'username': username, 'max_attempts': MAX_RUN_RETRIES + 1},
+            ),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[recipient],
+            fail_silently=False,
+        )
+    except Exception as exc:
+        if self.request.retries >= self.max_retries:
+            raise
+        raise self.retry(exc=exc, countdown=300)
+    RecommendationRun.objects.filter(pk=run.id).update(operator_notified_at=timezone.now())  # ty: ignore[unresolved-attribute]
 
 
 @shared_task(bind=True, max_retries=5)
@@ -576,6 +705,85 @@ def send_recommendation_email(self: 'send_recommendation_email', user_id: int, r
         raise self.retry(exc=exc, countdown=300)
 
 
+@shared_task(bind=True, max_retries=5)
+def send_run_failure_notice(self: 'send_run_failure_notice', run_id: int, kind: str) -> None:
+    """
+    The customer's failure email, sent once per chain per kind: "retrying" on
+    the first failure, "exhausted" when the retries are used up. The sent-at
+    marker is claimed (an ORM conditional update) before sending, so a
+    duplicate or replayed task sends nothing; a failed send releases the claim
+    and retries. Never carries attempt counts or error text.
+    """
+    marker_by_kind = {'retrying': 'retry_notice_sent_at', 'exhausted': 'exhausted_notice_sent_at'}
+    marker = marker_by_kind[kind]
+    run = RecommendationRun.objects.filter(pk=run_id).first()  # ty: ignore[unresolved-attribute]
+    if run is None:
+        return
+    if kind == 'retrying' and run.status == 'done':
+        return
+    if kind == 'exhausted' and run.retry_state != 'exhausted':
+        return
+    claimed = RecommendationRun.objects.filter(  # ty: ignore[unresolved-attribute]
+        pk=run_id, **{f'{marker}__isnull': True}
+    ).update(**{marker: timezone.now()})
+    if not claimed:
+        return
+    try:
+        context = {
+            'run': run,
+            'support_email': settings.SUPPORT_EMAIL,
+            'runs_url': f"{settings.FRONTEND_URL}/runs",
+        }
+        message = EmailMultiAlternatives(
+            subject=(
+                "Your fragrance picks hit a snag. We're trying again."
+                if kind == 'retrying'
+                else "We couldn't create this month's fragrance picks"
+            ),
+            body=render_to_string(template_name=f'fragrance/run_failed_{kind}_email.txt', context=context),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[_delivery_address(user_id=run.user_id)],
+        )
+        message.attach_alternative(
+            render_to_string(template_name=f'fragrance/run_failed_{kind}_email.html', context=context),
+            'text/html',
+        )
+        message.send(fail_silently=False)
+    except Exception as exc:
+        RecommendationRun.objects.filter(pk=run_id).update(**{marker: None})  # ty: ignore[unresolved-attribute]
+        if self.request.retries >= self.max_retries:
+            raise
+        raise self.retry(exc=exc, countdown=300)
+
+
+def _delivery_address(*, user_id: int) -> str:
+    """Where a user's run emails go: their config's recipient, else the account email."""
+    user = User.objects.get(pk=user_id)
+    config = FragranceConfig.objects.filter(user_id=user_id).first()  # ty: ignore[unresolved-attribute]
+    if config is None:
+        logger.warning('user %s has no FragranceConfig at send time; creating it', user_id)
+        config = get_or_create_fragrance_config(user=user)
+    recipient = config.recipient_email
+    if not recipient:
+        logger.warning('user %s has a blank recipient_email; delivering to the account email', user_id)
+        recipient = user.email
+    if not recipient:
+        raise ValueError(f'user {user_id} has no delivery address (blank recipient_email and account email)')
+    return str(recipient)
+
+
+def _enqueue_failure_notices(*, run_id: int, outcome: RunFailureOutcome) -> None:
+    """Queues what a chain outcome calls for; the tasks themselves dedupe. Never raises."""
+    try:
+        if outcome == 'scheduled':
+            send_run_failure_notice.delay(run_id=run_id, kind='retrying')
+        elif outcome == 'exhausted':
+            send_run_failure_notice.delay(run_id=run_id, kind='exhausted')
+            send_operator_run_exhausted_alert.delay(run_id=run_id)
+    except Exception:
+        logger.exception("could not queue failure notices for run %s", run_id)
+
+
 def _resolve_profile(
     user_id: int, run_id: int, provider: StructuredLLMProvider
 ) -> PreferenceProfile:
@@ -610,3 +818,8 @@ def _resolve_profile(
     # Reuse the existing profile but still link it to this run.
     RecommendationRun.objects.filter(id=run_id).update(profile=latest_profile)  # ty: ignore[unresolved-attribute]
     return latest_profile
+
+
+def _unnotified_failure_q() -> Q:
+    """Runs whose latest failure the operator has not been told about."""
+    return Q(operator_notified_at__isnull=True) | Q(operator_notified_at__lt=F('last_failed_at'))

@@ -1,0 +1,10 @@
+{% autoescape off %}Hi,
+
+We tried several times to create this month's fragrance picks and weren't able to finish. We're sorry. The problem is on our side, and we've been alerted and are looking into it.
+
+We'd like to hear from you. Write to {{ support_email }} and we'll look at your account and tell you what we can do.
+
+Your collection and everything you've received so far are exactly as you left them. You can see them any time:
+{{ runs_url }}
+
+— Fragrance Journey{% endautoescape %}

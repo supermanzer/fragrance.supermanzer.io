@@ -1,0 +1,6 @@
+{% autoescape off %}Run failures since the last digest:
+{% for run in runs %}
+- Run {{ run.id }}, user {{ run.user_id }}: attempt {{ run.attempt }} of {{ max_attempts }}, now {{ run.status }}{% if run.retry_state %} (retry {{ run.retry_state }}{% if run.next_retry_at %}, next {{ run.next_retry_at|date:"Y-m-d H:i" }} UTC{% endif %}){% endif %}
+  Last failure: {{ run.last_failed_at|date:"Y-m-d H:i" }} UTC
+  Error: {{ run.error_message|default:"(cleared)" }}
+{% endfor %}{% endautoescape %}

@@ -130,7 +130,9 @@ class StaleInFlightRunTests(TestCase):
             start_recommendation_run(user=self.user, source="test")
         reap_stale_runs()
         self.assertEqual(quota_snapshot(user=self.user, subscription=self.user.subscription)["runs_used"], 0)
-        self.assertEqual(start_recommendation_run(user=self.user, source="test").status, "pending")
+        # The reaped run is not gone: it entered the retry chain, so it still blocks a second run.
+        with self.assertRaises(RunInProgress):
+            start_recommendation_run(user=self.user, source="test")
 
     def test_snapshot_can_trigger_agrees_with_chokepoint(self) -> None:
         staff = User.objects.create_user(username="agree-staff", password="pw12345!", is_staff=True)
@@ -171,3 +173,15 @@ class StaleInFlightRunTests(TestCase):
         run.refresh_from_db()
         self.assertEqual(run.status, "failed")
         self.assertTrue(run.error_message)
+
+
+class BrokerIsolationTests(TestCase):
+    def test_an_unpatched_delay_publishes_to_a_throwaway_in_memory_broker(self) -> None:
+        from config.celery import app
+        from fragrance.tasks import send_run_failure_notice
+
+        send_run_failure_notice.delay(run_id=0, kind="retrying")
+
+        with app.connection_for_write() as connection:
+            self.assertTrue(connection.as_uri().startswith("memory://"))
+        self.assertEqual(type(app.backend).__name__, "CacheBackend")

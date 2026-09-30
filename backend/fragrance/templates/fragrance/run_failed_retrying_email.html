@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Your fragrance picks hit a snag</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f5f5f0; font-family: Georgia, 'Times New Roman', serif;">
+  <div style="display: none; max-height: 0; overflow: hidden; color: #f5f5f0; font-size: 1px; line-height: 1px;">Nothing you did caused this. We're trying again automatically.</div>
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: #f5f5f0;">
+    <tr>
+      <td align="center" style="padding: 40px 20px;">
+        <table width="600" cellpadding="0" cellspacing="0" border="0" style="max-width: 600px; width: 100%; background-color: #ffffff;">
+
+          <!-- Header -->
+          <tr>
+            <td style="background-color: #2c2c2c; padding: 32px 40px;">
+              <p style="margin: 0; color: #c8b89a; font-size: 11px; letter-spacing: 3px; text-transform: uppercase;">A quick note</p>
+              <h1 style="margin: 8px 0 0 0; color: #ffffff; font-size: 26px; font-weight: normal; letter-spacing: 1px;">
+                Your picks are on their way
+              </h1>
+              <p style="margin: 6px 0 0 0; color: #888888; font-size: 14px;">
+                {{ run.triggered_at|date:"F Y" }}
+              </p>
+            </td>
+          </tr>
+
+          <!-- Body -->
+          <tr>
+            <td style="padding: 36px 40px 20px 40px;">
+              <p style="margin: 0; color: #444444; font-size: 16px; line-height: 1.8;">
+                This month's fragrance picks didn't finish. The problem was on our side, not yours, and nothing you did caused it.
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 0px 40px 20px 40px;">
+              <p style="margin: 0; color: #444444; font-size: 16px; line-height: 1.8;">
+                We're already working on it. We'll try again automatically in about 24 hours, and keep trying if we need to. You don't need to do anything. As soon as your picks are ready, they'll arrive in your inbox as usual.
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 0px 40px 20px 40px;">
+              <p style="margin: 0; color: #444444; font-size: 16px; line-height: 1.8;">
+                You can see where things stand any time on your Runs page.<br><a href="{{ runs_url }}" style="color: #8b6f47; font-size: 13px; text-decoration: none; letter-spacing: 0.3px;">See your runs &rarr;</a>
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 0px 40px 20px 40px;">
+              <p style="margin: 0; color: #666666; font-size: 14px; line-height: 1.8;">
+                If you'd rather hear from us directly, just write to <a href="mailto:{{ support_email }}" style="color: #8b6f47;">{{ support_email }}</a>.
+              </p>
+            </td>
+          </tr>
+
+          <!-- Footer -->
+          <tr>
+            <td style="padding: 40px; border-top: 1px solid #e8e4de; background-color: #faf9f7;">
+              <p style="margin: 0; color: #aaaaaa; font-size: 12px; text-align: center; line-height: 1.6;">
+                You're receiving this because a scheduled run didn't finish.
+              </p>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

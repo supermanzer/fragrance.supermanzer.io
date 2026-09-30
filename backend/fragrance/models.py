@@ -49,6 +49,15 @@ FREQUENCIES = [
 PICK_STATUSES = [("confirmed", "Confirmed"), ("replaced", "Replaced")]
 
 
+# A failed run's retry chain. "" is a run that is not in a chain (never
+# failed, or failed before retries existed, or never queued).
+RUN_RETRY_STATES = [
+    ("scheduled", "Scheduled"),
+    ("exhausted", "Exhausted"),
+    ("stopped", "Stopped"),
+]
+
+
 RUN_STATUSES = [
     ("pending", "Pending"),
     ("running", "Running"),
@@ -139,7 +148,13 @@ class PreferenceProfile(models.Model):
 
 
 class RecommendationRun(models.Model):
-    """Executed recommendation generation event."""
+    """
+    Executed recommendation generation event. One row per retry chain: a
+    failed attempt is retried on this same row (status failed -> pending ->
+    running -> done), so `triggered_at` is the chain start and the anchor of
+    the quota period, while `attempt_started_at` is the clock of the attempt
+    now in flight.
+    """
 
     user = models.ForeignKey(
         User, on_delete=models.CASCADE, related_name="recommendation_runs"
@@ -166,6 +181,20 @@ class RecommendationRun(models.Model):
         max_length=20, choices=AI_PROVIDER_FAMILIES, blank=True
     )
     provider_model_id = models.CharField(max_length=255, blank=True)
+    # Retry chain (see services.record_run_failure / claim_run_retry).
+    # `attempt` is the number of the most recent attempt started, 1-based.
+    attempt = models.PositiveSmallIntegerField(default=1)
+    attempt_started_at = models.DateTimeField(null=True, blank=True)
+    retry_state = models.CharField(
+        max_length=10, choices=RUN_RETRY_STATES, blank=True, default=""
+    )
+    next_retry_at = models.DateTimeField(null=True, blank=True)
+    last_failed_at = models.DateTimeField(null=True, blank=True)
+    # Sent-at markers: each notification goes out once per chain, however
+    # many times the task that sends it is queued or replayed.
+    retry_notice_sent_at = models.DateTimeField(null=True, blank=True)
+    exhausted_notice_sent_at = models.DateTimeField(null=True, blank=True)
+    operator_notified_at = models.DateTimeField(null=True, blank=True)
 
 
 class Subscription(models.Model):

@@ -219,6 +219,10 @@ SERVER_EMAIL = config("DEFAULT_FROM_EMAIL", default="noreply@supermanzer.io")
 # is a noreply address, so this is separate. The default is a placeholder: confirm it is a
 # mailbox someone reads, or set SUPPORT_EMAIL.
 SUPPORT_EMAIL = config("SUPPORT_EMAIL", default="support@supermanzer.io")
+# The operator's own mailbox: receives the immediate alert when a run exhausts
+# its retries and the 4-hourly digest of run failures. Blank disables both
+# (they are logged and skipped, never an error).
+ADMIN_EMAIL = config("ADMIN_EMAIL", default="")
 ANYMAIL = {
     "POSTMARK_SERVER_TOKEN": config("POSTMARK_SERVER_TOKEN"),
 }

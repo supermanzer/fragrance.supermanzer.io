@@ -24,10 +24,19 @@ setting name). `override_settings(...).enable()` is what fires that signal;
 a bare assignment would leave any already-resolved cache connection pointed
 at the old backend.
 """
+import os
 from typing import Any
 
 from django.test.runner import DiscoverRunner
 from django.test.utils import override_settings
+
+# Celery's Settings.broker_url / result_backend read these environment
+# variables before any configured value, so this is the override that sticks.
+_TEST_CELERY_ENV = {
+    "CELERY_BROKER_URL": "memory://",
+    "CELERY_RESULT_BACKEND": "cache+memory://",
+}
+
 
 _TEST_CACHES = {
     "default": {
@@ -49,13 +58,27 @@ class RedisSafeTestRunner(DiscoverRunner):
     """
 
     _cache_override: override_settings | None = None
+    _previous_celery_env: dict[str, str | None] | None = None
 
     def setup_test_environment(self, **kwargs: Any) -> None:
         super().setup_test_environment(**kwargs)
+        # Same isolation for Celery: a test that reaches an unpatched
+        # `.delay()` (the failure paths of monthly_fragrance_run do, via the
+        # failure-notice tasks) must publish into a throwaway in-memory
+        # broker, never the live Redis a running celery-worker consumes.
+        self._previous_celery_env = {name: os.environ.get(name) for name in _TEST_CELERY_ENV}
+        os.environ.update(_TEST_CELERY_ENV)
         self._cache_override = override_settings(CACHES=_TEST_CACHES)
         self._cache_override.enable()
 
     def teardown_test_environment(self, **kwargs: Any) -> None:
+        if self._previous_celery_env is not None:
+            for name, previous in self._previous_celery_env.items():
+                if previous is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = previous
+            self._previous_celery_env = None
         if self._cache_override is not None:
             self._cache_override.disable()
             self._cache_override = None
