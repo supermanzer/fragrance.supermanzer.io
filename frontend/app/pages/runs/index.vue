@@ -541,7 +541,7 @@ const firstRunAvailable = computed(
 const nextRunAt = computed(() => quota.value?.next_run_at ?? null)
 
 const retryBlocksStaff = computed(
-  () => isStaff.value && runs.value.some((r) => r.status === 'failed' && r.retry?.state === 'scheduled'),
+  () => isStaff.value && runs.value.some(isRetryBlocking),
 )
 const retryBlockNote = 'A retry is scheduled; Run now is unavailable until it finishes.'
 

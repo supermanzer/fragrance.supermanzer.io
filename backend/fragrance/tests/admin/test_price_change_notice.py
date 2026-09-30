@@ -3,7 +3,8 @@ from unittest.mock import patch
 
 from django.contrib.auth.models import User
 from django.core import mail
-from django.test import TestCase
+from django.contrib.admin.models import LogEntry
+from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
 from fragrance.models import Plan, PriceChangeNotice, Subscription
@@ -141,18 +142,6 @@ class PriceChangeNoticeTests(TestCase):
         self.assertEqual(PriceChangeNotice.objects.count(), 1)
         self.assertEqual(delay.call_count, 1)
 
-    def test_the_admin_reports_a_queue_failure_as_an_error_not_a_success(self) -> None:
-        # The commit hook runs when the admin's transaction exits, inside add_view.
-        with patch(
-            "django.contrib.admin.options.ModelAdmin.add_view",
-            side_effect=PriceChangeNoticeError(problems=["The emails could not be queued."]),
-        ):
-            response = self.client.post(reverse("admin:fragrance_pricechangenotice_add"), {}, follow=True)
-
-        texts = [str(m) for m in response.context["messages"]]
-        self.assertEqual(texts, ["Notice NOT sent: The emails could not be queued."])
-        self.assertEqual(response.redirect_chain[-1][0], reverse("admin:fragrance_pricechangenotice_changelist"))
-
     def test_service_refuses_duplicate_and_short_notice_directly(self) -> None:
         with patch.object(send_price_change_notice_email, "delay"):
             send_price_change_notice(
@@ -250,3 +239,31 @@ class PriceChangeNoticeEmailTests(TestCase):
                 )
         retry.assert_called_once()
         self.assertTrue(result.failed())
+
+
+class PriceChangeNoticeAdminQueueFailureTests(TransactionTestCase):
+    def test_the_admin_reports_a_queue_failure_as_an_error_not_a_success(self) -> None:
+        superuser = User.objects.create_superuser(username="hal", email="hal@example.com", password="hal-9000")
+        self.client.force_login(superuser)
+        plan = _plan()
+        _subscriber(username="a", plan=plan)
+
+        with patch.object(send_price_change_notice_email, "delay", side_effect=OSError("broker down")):
+            with self.assertLogs("fragrance.services", level="ERROR"):
+                response = self.client.post(
+                    reverse("admin:fragrance_pricechangenotice_add"),
+                    {
+                        "plan": plan.pk,
+                        "new_amount_cents": 500,
+                        "effective_date": str(timezone.localdate() + timedelta(days=31)),
+                    },
+                    follow=True,
+                )
+
+        texts = [str(m) for m in response.context["messages"]]
+        self.assertEqual(len(texts), 1)
+        self.assertTrue(texts[0].startswith("Notice NOT sent: The emails could not be queued"))
+        self.assertIn("may receive a duplicate", texts[0])
+        self.assertEqual(response.redirect_chain[-1][0], reverse("admin:fragrance_pricechangenotice_changelist"))
+        self.assertEqual(PriceChangeNotice.objects.count(), 0)
+        self.assertEqual(LogEntry.objects.count(), 0)

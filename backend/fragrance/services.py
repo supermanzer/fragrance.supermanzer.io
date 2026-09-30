@@ -485,7 +485,6 @@ def hash_signup_ip(*, ip: str) -> str:
     ).hexdigest()
 
 
-@transaction.atomic
 def http_url_or_empty(*, url: object) -> str:
     """The URL if it is an absolute http(s) URL, else "": stops a `javascript:` or `data:` link from a search result reaching an href."""
     if not isinstance(url, str):
@@ -499,6 +498,7 @@ def http_url_or_empty(*, url: object) -> str:
     return ""
 
 
+@transaction.atomic
 def import_collection_from_csv(user: User, file_obj: Iterable[str]) -> dict:
     """
     Parse a CSV and upsert Fragrance records for the given user.
@@ -789,7 +789,8 @@ def send_price_change_notice(*, notice: PriceChangeNotice, created_by: User | No
                 raise PriceChangeNoticeError(
                     problems=[
                         f"The emails could not be queued ({queued} of {len(user_ids)} were queued before the "
-                        "queue failed) and the notice was not recorded. Check the message broker, then send it again."
+                        "queue failed) and the notice was not recorded. Check the message broker, then send it again; "
+                        "recipients already queued may receive a duplicate if it is resent."
                     ]
                 )
 

@@ -28,11 +28,19 @@ export function newestRun(runs: readonly RecommendationRun[]): RecommendationRun
   return newest
 }
 
-// A run that is in flight, or a failed run whose automatic retry is queued.
+// Mirrors backend RETRY_OVERDUE_GRACE: a scheduled retry overdue by more than this stops blocking.
+const RETRY_OVERDUE_GRACE_MS = 2 * 60 * 60 * 1000
+
+export function isRetryBlocking(run: RecommendationRun): boolean {
+  if (run.status !== 'failed' || run.retry?.state !== 'scheduled') return false
+  const next = run.retry.next_retry_at
+  if (!next) return true
+  return new Date(next).getTime() >= Date.now() - RETRY_OVERDUE_GRACE_MS
+}
+
+// A run that is in flight, or a failed run whose automatic retry is queued and not overdue.
 export function isRunActive(run: RecommendationRun): boolean {
-  return run.status === 'pending'
-    || run.status === 'running'
-    || (run.status === 'failed' && run.retry?.state === 'scheduled')
+  return run.status === 'pending' || run.status === 'running' || isRetryBlocking(run)
 }
 
 export function isRunInFlight(run: RecommendationRun | null): boolean {

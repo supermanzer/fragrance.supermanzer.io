@@ -2,7 +2,9 @@ import logging
 
 from django import forms
 from django.contrib import admin, messages
+from django.contrib.admin.models import LogEntry
 from django.contrib.auth.models import User
+from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
 from django.db.models import QuerySet
 from django.forms import ModelForm
@@ -461,6 +463,13 @@ class PriceChangeNoticeAdmin(admin.ModelAdmin):
         except PriceChangeNoticeError as exc:
             # Drop the "added successfully" message queued before the commit hook failed.
             list(messages.get_messages(request))
+            failed_notice = getattr(request, "_price_change_notice", None)
+            if failed_notice is not None:
+                # The notice row was deleted by the service; its "Added" entry would dangle.
+                LogEntry.objects.filter(
+                    content_type=ContentType.objects.get_for_model(PriceChangeNotice),
+                    object_id=str(failed_notice.pk),
+                ).delete()
             self.message_user(
                 request, f"Notice NOT sent: {'; '.join(exc.problems)}", level=messages.ERROR
             )
