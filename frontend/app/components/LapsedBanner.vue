@@ -11,15 +11,29 @@
       >
         <div class="d-flex flex-column flex-sm-row align-sm-center ga-3">
           <p class="text-body-2 flex-grow-1 mb-0" style="max-width: 720px">{{ message }}</p>
-          <VBtn
-            variant="flat"
-            color="primary"
-            rounded="lg"
-            to="/billing"
-          >
-            {{ buttonLabel }}
-          </VBtn>
+          <div class="d-flex flex-column flex-sm-row align-start ga-2">
+            <VBtn
+              variant="flat"
+              color="primary"
+              rounded="lg"
+              to="/billing"
+            >
+              {{ buttonLabel }}
+            </VBtn>
+            <VBtn
+              v-if="lapsedKind === 'lapsed' && canManageBilling"
+              variant="text"
+              color="primary"
+              rounded="lg"
+              :loading="portalRedirecting"
+              :disabled="portalRedirecting"
+              @click="manageBilling"
+            >
+              Fix payment
+            </VBtn>
+          </div>
         </div>
+        <p v-if="portalError" class="text-caption mt-2 mb-0">{{ portalError }}</p>
       </VAlert>
     </div>
   </VExpandTransition>
@@ -27,14 +41,15 @@
 
 <script setup lang="ts">
 const route = useRoute()
-const { subscription, isLapsed, lapsedKind } = useSubscription()
+const { subscription, isLapsed, lapsedKind, canManageBilling } = useSubscription()
+const { portalRedirecting, portalError, manageBilling } = usePortal()
 
 const visible = computed(() => isLapsed.value && !route.path.startsWith('/billing'))
 
 const message = computed(() => {
   switch (lapsedKind.value) {
     case 'revoked':
-      return 'Access was paused when a payment dispute was opened on this account. Your collection and past recommendations are still here to read and export. Subscribe again to restore full access.'
+      return 'Access was paused when a payment dispute was opened on this account. Your collection and past recommendations are still here to read and export. Write to support@supermanzer.io to sort it out.'
     case 'lapsed': {
       const expires = subscription.value?.access_expires_at
       const ended = expires ? `Your subscription ended on ${formatExpiryDate(expires)}.` : 'Your subscription has ended.'
@@ -45,5 +60,7 @@ const message = computed(() => {
   }
 })
 
-const buttonLabel = computed(() => (lapsedKind.value === 'lapsed' ? 'Renew' : 'View plans'))
+const buttonLabel = computed(() => (
+  lapsedKind.value === 'lapsed' ? 'Renew' : lapsedKind.value === 'revoked' ? 'See details' : 'View plans'
+))
 </script>

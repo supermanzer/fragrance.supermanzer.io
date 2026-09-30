@@ -14,6 +14,14 @@
         <p v-if="isLapsed" class="text-caption text-medium-emphasis mb-4">
           Schedule changes need an active subscription.
         </p>
+        <VExpandTransition>
+          <div v-if="legacyFrequency">
+            <v-alert type="info" variant="tonal" density="compact" rounded="lg" class="mb-4">
+              Your schedule was set to {{ legacyFrequency }}. Picks are now made monthly, and we'll switch you when you save.
+            </v-alert>
+          </div>
+        </VExpandTransition>
+        <p class="text-body-2 mb-4">Your picks are made once a month.</p>
         <v-text-field
           v-model="form.recipient_email"
           label="Recipient email"
@@ -24,13 +32,16 @@
           :readonly="isLapsed"
           class="mb-4"
         />
-        <v-select
-          v-model="form.frequency"
-          label="Frequency"
-          :items="frequencyOptions"
+        <v-text-field
+          v-model.number="form.run_day_of_month"
+          label="Day of month"
+          type="number"
+          :min="1"
+          :max="28"
           variant="outlined"
           rounded="lg"
-          hide-details="auto"
+          hint="Runs happen on this day each month, at the hour below."
+          persistent-hint
           :readonly="isLapsed"
           class="mb-4"
         />
@@ -40,45 +51,6 @@
           type="number"
           :min="0"
           :max="23"
-          variant="outlined"
-          rounded="lg"
-          hide-details="auto"
-          :readonly="isLapsed"
-          class="mb-4"
-        />
-        <v-text-field
-          v-if="form.frequency === 'weekly'"
-          v-model.number="form.run_day_of_week"
-          label="Day of week (0=Sun, 6=Sat)"
-          type="number"
-          :min="0"
-          :max="6"
-          variant="outlined"
-          rounded="lg"
-          hide-details="auto"
-          :readonly="isLapsed"
-          class="mb-4"
-        />
-        <v-text-field
-          v-if="form.frequency === 'monthly' || form.frequency === 'yearly'"
-          v-model.number="form.run_day_of_month"
-          label="Day of month"
-          type="number"
-          :min="1"
-          :max="31"
-          variant="outlined"
-          rounded="lg"
-          hide-details="auto"
-          :readonly="isLapsed"
-          class="mb-4"
-        />
-        <v-text-field
-          v-if="form.frequency === 'yearly'"
-          v-model.number="form.run_month"
-          label="Month (1–12)"
-          type="number"
-          :min="1"
-          :max="12"
           variant="outlined"
           rounded="lg"
           hide-details="auto"
@@ -247,7 +219,7 @@
 </template>
 
 <script setup lang="ts">
-import { useSettings, type FragranceConfigInput } from '~/composables/useSettings'
+import { useSettings } from '~/composables/useSettings'
 import { useImport } from '~/composables/useImport'
 import { useExport } from '~/composables/useExport'
 import { useApi, clearTokens, isSubscriptionRequired } from '~/composables/useApi'
@@ -278,31 +250,29 @@ async function runImport(): Promise<void> {
   if (importResult.value) importFile.value = null
 }
 
-const frequencyOptions = [
-  { title: 'Weekly', value: 'weekly' },
-  { title: 'Monthly', value: 'monthly' },
-  { title: 'Yearly', value: 'yearly' },
-]
-
-const form = reactive<Partial<FragranceConfigInput>>({
+const form = reactive<{
+  recipient_email: string
+  run_hour: number
+  run_day_of_month: number
+}>({
   recipient_email: '',
-  frequency: 'monthly',
   run_hour: 9,
-  run_day_of_week: 1,
   run_day_of_month: 1,
-  run_month: 1,
+})
+
+const legacyFrequency = computed(() => {
+  const f = config.value?.frequency
+  return f === 'weekly' || f === 'yearly' ? f : null
 })
 
 onMounted(async () => {
   await fetchConfig()
   if (config.value) {
+    const day = config.value.run_day_of_month
     Object.assign(form, {
       recipient_email: config.value.recipient_email,
-      frequency: config.value.frequency,
       run_hour: config.value.run_hour,
-      run_day_of_week: config.value.run_day_of_week,
-      run_day_of_month: config.value.run_day_of_month,
-      run_month: config.value.run_month,
+      run_day_of_month: Number.isInteger(day) && day >= 1 && day <= 28 ? day : 1,
     })
   }
 })
@@ -310,13 +280,29 @@ onMounted(async () => {
 async function submit() {
   saving.value = true
   saved.value = null
+  error.value = null
   readOnlyNotice.value = null
   try {
-    await updateConfig({ ...form })
+    await updateConfig({
+      recipient_email: form.recipient_email,
+      frequency: 'monthly',
+      run_hour: form.run_hour,
+      run_day_of_month: form.run_day_of_month,
+    })
     saved.value = 'Settings saved.'
   } catch (err: unknown) {
-    if (!isSubscriptionRequired(err)) throw err
-    readOnlyNotice.value = READ_ONLY_WRITE_NOTICE
+    if (isSubscriptionRequired(err)) {
+      readOnlyNotice.value = READ_ONLY_WRITE_NOTICE
+      return
+    }
+    const e = err as { status?: number; data?: Record<string, unknown> }
+    if (e?.status === 400) {
+      error.value = e.data?.frequency
+        ? 'Only monthly schedules are available. Please reload the page and try again.'
+        : "We couldn't save your schedule. Please check the day and hour and try again."
+    } else {
+      error.value = "We couldn't save your settings just now. Please try again in a moment."
+    }
   } finally {
     saving.value = false
   }

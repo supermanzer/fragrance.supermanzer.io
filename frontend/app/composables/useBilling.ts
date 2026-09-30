@@ -31,6 +31,11 @@ export interface SessionStatus {
   granted: boolean
 }
 
+export function isAccountLocked(err: unknown): boolean {
+  const e = err as { status?: number; data?: { code?: string } }
+  return e?.status === 409 && e.data?.code === 'account_locked'
+}
+
 export function useBilling() {
   const { api } = useApi()
   const plans = ref<Plan[]>([])
@@ -95,8 +100,11 @@ export function useBilling() {
 
   // The three below re-throw on every failure; callers branch on err.status / err.data.code
   // and then refetch, so the server stays the source of truth.
-  async function schedulePlanChange(slug: string): Promise<void> {
-    await api('/billing/change-plan/', { method: 'POST', body: { plan: slug } })
+  async function schedulePlanChange(slug: string): Promise<{ pending: PlanChangePending | null }> {
+    return await api<{ pending: PlanChangePending | null }>('/billing/change-plan/', {
+      method: 'POST',
+      body: { plan: slug },
+    })
   }
 
   // DELETE returns 204 with no body; ofetch resolves that to undefined.

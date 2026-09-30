@@ -6,45 +6,87 @@
         <p class="text-body-2 text-medium-emphasis mb-0">Monthly AI-curated fragrance picks</p>
       </div>
 
-      <div class="d-flex flex-column align-start align-sm-end">
-        <LapsedGate
-          :locked="!available"
-          label="Trigger Run"
-          :reason="triggerReason"
+      <VFadeTransition mode="out-in">
+        <VSkeletonLoader
+          v-if="headerMode === 'unknown'"
+          key="unknown"
+          type="text"
+          width="180"
+        />
+
+        <div
+          v-else-if="headerMode === 'staff'"
+          key="staff"
+          class="d-flex flex-column align-start align-sm-end"
+          style="max-width: 280px"
+        >
+          <LapsedGate
+            :locked="!staffAvailable"
+            label="Run now"
+            :reason="triggerReason"
+          >
+            <VBtn
+              color="primary"
+              variant="flat"
+              rounded="lg"
+              prepend-icon="mdi-play-outline"
+              :disabled="!staffAvailable"
+              :loading="triggering"
+              @click="trigger"
+            >
+              Run now
+            </VBtn>
+          </LapsedGate>
+          <p class="text-caption text-medium-emphasis mb-0 mt-2 text-sm-right">
+            Staff only. Starts a run outside the schedule.
+          </p>
+        </div>
+
+        <div
+          v-else-if="headerMode === 'first-picks'"
+          key="first-picks"
+          class="d-flex flex-column align-start align-sm-end"
+          style="max-width: 280px"
         >
           <VBtn
             color="primary"
             variant="flat"
             rounded="lg"
-            :disabled="!available"
             :loading="triggering"
             @click="trigger"
           >
-            Trigger Run
+            Get my first picks
           </VBtn>
-        </LapsedGate>
-
-        <div class="mt-2 text-sm-right" style="max-width: 280px">
-          <VFadeTransition mode="out-in">
-            <VSkeletonLoader
-              v-if="quotaLoading"
-              key="quota-skeleton"
-              type="text"
-              width="180"
-            />
-            <div v-else-if="quotaCaption" :key="quotaCaption.key">
-              <p class="text-caption text-medium-emphasis mb-0">{{ quotaCaption.text }}</p>
-              <p
-                v-if="quotaCaption.key === 'quota-available' && lastRunFailed"
-                class="text-caption text-medium-emphasis mb-0 mt-1"
-              >
-                Your last run didn't finish, so it wasn't counted.
-              </p>
-            </div>
-          </VFadeTransition>
         </div>
-      </div>
+
+        <div
+          v-else-if="headerLine"
+          :key="headerMode"
+          class="d-flex flex-column align-start align-sm-end"
+          style="max-width: 280px"
+        >
+          <p class="text-body-2 text-medium-emphasis mb-0 text-sm-right">{{ headerLine }}</p>
+          <VBtn
+            variant="text"
+            color="primary"
+            rounded="lg"
+            size="small"
+            class="px-0 px-sm-3"
+            to="/settings"
+          >
+            Change schedule
+          </VBtn>
+        </div>
+      </VFadeTransition>
     </div>
+
+    <RunStatusNotice
+      v-if="!loading && !error && runs.length"
+      :kind="noticeKind === 'none' ? null : noticeKind"
+      :title="noticeTitle"
+      :body="noticeBody"
+      :show-support="noticeKind === 'exhausted'"
+    />
 
     <VFadeTransition mode="out-in">
       <VSkeletonLoader
@@ -98,28 +140,58 @@
             View plans
           </VBtn>
         </template>
-        <template v-else>
-        <p class="text-body-2 text-medium-emphasis mt-1">
-          Trigger a run to generate your first five fragrance picks, curated from your collection.
-        </p>
-        <LapsedGate
-          :locked="!available"
-          label="Trigger your first run"
-          :reason="triggerReason"
-        >
-          <VBtn
-            color="primary"
-            variant="flat"
-            rounded="lg"
-            class="mt-6"
-            :disabled="!available"
-            :loading="triggering"
-            @click="trigger"
+        <template v-else-if="isStaff">
+          <p class="text-body-2 text-medium-emphasis mt-1">
+            Start a run to generate your first five fragrance picks, curated from your collection.
+          </p>
+          <LapsedGate
+            :locked="!staffAvailable"
+            label="Run now"
+            :reason="triggerReason"
           >
-            Trigger your first run
-          </VBtn>
-        </LapsedGate>
+            <VBtn
+              color="primary"
+              variant="flat"
+              rounded="lg"
+              class="mt-6"
+              prepend-icon="mdi-play-outline"
+              :disabled="!staffAvailable"
+              :loading="triggering"
+              @click="trigger"
+            >
+              Run now
+            </VBtn>
+          </LapsedGate>
         </template>
+        <template v-else-if="known">
+          <p class="text-body-2 text-medium-emphasis mt-1">{{ emptyLine }}</p>
+          <div class="d-flex flex-column align-center ga-2 mt-6">
+            <VBtn
+              v-if="firstRunAvailable"
+              color="primary"
+              variant="flat"
+              rounded="lg"
+              :loading="triggering"
+              @click="trigger"
+            >
+              Get my first picks
+            </VBtn>
+            <VBtn
+              variant="text"
+              color="primary"
+              rounded="lg"
+              to="/settings"
+            >
+              Check your schedule
+            </VBtn>
+          </div>
+        </template>
+        <VSkeletonLoader
+          v-else
+          type="text"
+          width="240"
+          class="mx-auto mt-1"
+        />
       </div>
 
       <VExpansionPanels
@@ -141,10 +213,10 @@
                 <VChip
                   size="small"
                   variant="tonal"
-                  color="error"
+                  :color="failedChip(run).color"
                   class="ml-4"
                 >
-                  Failed
+                  {{ failedChip(run).label }}
                 </VChip>
               </template>
               <template v-else-if="run.status === 'pending'">
@@ -220,6 +292,12 @@
                 rounded
                 class="mb-4"
               />
+              <p
+                v-if="run.attempt > 1"
+                class="text-caption text-medium-emphasis mb-1"
+              >
+                Attempt {{ run.attempt }} of {{ run.max_attempts }}.
+              </p>
               <p class="text-body-2 text-medium-emphasis">
                 Curating your picks — this takes about 2 minutes.
               </p>
@@ -227,12 +305,16 @@
 
             <!-- Pipeline failed -->
             <template v-else-if="run.status === 'failed'">
+              <p class="text-body-2 mb-0">{{ failedSentence(run) }}</p>
               <VAlert
+                v-if="isStaff && run.error_message"
                 type="error"
                 variant="tonal"
-                rounded="lg"
                 density="compact"
+                rounded="lg"
+                class="mt-4"
               >
+                <p class="text-subtitle-2 mb-1">Staff detail</p>
                 {{ run.error_message }}
               </VAlert>
             </template>
@@ -269,6 +351,13 @@
                   </LapsedGate>
                 </template>
               </VAlert>
+
+              <p
+                v-if="run.attempt > 1"
+                class="text-caption text-medium-emphasis mb-2"
+              >
+                Delivered on attempt {{ run.attempt }}.
+              </p>
 
               <p
                 v-if="run.intro"
@@ -403,7 +492,7 @@
 </template>
 
 <script setup lang="ts">
-import { useRuns, type Recommendation } from '~/composables/useRuns'
+import { useRuns, type Recommendation, type RecommendationRun } from '~/composables/useRuns'
 import { isSubscriptionRequired } from '~/composables/useApi'
 import { ratingLabel, ratingIcon, statusColor, type RatingAction } from '~/utils/rating'
 
@@ -421,91 +510,125 @@ const {
   rateRecommendation,
 } = useRuns()
 const {
-  subscription,
-  loading: subscriptionLoading,
   isLapsed,
+  isStaff,
+  known,
   quota,
-  unlimited,
-  fetchSubscription,
   refreshSubscription,
 } = useSubscription()
 
-// Bridge holding next_eligible_at from a 429 quota_exceeded until the refetch lands.
-const blockedUntil = ref<string | null>(null)
-watch(subscriptionLoading, (isLoading) => {
-  if (!isLoading) blockedUntil.value = null
-})
+const newest = computed(() => newestRun(runs.value))
+const noticeKind = computed(() => runNotice({ isLapsed: isLapsed.value, newest: newest.value }))
 
-const inProgress = computed(
-  () => !isLapsed.value && (hasActiveRun.value || (unlimited.value && quota.value?.can_trigger === false)),
+// Any run pending/running, or a failed run whose retry is queued, blocks a manual start.
+const anyActive = computed(() => runs.value.some(isRunActive))
+const staffAvailable = computed(() => isStaff.value && !anyActive.value)
+const firstRunAvailable = computed(
+  () => known.value && !isStaff.value && !isLapsed.value && !anyActive.value && quota.value?.first_run_available === true,
 )
-const quotaUsed = computed(
-  () =>
-    !isLapsed.value
-    && !inProgress.value
-    && !unlimited.value
-    && (quota.value?.can_trigger === false || blockedUntil.value !== null),
+const nextRunAt = computed(() => quota.value?.next_run_at ?? null)
+
+const triggerReason = computed(() => 'A run is already in progress')
+
+type HeaderMode = 'unknown' | 'staff' | 'first-picks' | 'curating' | 'next-date' | 'monthly' | 'none'
+const headerMode = computed<HeaderMode>(() => {
+  if (!known.value) return 'unknown'
+  if (isStaff.value) return 'staff'
+  if (isRunInFlight(newest.value)) return 'curating'
+  if (isLapsed.value) return 'none'
+  if (firstRunAvailable.value) return 'first-picks'
+  const n = newest.value
+  if (n?.status === 'failed' && (n.retry?.state === 'scheduled' || n.retry?.state === 'exhausted')) return 'none'
+  return nextRunAt.value ? 'next-date' : 'monthly'
+})
+const headerLine = computed(() => {
+  switch (headerMode.value) {
+    case 'curating': return 'Curating your picks now.'
+    case 'next-date': return `Your next picks arrive on ${formatNextRunDate(nextRunAt.value!)}.`
+    case 'monthly': return 'Your picks arrive by email on your monthly schedule.'
+    default: return ''
+  }
+})
+
+const emptyLine = computed(() =>
+  nextRunAt.value
+    ? `Your first five picks will arrive by email on ${formatNextRunDate(nextRunAt.value)}. They'll appear here too.`
+    : "Your first five picks will arrive by email on your monthly schedule. They'll appear here too.",
 )
-const available = computed(() => !isLapsed.value && !inProgress.value && !quotaUsed.value)
 
-// A 429 is fresher than a cached page, so blockedUntil wins only when it is later.
-const nextEligibleAt = computed<string | null>(() => {
-  const fromQuota = quota.value?.next_eligible_at ?? null
-  const fromBridge = blockedUntil.value
-  if (fromQuota && fromBridge) return new Date(fromBridge) > new Date(fromQuota) ? fromBridge : fromQuota
-  return fromQuota ?? fromBridge
-})
-const nextRunDate = computed(() => (nextEligibleAt.value ? formatNextRunDate(nextEligibleAt.value) : null))
-
-const triggerReason = computed(() => {
-  if (isLapsed.value) return 'Running needs an active subscription.'
-  if (inProgress.value) return 'A run is already in progress'
-  return nextRunDate.value
-    ? `Your next run is available on ${nextRunDate.value}.`
-    : 'Your next run will be available when this period ends.'
-})
-
-const quotaLoading = computed(() => subscriptionLoading.value && !subscription.value)
-
-const lastRunFailed = computed(() => {
-  let newest: (typeof runs.value)[number] | null = null
-  for (const run of runs.value) {
-    if (!newest || new Date(run.triggered_at) > new Date(newest.triggered_at)) newest = run
+const noticeTitle = computed(() => {
+  switch (noticeKind.value) {
+    case 'retrying': return "This month's run didn't finish. We're on it."
+    case 'running-again': return 'Trying again now'
+    case 'exhausted': return "We couldn't create this month's picks"
+    case 'stopped': return "This month's run didn't finish"
+    default: return ''
   }
-  return newest?.status === 'failed'
+})
+const noticeBody = computed(() => {
+  const run = newest.value
+  if (!run) return ''
+  const { attempt, max_attempts: max } = run
+  switch (noticeKind.value) {
+    case 'retrying': {
+      const when = retryWhen(run.retry?.next_retry_at ?? null)
+      return run.retry?.retries_remaining === 1
+        ? `Attempt ${attempt} of ${max} ran into a problem on our side. We'll try once more ${when}, and that will be our last automatic try. There's nothing you need to do. We've emailed you a short note too.`
+        : `Attempt ${attempt} of ${max} ran into a problem on our side. We'll try again ${when} and keep trying automatically, so there's nothing you need to do. We've emailed you a short note too.`
+    }
+    case 'running-again':
+      return `Attempt ${attempt} of ${max} is running. It takes about 2 minutes, and your picks will arrive by email as soon as they're ready.`
+    case 'exhausted':
+      return `We tried ${max} times and weren't able to finish. We've been alerted and are looking into it. If you'd like to hear from us directly, write to ${SUPPORT_EMAIL}.`
+    case 'stopped':
+      return `We won't try again while your account is read-only. Once your subscription is active again, write to ${SUPPORT_EMAIL} and we'll look at it.`
+    default:
+      return ''
+  }
 })
 
-const quotaCaption = computed<{ key: string; text: string } | null>(() => {
-  const q = quota.value
-  // No caption for lapsed, exempt (unlimited), or unknown quota; also never
-  // interpolate "{used} of {allowed}" while runs_allowed is null.
-  if (isLapsed.value || unlimited.value || q === null || q.runs_allowed === null) return null
-  const noun = q.runs_allowed === 1 ? 'run' : 'runs'
-  const usage = `${q.runs_used} of ${q.runs_allowed} ${noun} used this period`
-  if (quotaUsed.value) {
-    if (q.can_trigger === false && q.runs_used < q.runs_allowed) {
-      return {
-        key: 'quota-blocked',
-        text: nextRunDate.value
-          ? `Two recent runs didn't finish. Your next run is available on ${nextRunDate.value}.`
-          : "Two recent runs didn't finish. Runs will be available again soon.",
-      }
-    }
-    return {
-      key: 'quota-used',
-      text: nextRunDate.value
-        ? `${usage}. Your next run is available on ${nextRunDate.value}.`
-        : `${usage}. Your next run will be available when this period ends.`,
-    }
+function failedChip(run: RecommendationRun): { label: string; color: string } {
+  return run.retry?.state === 'scheduled' && !isLapsed.value
+    ? { label: 'Retrying', color: 'info' }
+    : { label: "Didn't finish", color: 'error' }
+}
+
+function failedSentence(run: RecommendationRun): string {
+  if (isLapsed.value) return "This run didn't finish."
+  switch (run.retry?.state) {
+    case 'scheduled':
+      return `This run ran into a problem on our side. We'll try again ${retryWhen(run.retry.next_retry_at)}.`
+    case 'exhausted':
+      return `This run couldn't be completed after ${run.max_attempts} attempts. If you'd like to hear from us, write to ${SUPPORT_EMAIL}.`
+    default:
+      return "This run didn't finish."
   }
-  return { key: available.value ? 'quota-available' : 'quota-in-progress', text: usage }
-})
+}
 
 const openPanels = ref<number[]>([0])
 const openRationales = ref<Set<number>>(new Set())
 const snackbar = ref<{ message: string; color: 'success' | 'error' | 'info' } | null>(null)
 
 onMounted(fetchRuns)
+
+// Announce only the two transitions a customer can act on, and only when they happen
+// while the page is open (the watch is not immediate).
+watch(noticeKind, (kind, previous) => {
+  if (kind === 'exhausted' && previous !== 'exhausted') {
+    snackbar.value = {
+      message: "We couldn't create this month's picks. Details are above the list.",
+      color: 'info',
+    }
+  }
+})
+watch(
+  () => [newest.value?.id, newest.value?.status] as const,
+  ([id, status], [prevId, prevStatus]) => {
+    if (id !== undefined && id === prevId && status === 'done' && prevStatus !== 'done') {
+      snackbar.value = { message: 'Your picks are ready.', color: 'success' }
+    }
+  },
+)
 
 function formatDate(dateString: string): string {
   return new Date(dateString).toLocaleDateString(undefined, {
@@ -524,16 +647,19 @@ function toggleRationale(id: number): void {
 }
 
 async function trigger(): Promise<void> {
-  if (!available.value) return
+  if (triggering.value) return
+  if (isStaff.value ? !staffAvailable.value : !firstRunAvailable.value) return
   try {
     await triggerRun()
     snackbar.value = { message: 'Run triggered', color: 'success' }
     await Promise.all([fetchRuns(), refreshSubscription()])
   } catch (err: unknown) {
     const e = err as { status?: number; data?: { code?: string; next_eligible_at?: string | null } }
-    if (e?.status === 429 && e.data?.code === 'quota_exceeded') {
-      blockedUntil.value = e.data.next_eligible_at ?? null
-      const date = blockedUntil.value ? formatNextRunDate(blockedUntil.value) : null
+    if (e?.status === 403 && e.data?.code === 'manual_runs_staff_only') {
+      snackbar.value = { message: 'Your picks are delivered automatically each month.', color: 'info' }
+      await refreshSubscription()
+    } else if (e?.status === 429 && e.data?.code === 'quota_exceeded') {
+      const date = e.data.next_eligible_at ? formatNextRunDate(e.data.next_eligible_at) : null
       snackbar.value = {
         message: date ? `Your next run is available on ${date}.` : "You've already used this period's run.",
         color: 'info',
@@ -541,7 +667,7 @@ async function trigger(): Promise<void> {
       await refreshSubscription()
     } else if (e?.status === 429 && e.data?.code === 'run_in_progress') {
       snackbar.value = { message: 'A run is already in progress.', color: 'info' }
-      await fetchRuns(true)
+      await Promise.all([fetchRuns(true), refreshSubscription()])
     } else if (isSubscriptionRequired(err)) {
       snackbar.value = {
         message: "Your account is read-only right now, so a run can't be started.",

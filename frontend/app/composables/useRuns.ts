@@ -17,6 +17,13 @@ export interface RateOutcome {
   action: RatingAction
 }
 
+export interface RunRetry {
+  state: 'scheduled' | 'exhausted' | 'stopped'
+  retries_remaining: number
+  next_retry_at: string | null
+  last_failed_at: string | null
+}
+
 export interface RecommendationRun {
   id: number
   triggered_at: string
@@ -26,7 +33,11 @@ export interface RecommendationRun {
   status: 'pending' | 'running' | 'done' | 'failed'
   email_status: 'pending' | 'sent' | 'failed' | null
   celery_task_id: string
+  // Blank for non-staff; never render it for them.
   error_message: string
+  attempt: number
+  max_attempts: number
+  retry: RunRetry | null
   intro: string
   picks: Recommendation[]
 }
@@ -156,7 +167,18 @@ export function useRuns() {
     }
   }
 
-  onUnmounted(stopPolling)
+  // A tab left open overnight should show a queued retry that has since run.
+  function onVisibilityChange(): void {
+    if (document.visibilityState !== 'visible') return
+    const newest = newestRun(runs.value)
+    if (newest?.status === 'failed' && newest.retry?.state === 'scheduled') void fetchRuns(true)
+  }
+
+  onMounted(() => document.addEventListener('visibilitychange', onVisibilityChange))
+  onUnmounted(() => {
+    document.removeEventListener('visibilitychange', onVisibilityChange)
+    stopPolling()
+  })
 
   return {
     runs,

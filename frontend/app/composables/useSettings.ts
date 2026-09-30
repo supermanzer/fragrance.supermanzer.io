@@ -11,7 +11,9 @@ export interface FragranceConfig {
   run_month: number
 }
 
-export type FragranceConfigInput = Omit<FragranceConfig, 'id'> & {
+// Reads may still return legacy 'weekly' / 'yearly'; writes accept only 'monthly'.
+export type FragranceConfigInput = Omit<FragranceConfig, 'id' | 'frequency'> & {
+  frequency: 'monthly'
   gmail_app_password_enc?: string
 }
 

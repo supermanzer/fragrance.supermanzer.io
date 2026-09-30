@@ -6,6 +6,14 @@ export interface SubscriptionQuota {
   runs_used: number
   next_eligible_at: string | null
   can_trigger: boolean
+  // True only for a non-staff user's one first run; the only gate for "Get my first picks".
+  first_run_available: boolean
+  next_run_at: string | null
+}
+
+export interface PaymentRecovery {
+  state: 'retrying' | 'failed'
+  attempted_at: string
 }
 
 export interface Subscription {
@@ -14,6 +22,11 @@ export interface Subscription {
   access_expires_at: string | null
   has_active_access: boolean
   exempt: boolean
+  // Strictly staff; a non-staff superuser is exempt but not is_staff.
+  is_staff: boolean
+  // Currently always null server-side: never claim a reason.
+  lapse_reason: 'payment_failed' | 'cancelled' | null
+  payment_recovery: PaymentRecovery | null
   // True whenever a billing account exists, lapsed customers included; gate UI on active state too.
   can_manage_billing: boolean
   quota: SubscriptionQuota
@@ -51,6 +64,8 @@ export function useSubscription() {
   })
   const quota = computed<SubscriptionQuota | null>(() => subscription.value?.quota ?? null)
   const isExempt = computed(() => subscription.value?.exempt === true)
+  // Fail-closed: false while the subscription is unknown.
+  const isStaff = computed(() => subscription.value?.is_staff === true)
   const canManageBilling = computed(() => subscription.value?.can_manage_billing === true && !isExempt.value)
   const unlimited = computed(() => quota.value !== null && quota.value.runs_allowed === null)
 
@@ -108,6 +123,7 @@ export function useSubscription() {
     lapsedKind,
     quota,
     isExempt,
+    isStaff,
     canManageBilling,
     unlimited,
   }

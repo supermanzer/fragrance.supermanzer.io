@@ -25,9 +25,9 @@
 
       <div v-else-if="revoked" key="revoked">
         <v-alert type="warning" variant="tonal" class="mb-6 text-left">
-          <p class="text-h6 font-weight-regular mb-2">There's a problem with this subscription</p>
+          <p class="text-h6 font-weight-regular mb-2">Access on this account is paused</p>
           <p class="text-body-2">
-            This subscription was revoked. Check your billing page to see your current status.
+            A payment dispute was opened on this account. Your billing page has the details, or you can write to support@supermanzer.io.
           </p>
         </v-alert>
         <v-btn color="primary" variant="flat" rounded="lg" to="/billing">Go to billing</v-btn>
