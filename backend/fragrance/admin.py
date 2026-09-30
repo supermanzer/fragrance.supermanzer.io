@@ -25,7 +25,12 @@ from .models import (
     StripeEvent,
     Subscription,
 )
-from .services import default_schedule_for, derive_unique_username, get_or_create_fragrance_config
+from .services import (
+    MAX_RUN_DAY_OF_MONTH,
+    default_schedule_for,
+    derive_unique_username,
+    get_or_create_fragrance_config,
+)
 
 # Register your models here.
 
@@ -317,8 +322,20 @@ class BetaSignupAdmin(admin.ModelAdmin):
             )
 
 
+class FragranceConfigAdminForm(forms.ModelForm):
+    """Same day cap as the API serializer; the crontab builder would clamp a larger value silently."""
+
+    def clean_run_day_of_month(self) -> int:
+        day = self.cleaned_data["run_day_of_month"]
+        if not 1 <= day <= MAX_RUN_DAY_OF_MONTH:
+            raise forms.ValidationError(f"Day of month must be between 1 and {MAX_RUN_DAY_OF_MONTH}.")
+        return day
+
+
 @admin.register(FragranceConfig)
 class FragranceConfigAdmin(admin.ModelAdmin):
+    form = FragranceConfigAdminForm
+
     def save_model(self, request, obj, form, change) -> None:
         # Jitter only on create, and only for schedule fields the admin left
         # on the form's default -- a value they actually typed is a choice.
@@ -332,7 +349,7 @@ class FragranceConfigAdmin(admin.ModelAdmin):
 
 
 @admin.register(Fragrance)
-class FragraneAdmin(admin.ModelAdmin):
+class FragranceAdmin(admin.ModelAdmin):
     pass
 
 
