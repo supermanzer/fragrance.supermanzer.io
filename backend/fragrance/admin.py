@@ -26,6 +26,9 @@ from .services import default_schedule_for, derive_unique_username
 # Register your models here.
 
 
+_DEFAULT_PLAN_SLUG = "beta-monthly"
+
+
 @admin.register(AIModelConfig)
 class AIModelConfigAdmin(admin.ModelAdmin):
     list_display = (
@@ -121,87 +124,6 @@ class AIModelConfigAdmin(admin.ModelAdmin):
                 level=messages.WARNING,
             )
         return HttpResponseRedirect(request.path)
-
-
-@admin.register(FragranceConfig)
-class FragranceConfigAdmin(admin.ModelAdmin):
-    def save_model(self, request, obj, form, change) -> None:
-        # Jitter only on create, and only for schedule fields the admin left
-        # on the form's default -- a value they actually typed is a choice.
-        if not change:
-            day, hour = default_schedule_for(user_id=obj.user_id)
-            if "run_day_of_month" not in form.changed_data:
-                obj.run_day_of_month = day
-            if "run_hour" not in form.changed_data:
-                obj.run_hour = hour
-        super().save_model(request, obj, form, change)
-
-
-@admin.register(Fragrance)
-class FragraneAdmin(admin.ModelAdmin):
-    pass
-
-
-@admin.register(PreferenceProfile)
-class PreferenceProfileAdmin(admin.ModelAdmin):
-    pass
-
-
-@admin.register(Recommendation)
-class RecommendationAdmin(admin.ModelAdmin):
-    pass
-
-
-@admin.register(RecommendationRun)
-class RecommendationRunAdmin(admin.ModelAdmin):
-    pass
-
-
-@admin.register(Plan)
-class PlanAdmin(admin.ModelAdmin):
-    list_display = ("slug", "name", "amount_cents", "billing_interval", "is_active")
-    list_filter = ("is_active", "billing_interval")
-
-
-@admin.register(Subscription)
-class SubscriptionAdmin(admin.ModelAdmin):
-    list_display = ("user", "plan", "status", "access_expires_at", "last_paid_at")
-    list_filter = ("status", "plan")
-    search_fields = ("user__username", "user__email", "stripe_customer_id", "stripe_subscription_id")
-    # Every field here is Stripe-derived state -- editing it here would let
-    # the admin drift from what Stripe actually reports, which is exactly
-    # the class of bug the payment-driven design (see Subscription's
-    # docstring) exists to avoid. Read-only for operator visibility during
-    # manual verification (see the plan's end-to-end walk), never for
-    # granting access by hand.
-    readonly_fields = [f.name for f in Subscription._meta.fields]
-
-    def has_add_permission(self, request: HttpRequest) -> bool:
-        return False
-
-
-@admin.register(StripeEvent)
-class StripeEventAdmin(admin.ModelAdmin):
-    list_display = ("stripe_event_id", "event_type", "status", "received_at", "processed_at")
-    list_filter = ("status", "event_type")
-    search_fields = ("stripe_event_id",)
-    readonly_fields = [f.name for f in StripeEvent._meta.fields]
-
-    def has_add_permission(self, request: HttpRequest) -> bool:
-        return False
-
-
-@admin.register(ProcessedPayment)
-class ProcessedPaymentAdmin(admin.ModelAdmin):
-    list_display = ("stripe_invoice_id", "subscription", "amount_paid_cents", "applied_at", "period_end")
-    search_fields = ("stripe_invoice_id", "stripe_subscription_id")
-    readonly_fields = [f.name for f in ProcessedPayment._meta.fields]
-
-    def has_add_permission(self, request: HttpRequest) -> bool:
-        return False
-
-
-_DEFAULT_PLAN_SLUG = "beta-monthly"
 
 
 @admin.register(BetaSignup)
@@ -352,3 +274,81 @@ class BetaSignupAdmin(admin.ModelAdmin):
                 f"Skipped {skipped_count} signup(s) not in 'pending' status.",
                 level=messages.WARNING,
             )
+
+
+@admin.register(FragranceConfig)
+class FragranceConfigAdmin(admin.ModelAdmin):
+    def save_model(self, request, obj, form, change) -> None:
+        # Jitter only on create, and only for schedule fields the admin left
+        # on the form's default -- a value they actually typed is a choice.
+        if not change:
+            day, hour = default_schedule_for(user_id=obj.user_id)
+            if "run_day_of_month" not in form.changed_data:
+                obj.run_day_of_month = day
+            if "run_hour" not in form.changed_data:
+                obj.run_hour = hour
+        super().save_model(request, obj, form, change)
+
+
+@admin.register(Fragrance)
+class FragraneAdmin(admin.ModelAdmin):
+    pass
+
+
+@admin.register(Plan)
+class PlanAdmin(admin.ModelAdmin):
+    list_display = ("slug", "name", "amount_cents", "billing_interval", "is_active")
+    list_filter = ("is_active", "billing_interval")
+
+
+@admin.register(PreferenceProfile)
+class PreferenceProfileAdmin(admin.ModelAdmin):
+    pass
+
+
+@admin.register(ProcessedPayment)
+class ProcessedPaymentAdmin(admin.ModelAdmin):
+    list_display = ("stripe_invoice_id", "subscription", "amount_paid_cents", "applied_at", "period_end")
+    search_fields = ("stripe_invoice_id", "stripe_subscription_id")
+    readonly_fields = [f.name for f in ProcessedPayment._meta.fields]
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False
+
+
+@admin.register(Recommendation)
+class RecommendationAdmin(admin.ModelAdmin):
+    pass
+
+
+@admin.register(RecommendationRun)
+class RecommendationRunAdmin(admin.ModelAdmin):
+    pass
+
+
+@admin.register(StripeEvent)
+class StripeEventAdmin(admin.ModelAdmin):
+    list_display = ("stripe_event_id", "event_type", "status", "received_at", "processed_at")
+    list_filter = ("status", "event_type")
+    search_fields = ("stripe_event_id",)
+    readonly_fields = [f.name for f in StripeEvent._meta.fields]
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False
+
+
+@admin.register(Subscription)
+class SubscriptionAdmin(admin.ModelAdmin):
+    list_display = ("user", "plan", "status", "access_expires_at", "last_paid_at")
+    list_filter = ("status", "plan")
+    search_fields = ("user__username", "user__email", "stripe_customer_id", "stripe_subscription_id")
+    # Every field here is Stripe-derived state -- editing it here would let
+    # the admin drift from what Stripe actually reports, which is exactly
+    # the class of bug the payment-driven design (see Subscription's
+    # docstring) exists to avoid. Read-only for operator visibility during
+    # manual verification (see the plan's end-to-end walk), never for
+    # granting access by hand.
+    readonly_fields = [f.name for f in Subscription._meta.fields]
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        return False

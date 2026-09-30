@@ -28,8 +28,12 @@ from django.utils import timezone
 
 from fragrance.models import Plan
 
-_MONTHLY_SLUG = "beta-monthly"
+
 _ANNUAL_SLUG = "beta-annual"
+
+
+_MONTHLY_SLUG = "beta-monthly"
+
 
 _PLAN_FIELDS: dict[str, dict[str, Any]] = {
     _MONTHLY_SLUG: {

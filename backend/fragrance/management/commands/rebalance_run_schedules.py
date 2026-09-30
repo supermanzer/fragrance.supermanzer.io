@@ -17,7 +17,10 @@ from django.db import transaction
 from fragrance.models import FragranceConfig
 from fragrance.services import default_schedule_for
 
+
 _UNTOUCHED_DAY = 1
+
+
 _UNTOUCHED_HOUR = 9
 
 

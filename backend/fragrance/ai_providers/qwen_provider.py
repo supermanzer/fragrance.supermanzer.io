@@ -14,6 +14,7 @@ from django.conf import settings
 
 from .openai_provider import OpenAIProvider
 
+
 # Alibaba splits China vs. international accounts onto separate base URLs with
 # non-interchangeable API keys. Default to the international endpoint since
 # that's what a US-registered account uses; override via DASHSCOPE_BASE_URL

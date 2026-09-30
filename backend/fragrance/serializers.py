@@ -10,12 +10,20 @@ from .models import FRAGRANCE_STATUSES, FragranceConfig, Fragrance, Plan, Prefer
 from .services import resolve_beta_invite_signup
 
 
-class BetaSignupSerializer(serializers.Serializer):
-    email = serializers.EmailField()
-    # Honeypot: real users never see or fill this field (hidden in the
-    # frontend form); a bot that fills every input trips it. Non-empty means
-    # silently drop the submission, never store it.
-    website = serializers.CharField(required=False, allow_blank=True, default='')
+class RecommendationSerializer(serializers.ModelSerializer):
+    rating = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Recommendation
+        fields = '__all__'
+        read_only_fields = ['user', 'run']
+
+    def get_rating(self, obj: Recommendation) -> str | None:
+        # promoted_fragrance is a reverse OneToOneField accessor; it raises
+        # RelatedObjectDoesNotExist (an AttributeError subclass) on no match,
+        # so getattr(..., None) is the correct idiom here, not try/except.
+        fragrance = getattr(obj, 'promoted_fragrance', None)
+        return fragrance.status if fragrance else None
 
 
 class BetaAcceptSerializer(serializers.Serializer):
@@ -57,52 +65,12 @@ class BetaAcceptSerializer(serializers.Serializer):
         return attrs
 
 
-class FragranceConfigSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = FragranceConfig
-        exclude = ['user']
-        # An out-of-range value would save and then yield an invalid crontab;
-        # django-celery-beat swallows that error, silently losing the run.
-        extra_kwargs = {
-            'run_hour': {'min_value': 0, 'max_value': 23},
-            'run_day_of_week': {'min_value': 0, 'max_value': 6},
-            'run_day_of_month': {'min_value': 1, 'max_value': 31},
-            'run_month': {'min_value': 1, 'max_value': 12},
-        }
-
-
-class FragranceSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Fragrance
-        exclude = ['user']
-        read_only_fields = ['added_at']
-
-
-class PreferenceProfileSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = PreferenceProfile
-        exclude = ['user']
-        read_only_fields = ['generated_at']
-
-
-class RecommendationSerializer(serializers.ModelSerializer):
-    rating = serializers.SerializerMethodField()
-
-    class Meta:
-        model = Recommendation
-        fields = '__all__'
-        read_only_fields = ['user', 'run']
-
-    def get_rating(self, obj: Recommendation) -> str | None:
-        # promoted_fragrance is a reverse OneToOneField accessor; it raises
-        # RelatedObjectDoesNotExist (an AttributeError subclass) on no match,
-        # so getattr(..., None) is the correct idiom here, not try/except.
-        fragrance = getattr(obj, 'promoted_fragrance', None)
-        return fragrance.status if fragrance else None
-
-
-class RecommendationRatingSerializer(serializers.Serializer):
-    action = serializers.ChoiceField(choices=FRAGRANCE_STATUSES)
+class BetaSignupSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+    # Honeypot: real users never see or fill this field (hidden in the
+    # frontend form); a bot that fills every input trips it. Non-empty means
+    # silently drop the submission, never store it.
+    website = serializers.CharField(required=False, allow_blank=True, default='')
 
 
 class ChangePasswordSerializer(serializers.Serializer):
@@ -124,8 +92,42 @@ class ChangePasswordSerializer(serializers.Serializer):
         return attrs
 
 
-class PasswordResetRequestSerializer(serializers.Serializer):
-    email = serializers.EmailField()
+class ChangePlanSerializer(serializers.Serializer):
+    """Only a plan slug, resolved server-side to a Plan; never a price id."""
+
+    plan = serializers.SlugField()
+
+
+class CheckoutCreateSerializer(serializers.Serializer):
+    """
+    Only a plan slug -- an opaque key into the server-owned Plan table.
+    A client-supplied price_id is never a recognized field here, so DRF
+    silently ignores it rather than accepting it; BillingCheckoutView always
+    resolves the Stripe Price id itself via Plan.objects.get(slug=...).
+    """
+
+    slug = serializers.SlugField()
+
+
+class FragranceConfigSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = FragranceConfig
+        exclude = ['user']
+        # An out-of-range value would save and then yield an invalid crontab;
+        # django-celery-beat swallows that error, silently losing the run.
+        extra_kwargs = {
+            'run_hour': {'min_value': 0, 'max_value': 23},
+            'run_day_of_week': {'min_value': 0, 'max_value': 6},
+            'run_day_of_month': {'min_value': 1, 'max_value': 31},
+            'run_month': {'min_value': 1, 'max_value': 12},
+        }
+
+
+class FragranceSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Fragrance
+        exclude = ['user']
+        read_only_fields = ['added_at']
 
 
 class PasswordResetConfirmSerializer(serializers.Serializer):
@@ -152,6 +154,10 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
         return attrs
 
 
+class PasswordResetRequestSerializer(serializers.Serializer):
+    email = serializers.EmailField()
+
+
 class PlanSerializer(serializers.ModelSerializer):
     """
     Deliberately excludes stripe_price_id (and every other internal field):
@@ -165,21 +171,15 @@ class PlanSerializer(serializers.ModelSerializer):
         fields = ["slug", "name", "amount_cents", "currency", "billing_interval"]
 
 
-class CheckoutCreateSerializer(serializers.Serializer):
-    """
-    Only a plan slug -- an opaque key into the server-owned Plan table.
-    A client-supplied price_id is never a recognized field here, so DRF
-    silently ignores it rather than accepting it; BillingCheckoutView always
-    resolves the Stripe Price id itself via Plan.objects.get(slug=...).
-    """
-
-    slug = serializers.SlugField()
+class PreferenceProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PreferenceProfile
+        exclude = ['user']
+        read_only_fields = ['generated_at']
 
 
-class ChangePlanSerializer(serializers.Serializer):
-    """Only a plan slug, resolved server-side to a Plan; never a price id."""
-
-    plan = serializers.SlugField()
+class RecommendationRatingSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(choices=FRAGRANCE_STATUSES)
 
 
 class RecommendationRunSerializer(serializers.ModelSerializer):

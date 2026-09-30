@@ -16,6 +16,7 @@ import anthropic
 import openai
 import stripe
 
+
 # Both SDKs default to a 600s read timeout with 2 retries, far exceeding
 # gunicorn's --timeout 120 (docker-compose.yaml). Every provider's client
 # construction should pass this explicitly so a single slow/hung call fails
@@ -23,6 +24,35 @@ import stripe
 # on gunicorn's worker-kill as the only backstop. Comfortably under 120s even
 # accounting for the SDKs' own internal retries.
 PROVIDER_TIMEOUT_SECONDS = 90.0
+
+
+class StructuredOutputError(Exception):
+    """
+    Raised by an adapter when a provider's response cannot be parsed into the
+    dict the caller asked for — malformed JSON, a refusal, a missing content
+    block, etc. Never a bare KeyError/AttributeError/IndexError bubbling out of
+    SDK response internals.
+    """
+
+
+@runtime_checkable
+class StructuredLLMProvider(Protocol):
+    def generate_structured(
+        self,
+        *,
+        prompt: str,
+        tool_name: str,
+        description: str,
+        schema: dict,
+        max_tokens: int,
+    ) -> dict:
+        """
+        Issue one structured-output call and return the parsed response as a
+        dict matching `schema`. Must force the model to return exactly that
+        shape (Anthropic: forced tool_choice; OpenAI/Qwen: strict json_schema
+        response_format) — never fall back to free-text parsing.
+        """
+        ...
 
 
 def sanitize_sdk_error_message(exc: Exception) -> str:
@@ -57,32 +87,3 @@ def sanitize_sdk_error_message(exc: Exception) -> str:
     if isinstance(exc, stripe.StripeError):
         return "Stripe rejected the request. Check the Stripe configuration and try again."
     return str(exc)
-
-
-class StructuredOutputError(Exception):
-    """
-    Raised by an adapter when a provider's response cannot be parsed into the
-    dict the caller asked for — malformed JSON, a refusal, a missing content
-    block, etc. Never a bare KeyError/AttributeError/IndexError bubbling out of
-    SDK response internals.
-    """
-
-
-@runtime_checkable
-class StructuredLLMProvider(Protocol):
-    def generate_structured(
-        self,
-        *,
-        prompt: str,
-        tool_name: str,
-        description: str,
-        schema: dict,
-        max_tokens: int,
-    ) -> dict:
-        """
-        Issue one structured-output call and return the parsed response as a
-        dict matching `schema`. Must force the model to return exactly that
-        shape (Anthropic: forced tool_choice; OpenAI/Qwen: strict json_schema
-        response_format) — never fall back to free-text parsing.
-        """
-        ...

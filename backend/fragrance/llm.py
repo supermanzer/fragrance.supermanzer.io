@@ -19,10 +19,10 @@ from .models import (
     RecommendationRun,
 )
 
+
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
 # Tool schemas — define the structured output shape for each LLM call.
 #
 # `*_SCHEMA` constants are the inner JSON Schema object only (no vendor
@@ -31,12 +31,100 @@ logger = logging.getLogger(__name__)
 # assembles its own request shape from (tool_name, description, schema) —
 # keeping the envelope out of these constants is what stops a vendor-specific
 # shape from leaking into every adapter.
-# ---------------------------------------------------------------------------
 
-PROFILE_TOOL_NAME = "create_profile"
-PROFILE_TOOL_DESCRIPTION = (
-    "Create a fragrance preference profile from the user collection."
+
+CANDIDATES_PROMPT = """\
+You are a fragrance expert selecting 5 fragrances to recommend.
+
+User preference profile:
+- Loved notes: {loved_notes}
+- Liked notes: {liked_notes}
+- Disliked notes: {disliked_notes}
+- Currently owns: {owns_list}
+
+Previously recommended (do not select): {past_recommendations}
+
+Search results:
+{search_results}
+
+Select exactly 5 specific, purchasable fragrances from the search results. Requirements:
+- Match the user's taste profile
+- Not already owned or previously recommended
+- One fragrance per house
+
+Use the select_candidates tool to return your selections."""
+
+
+CANDIDATES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "candidates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "house": {"type": "string"},
+                },
+                "required": ["name", "house"],
+            },
+            "minItems": 5,
+            "maxItems": 5,
+        },
+    },
+    "required": ["candidates"],
+}
+
+
+CANDIDATES_TOOL_DESCRIPTION = (
+    "Select exactly 5 fragrances to recommend, one per fragrance house."
 )
+
+
+CANDIDATES_TOOL_NAME = "select_candidates"
+
+
+EMAIL_CONTENT_PROMPT = """\
+You are a fragrance expert writing a personalized monthly recommendation email.
+
+User preference profile:
+- Loved notes: {loved_notes}
+- Liked notes: {liked_notes}
+
+This month's fragrances:
+{picks}
+
+Write a warm 2-3 sentence intro referencing specific aspects of the user's taste, then one concise \
+rationale sentence per fragrance explaining why it suits them. \
+Use the generate_email_content tool to return your response."""
+
+
+EMAIL_CONTENT_TOOL_DESCRIPTION = (
+    "Generate a personalized intro and per-fragrance rationale for the "
+    "recommendation email."
+)
+
+
+EMAIL_CONTENT_TOOL_NAME = "generate_email_content"
+
+
+EXPECTED_CANDIDATE_COUNT = 5
+
+
+PROFILE_PROMPT = """\
+You are a fragrance expert analyzing a user's collection to build a preference profile.
+
+Fragrance collection:
+{collection}
+
+Previously recommended (never recommend these again):
+{past_recommendations}
+
+Analyze the collection to identify loved, liked, and disliked notes, then derive two distinct \
+search queries that would surface fragrances matching this user's taste. \
+Use the create_profile tool to return your analysis."""
+
+
 PROFILE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -67,35 +155,35 @@ PROFILE_SCHEMA = {
     ],
 }
 
-CANDIDATES_TOOL_NAME = "select_candidates"
-CANDIDATES_TOOL_DESCRIPTION = (
-    "Select exactly 5 fragrances to recommend, one per fragrance house."
-)
-CANDIDATES_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "candidates": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "house": {"type": "string"},
-                },
-                "required": ["name", "house"],
-            },
-            "minItems": 5,
-            "maxItems": 5,
-        },
-    },
-    "required": ["candidates"],
-}
-EXPECTED_CANDIDATE_COUNT = 5
 
-REPLACEMENT_TOOL_NAME = "select_replacement"
-REPLACEMENT_TOOL_DESCRIPTION = (
-    "Select one replacement fragrance for a candidate that failed verification."
+PROFILE_TOOL_DESCRIPTION = (
+    "Create a fragrance preference profile from the user collection."
 )
+
+
+PROFILE_TOOL_NAME = "create_profile"
+
+
+REPLACEMENT_PROMPT = """\
+A fragrance candidate could not be verified in search results and must be replaced.
+
+Failed candidate: {failed_name}
+
+User preference profile:
+- Loved notes: {loved_notes}
+- Liked notes: {liked_notes}
+- Disliked notes: {disliked_notes}
+
+Previously recommended (do not select): {past_recommendations}
+
+Search results for the failed candidate:
+{search_results}
+
+Select one alternative fragrance that appears in the search results, matches the user's taste, \
+and is not in the previously recommended list. \
+Use the select_replacement tool to return your selection."""
+
+
 REPLACEMENT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -105,11 +193,13 @@ REPLACEMENT_SCHEMA = {
     "required": ["name", "house"],
 }
 
-EMAIL_CONTENT_TOOL_NAME = "generate_email_content"
-EMAIL_CONTENT_TOOL_DESCRIPTION = (
-    "Generate a personalized intro and per-fragrance rationale for the "
-    "recommendation email."
+
+REPLACEMENT_TOOL_DESCRIPTION = (
+    "Select one replacement fragrance for a candidate that failed verification."
 )
+
+
+REPLACEMENT_TOOL_NAME = "select_replacement"
 
 
 class CandidateCountError(ValueError):
@@ -168,81 +258,55 @@ def build_email_content_tool_schema(confirmed_names: list[str]) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Prompt templates
-# ---------------------------------------------------------------------------
+def generate_email_content(
+    run_id: int, verified_picks: list[dict], provider: StructuredLLMProvider
+) -> None:
+    """
+    LLM call #4. Updates Recommendation rows with rationale and stores the intro on the run.
+    verified_picks contains both 'confirmed' and 'replaced' entries; only confirmed picks
+    receive rationale and appear in the email.
+    """
+    run = RecommendationRun.objects.select_related("profile").get(id=run_id)
+    profile = run.profile
 
-PROFILE_PROMPT = """\
-You are a fragrance expert analyzing a user's collection to build a preference profile.
+    # id order matches creation order — recs are inserted sequentially in search.py.
+    recs = list(
+        Recommendation.objects.filter(run_id=run_id, status="confirmed").order_by(
+            "id"
+        )
+    )
+    confirmed_names = [rec.name for rec in recs]
 
-Fragrance collection:
-{collection}
+    confirmed = [p for p in verified_picks if p["status"] == "confirmed"]
+    picks_text = "\n".join(f"- {p['name']} by {p['house']}" for p in confirmed)
 
-Previously recommended (never recommend these again):
-{past_recommendations}
+    result = provider.generate_structured(
+        prompt=EMAIL_CONTENT_PROMPT.format(
+            loved_notes=profile.loved_notes,
+            liked_notes=profile.liked_notes,
+            picks=picks_text,
+        ),
+        tool_name=EMAIL_CONTENT_TOOL_NAME,
+        description=EMAIL_CONTENT_TOOL_DESCRIPTION,
+        schema=build_email_content_tool_schema(confirmed_names=confirmed_names),
+        max_tokens=2048,
+    )
 
-Analyze the collection to identify loved, liked, and disliked notes, then derive two distinct \
-search queries that would surface fragrances matching this user's taste. \
-Use the create_profile tool to return your analysis."""
+    rationale_map = {r["name"]: r["rationale"] for r in result["rationales"]}
+    for rec in recs:
+        rec.rationale = rationale_map.get(rec.name, "")
+    Recommendation.objects.bulk_update(objs=recs, fields=["rationale"])
 
-CANDIDATES_PROMPT = """\
-You are a fragrance expert selecting 5 fragrances to recommend.
+    missing_names = [rec.name for rec in recs if not rec.rationale]
+    if missing_names:
+        logger.warning(
+            "generate_email_content: run_id=%s missing rationale for pick(s): %s",
+            run_id,
+            ", ".join(missing_names),
+        )
 
-User preference profile:
-- Loved notes: {loved_notes}
-- Liked notes: {liked_notes}
-- Disliked notes: {disliked_notes}
-- Currently owns: {owns_list}
-
-Previously recommended (do not select): {past_recommendations}
-
-Search results:
-{search_results}
-
-Select exactly 5 specific, purchasable fragrances from the search results. Requirements:
-- Match the user's taste profile
-- Not already owned or previously recommended
-- One fragrance per house
-
-Use the select_candidates tool to return your selections."""
-
-REPLACEMENT_PROMPT = """\
-A fragrance candidate could not be verified in search results and must be replaced.
-
-Failed candidate: {failed_name}
-
-User preference profile:
-- Loved notes: {loved_notes}
-- Liked notes: {liked_notes}
-- Disliked notes: {disliked_notes}
-
-Previously recommended (do not select): {past_recommendations}
-
-Search results for the failed candidate:
-{search_results}
-
-Select one alternative fragrance that appears in the search results, matches the user's taste, \
-and is not in the previously recommended list. \
-Use the select_replacement tool to return your selection."""
-
-EMAIL_CONTENT_PROMPT = """\
-You are a fragrance expert writing a personalized monthly recommendation email.
-
-User preference profile:
-- Loved notes: {loved_notes}
-- Liked notes: {liked_notes}
-
-This month's fragrances:
-{picks}
-
-Write a warm 2-3 sentence intro referencing specific aspects of the user's taste, then one concise \
-rationale sentence per fragrance explaining why it suits them. \
-Use the generate_email_content tool to return your response."""
-
-
-# ---------------------------------------------------------------------------
-# LLM pipeline functions — called in order by fragrance/tasks.py
-# ---------------------------------------------------------------------------
+    run.intro = result["intro"]
+    run.save(update_fields=["intro"])
 
 
 def generate_preference_profile(
@@ -355,54 +419,3 @@ def select_replacement(
             f"select_replacement response missing required field(s): {result!r}"
         )
     return result
-
-
-def generate_email_content(
-    run_id: int, verified_picks: list[dict], provider: StructuredLLMProvider
-) -> None:
-    """
-    LLM call #4. Updates Recommendation rows with rationale and stores the intro on the run.
-    verified_picks contains both 'confirmed' and 'replaced' entries; only confirmed picks
-    receive rationale and appear in the email.
-    """
-    run = RecommendationRun.objects.select_related("profile").get(id=run_id)
-    profile = run.profile
-
-    # id order matches creation order — recs are inserted sequentially in search.py.
-    recs = list(
-        Recommendation.objects.filter(run_id=run_id, status="confirmed").order_by(
-            "id"
-        )
-    )
-    confirmed_names = [rec.name for rec in recs]
-
-    confirmed = [p for p in verified_picks if p["status"] == "confirmed"]
-    picks_text = "\n".join(f"- {p['name']} by {p['house']}" for p in confirmed)
-
-    result = provider.generate_structured(
-        prompt=EMAIL_CONTENT_PROMPT.format(
-            loved_notes=profile.loved_notes,
-            liked_notes=profile.liked_notes,
-            picks=picks_text,
-        ),
-        tool_name=EMAIL_CONTENT_TOOL_NAME,
-        description=EMAIL_CONTENT_TOOL_DESCRIPTION,
-        schema=build_email_content_tool_schema(confirmed_names=confirmed_names),
-        max_tokens=2048,
-    )
-
-    rationale_map = {r["name"]: r["rationale"] for r in result["rationales"]}
-    for rec in recs:
-        rec.rationale = rationale_map.get(rec.name, "")
-    Recommendation.objects.bulk_update(objs=recs, fields=["rationale"])
-
-    missing_names = [rec.name for rec in recs if not rec.rationale]
-    if missing_names:
-        logger.warning(
-            "generate_email_content: run_id=%s missing rationale for pick(s): %s",
-            run_id,
-            ", ".join(missing_names),
-        )
-
-    run.intro = result["intro"]
-    run.save(update_fields=["intro"])

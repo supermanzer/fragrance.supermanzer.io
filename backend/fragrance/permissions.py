@@ -20,6 +20,7 @@ from rest_framework.views import APIView
 
 from .models import Subscription
 
+
 # NOTE: is_staff doubles as the subscription-exemption flag. A migration
 # grandfathers every user who existed when the gate shipped by setting it, and
 # staff bypass both these permission classes and the run quota (not the
@@ -44,13 +45,6 @@ class SubscriptionRequired(APIException):
         }
 
 
-def user_has_active_access(*, user: object) -> bool:
-    if getattr(user, "is_staff", False) or getattr(user, "is_superuser", False):
-        return True
-    subscription = Subscription.objects.filter(user=user).first()
-    return subscription is not None and subscription.has_active_access
-
-
 class HasActiveSubscription(BasePermission):
     def has_permission(self, request: Request, view: APIView) -> bool:
         if not (request.user and request.user.is_authenticated):
@@ -69,3 +63,10 @@ class HasActiveSubscriptionOrReadOnly(BasePermission):
         if user_has_active_access(user=request.user):
             return True
         raise SubscriptionRequired()
+
+
+def user_has_active_access(*, user: object) -> bool:
+    if getattr(user, "is_staff", False) or getattr(user, "is_superuser", False):
+        return True
+    subscription = Subscription.objects.filter(user=user).first()
+    return subscription is not None and subscription.has_active_access

@@ -17,16 +17,18 @@ from .openai_provider import OpenAIProvider
 from .qwen_provider import QwenProvider
 
 
-class NoActiveAIModelConfigError(Exception):
-    """Raised when no AIModelConfig row has is_active=True."""
+_CREDENTIAL_SETTINGS: dict[str, str] = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "qwen": "DASHSCOPE_API_KEY",
+}
 
 
-class UnknownProviderFamilyError(Exception):
-    """Raised when an AIModelConfig.family value has no registered adapter class."""
-
-
-class MissingCredentialError(Exception):
-    """Raised when the resolved family's API key is not configured in settings."""
+_PROVIDER_CLASSES: dict[str, type] = {
+    "anthropic": AnthropicProvider,
+    "openai": OpenAIProvider,
+    "qwen": QwenProvider,
+}
 
 
 class EnumEnforcementUnsupportedError(Exception):
@@ -39,33 +41,16 @@ class EnumEnforcementUnsupportedError(Exception):
     """
 
 
-_CREDENTIAL_SETTINGS: dict[str, str] = {
-    "anthropic": "ANTHROPIC_API_KEY",
-    "openai": "OPENAI_API_KEY",
-    "qwen": "DASHSCOPE_API_KEY",
-}
-
-_PROVIDER_CLASSES: dict[str, type] = {
-    "anthropic": AnthropicProvider,
-    "openai": OpenAIProvider,
-    "qwen": QwenProvider,
-}
+class MissingCredentialError(Exception):
+    """Raised when the resolved family's API key is not configured in settings."""
 
 
-def _get_api_key(*, family: str) -> str:
-    from django.conf import settings
+class NoActiveAIModelConfigError(Exception):
+    """Raised when no AIModelConfig row has is_active=True."""
 
-    setting_name = _CREDENTIAL_SETTINGS.get(family)
-    if setting_name is None:
-        raise UnknownProviderFamilyError(f"Unknown AI provider family: {family!r}")
-    api_key = getattr(settings, setting_name, "")
-    if not api_key:
-        raise MissingCredentialError(
-            f"{setting_name} is not configured — cannot resolve a provider for "
-            f"family {family!r}. Set it in backend/.env and recreate the "
-            f"container so it's picked up."
-        )
-    return api_key
+
+class UnknownProviderFamilyError(Exception):
+    """Raised when an AIModelConfig.family value has no registered adapter class."""
 
 
 def build_provider(*, config: AIModelConfig) -> StructuredLLMProvider:
@@ -118,3 +103,19 @@ def get_active_provider(*, enum_required: bool = False) -> StructuredLLMProvider
     """Convenience wrapper: get_active_config + build_provider in one call."""
     config = get_active_config(enum_required=enum_required)
     return build_provider(config=config)
+
+
+def _get_api_key(*, family: str) -> str:
+    from django.conf import settings
+
+    setting_name = _CREDENTIAL_SETTINGS.get(family)
+    if setting_name is None:
+        raise UnknownProviderFamilyError(f"Unknown AI provider family: {family!r}")
+    api_key = getattr(settings, setting_name, "")
+    if not api_key:
+        raise MissingCredentialError(
+            f"{setting_name} is not configured — cannot resolve a provider for "
+            f"family {family!r}. Set it in backend/.env and recreate the "
+            f"container so it's picked up."
+        )
+    return api_key

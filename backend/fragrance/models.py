@@ -2,50 +2,61 @@ from django.contrib.auth.models import User
 from django.db import IntegrityError, models, transaction
 from django.utils import timezone
 
+
 # Constants
 AI_PROVIDER_FAMILIES = [
     ("anthropic", "Anthropic"),
     ("openai", "OpenAI"),
     ("qwen", "Qwen"),
 ]
-FREQUENCIES = [
-    ("weekly", "Weekly"),
-    ("monthly", "Monthly"),
-    ("yearly", "Yearly"),
-]
-FRAGRANCE_STATUSES = [
-    ("own", "Own"),
-    ("like", "Like"),
-    ("dislike", "Don't Like"),
-]
-PICK_STATUSES = [("confirmed", "Confirmed"), ("replaced", "Replaced")]
-RUN_STATUSES = [
-    ("pending", "Pending"),
-    ("running", "Running"),
-    ("done", "Done"),
-    ("failed", "Failed"),
-]
-EMAIL_STATUSES = [
-    ("pending", "Pending"),
-    ("sent", "Sent"),
-    ("failed", "Failed"),
-]
+
+
 BETA_SIGNUP_STATUSES = [
     ("pending", "Pending"),
     ("approved", "Approved"),
     ("converted", "Converted"),
     ("rejected", "Rejected"),
 ]
+
+
 BILLING_INTERVALS = [
     ("month", "Month"),
     ("year", "Year"),
 ]
-SUBSCRIPTION_STATUSES = [
-    ("none", "None"),
-    ("checkout_started", "Checkout Started"),
-    ("active", "Active"),
-    ("revoked", "Revoked"),
+
+
+EMAIL_STATUSES = [
+    ("pending", "Pending"),
+    ("sent", "Sent"),
+    ("failed", "Failed"),
 ]
+
+
+FRAGRANCE_STATUSES = [
+    ("own", "Own"),
+    ("like", "Like"),
+    ("dislike", "Don't Like"),
+]
+
+
+FREQUENCIES = [
+    ("weekly", "Weekly"),
+    ("monthly", "Monthly"),
+    ("yearly", "Yearly"),
+]
+
+
+PICK_STATUSES = [("confirmed", "Confirmed"), ("replaced", "Replaced")]
+
+
+RUN_STATUSES = [
+    ("pending", "Pending"),
+    ("running", "Running"),
+    ("done", "Done"),
+    ("failed", "Failed"),
+]
+
+
 STRIPE_EVENT_STATUSES = [
     ("received", "Received"),
     ("processed", "Processed"),
@@ -53,56 +64,58 @@ STRIPE_EVENT_STATUSES = [
 ]
 
 
-# Create your models here.
-class FragranceConfig(models.Model):
-    """Per-user configuration.  One config per user"""
-
-    user = models.OneToOneField(
-        User, on_delete=models.CASCADE, related_name="fragrance_config"
-    )
-    recipient_email = models.EmailField(
-        help_text="The email we will deliver fragrance recommendations to"
-    )
-    # Fragrance Recommendation Schedule
-    frequency = models.CharField(
-        max_length=10, choices=FREQUENCIES, default="monthly"
-    )
-    run_hour = models.PositiveIntegerField(default=9)
-    run_day_of_week = models.PositiveIntegerField(
-        default=1
-    )  # Only weekly (0=Sun, 1=Mon, etc)
-    run_day_of_month = models.PositiveIntegerField(default=1)
-    run_month = models.PositiveBigIntegerField(default=1)
+SUBSCRIPTION_STATUSES = [
+    ("none", "None"),
+    ("checkout_started", "Checkout Started"),
+    ("active", "Active"),
+    ("revoked", "Revoked"),
+]
 
 
-class Fragrance(models.Model):
+class ActiveAIModelConfigConflictError(Exception):
     """
-    The user's fragrane collection, managed directly through the app.
-
-    This is the authoritative source for preference analysis
+    Raised when two concurrent saves both try to make a different
+    AIModelConfig row the active one. The DB-level partial unique index
+    (`one_active_ai_model_config`) is the actual source of truth — this
+    exists to translate the resulting IntegrityError into a message an admin
+    can act on, since the raw constraint-violation text names an index, not
+    a row.
     """
 
-    user = models.ForeignKey(
-        User, on_delete=models.CASCADE, related_name="fragrances"
-    )
-    name = models.CharField(max_length=255)
-    house = models.CharField(max_length=255)
-    status = models.CharField(max_length=10, choices=FRAGRANCE_STATUSES)
-    notes = models.TextField(
-        blank=True
-    )  # Users personal notes "I like it because..."
-    added_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-    source_recommendation = models.OneToOneField(
-        "Recommendation",
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="promoted_fragrance",
-    )  # if a user records a fragrance from a recommendation, linking the recommendation record it came from
 
-    class Meta:
-        unique_together = [["user", "name"]]
+class Plan(models.Model):
+    """
+    Billing terms and usage terms, deliberately separate. `billing_interval`
+    and `access_days_granted` describe how the customer is charged;
+    `quota_period_days` and `max_runs_per_quota_period` describe how often
+    the pipeline may run. They must stay separate fields: a single period
+    reused for both would let an annual subscriber take twelve runs on the
+    first of January. The quota chokepoint (a later slice) reads
+    `quota_period_days` on every plan and must never look at
+    `billing_interval`.
+    """
+
+    name = models.CharField(max_length=100)
+    slug = models.SlugField(unique=True)
+    stripe_price_id = models.CharField(max_length=255, unique=True)
+    amount_cents = models.PositiveIntegerField()
+    currency = models.CharField(max_length=3, default="usd")
+    billing_interval = models.CharField(max_length=5, choices=BILLING_INTERVALS)
+    # Fallback only for computing access_expires_at when Stripe's own
+    # period_end is unavailable -- prefer the value Stripe supplies.
+    access_days_granted = models.PositiveIntegerField()
+    quota_period_days = models.PositiveIntegerField(default=30)
+    max_runs_per_quota_period = models.PositiveIntegerField(default=1)
+    failed_run_grace = models.PositiveIntegerField(default=1)
+    # "Offered at checkout / plan-change target" -- never "honoured at
+    # renewal". billing._match_plan_line matches ANY Plan row regardless of
+    # this flag, on purpose: a retired row (see seed_plans --rotate-price)
+    # must keep granting for subscribers still billing on its Price even
+    # after it stops being offered here.
+    is_active = models.BooleanField(default=True)
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.slug})"
 
 
 class PreferenceProfile(models.Model):
@@ -152,101 +165,6 @@ class RecommendationRun(models.Model):
     provider_model_id = models.CharField(max_length=255, blank=True)
 
 
-class Recommendation(models.Model):
-    """
-    A single frangrance pick from a single run.
-    Serves as a permanent degdupilication guard and can be used to generate Fragrance records if the user tries a recommendation and provides feedback.
-    """
-
-    user = models.ForeignKey(
-        User, on_delete=models.CASCADE, related_name="recommendations"
-    )
-    run = models.ForeignKey(
-        RecommendationRun, on_delete=models.CASCADE, related_name="picks"
-    )
-    name = models.CharField(max_length=255)
-    house = models.CharField(max_length=255)
-    status = models.CharField(
-        max_length=10, choices=PICK_STATUSES, default="confirmed"
-    )
-    rationale = models.TextField()  # LLM generated: why was this recommended?
-    search_source_url = models.URLField(blank=True)
-
-
-class BetaSignup(models.Model):
-    """
-    A waitlist row, created before any User exists. This is triage, not
-    authorization -- manual admin approval (a later slice) is the real gate.
-    `normalized_email` (not `email`) carries the uniqueness constraint, since
-    a raw-email unique index does nothing against `+tag` or Gmail-dot abuse;
-    see services.normalize_email for the normalization rule it depends on.
-    """
-
-    email = models.EmailField()
-    normalized_email = models.EmailField(unique=True)
-    status = models.CharField(
-        max_length=10, choices=BETA_SIGNUP_STATUSES, default="pending"
-    )
-    created_at = models.DateTimeField(auto_now_add=True)
-    approved_at = models.DateTimeField(null=True, blank=True)
-    approved_by = models.ForeignKey(
-        User,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="approved_beta_signups",
-    )
-    invited_user = models.ForeignKey(
-        User,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="beta_signups",
-    )
-    # HMAC of the submitting client's IP, salted with SECRET_KEY -- never the
-    # raw address. Enough to correlate abuse across signups without storing PII.
-    signup_ip_hash = models.CharField(max_length=64, blank=True)
-    converted_at = models.DateTimeField(null=True, blank=True)
-
-    def __str__(self) -> str:
-        return f"{self.email} ({self.status})"
-
-
-class Plan(models.Model):
-    """
-    Billing terms and usage terms, deliberately separate. `billing_interval`
-    and `access_days_granted` describe how the customer is charged;
-    `quota_period_days` and `max_runs_per_quota_period` describe how often
-    the pipeline may run. They must stay separate fields: a single period
-    reused for both would let an annual subscriber take twelve runs on the
-    first of January. The quota chokepoint (a later slice) reads
-    `quota_period_days` on every plan and must never look at
-    `billing_interval`.
-    """
-
-    name = models.CharField(max_length=100)
-    slug = models.SlugField(unique=True)
-    stripe_price_id = models.CharField(max_length=255, unique=True)
-    amount_cents = models.PositiveIntegerField()
-    currency = models.CharField(max_length=3, default="usd")
-    billing_interval = models.CharField(max_length=5, choices=BILLING_INTERVALS)
-    # Fallback only for computing access_expires_at when Stripe's own
-    # period_end is unavailable -- prefer the value Stripe supplies.
-    access_days_granted = models.PositiveIntegerField()
-    quota_period_days = models.PositiveIntegerField(default=30)
-    max_runs_per_quota_period = models.PositiveIntegerField(default=1)
-    failed_run_grace = models.PositiveIntegerField(default=1)
-    # "Offered at checkout / plan-change target" -- never "honoured at
-    # renewal". billing._match_plan_line matches ANY Plan row regardless of
-    # this flag, on purpose: a retired row (see seed_plans --rotate-price)
-    # must keep granting for subscribers still billing on its Price even
-    # after it stops being offered here.
-    is_active = models.BooleanField(default=True)
-
-    def __str__(self) -> str:
-        return f"{self.name} ({self.slug})"
-
-
 class Subscription(models.Model):
     """
     The authorization record -- one per User. Access is granted only by
@@ -281,67 +199,6 @@ class Subscription(models.Model):
         if self.access_expires_at is None:
             return False
         return self.status == "active" and self.access_expires_at > timezone.now()
-
-
-class StripeEvent(models.Model):
-    """
-    Delivery-level idempotency: stops Stripe's duplicate *deliveries* of the
-    same event id. This is distinct from ProcessedPayment, which stops a
-    *period being granted twice* for the same money -- the webhook and the
-    Checkout success page reach the same fulfillment function by different
-    routes, and only one of them has an event id.
-    """
-
-    stripe_event_id = models.CharField(max_length=255, unique=True)
-    event_type = models.CharField(max_length=255)
-    stripe_created = models.DateTimeField(null=True, blank=True)
-    received_at = models.DateTimeField(auto_now_add=True)
-    processed_at = models.DateTimeField(null=True, blank=True)
-    status = models.CharField(max_length=10, choices=STRIPE_EVENT_STATUSES, default="received")
-    error = models.TextField(blank=True)
-    payload = models.JSONField(default=dict, blank=True)
-
-    def __str__(self) -> str:
-        return f"{self.stripe_event_id} ({self.event_type}, {self.status})"
-
-
-class ProcessedPayment(models.Model):
-    """
-    Grant-level idempotency, keyed on the Stripe **invoice** id, not the
-    PaymentIntent id. One invoice is one billing period is one grant; a
-    single PaymentIntent can settle several invoices, so keying on it would
-    under-grant. The insert happens inside the same transaction that extends
-    Subscription.access_expires_at, so a concurrent double-call loses the
-    race on this unique constraint rather than granting two periods.
-    """
-
-    stripe_invoice_id = models.CharField(max_length=255, unique=True)
-    stripe_payment_intent_id = models.CharField(max_length=255, blank=True)
-    stripe_subscription_id = models.CharField(max_length=255, blank=True)
-    subscription = models.ForeignKey(
-        Subscription,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="processed_payments",
-    )
-    amount_paid_cents = models.PositiveIntegerField()
-    applied_at = models.DateTimeField(auto_now_add=True)
-    period_end = models.DateTimeField(null=True, blank=True)
-
-    def __str__(self) -> str:
-        return self.stripe_invoice_id
-
-
-class ActiveAIModelConfigConflictError(Exception):
-    """
-    Raised when two concurrent saves both try to make a different
-    AIModelConfig row the active one. The DB-level partial unique index
-    (`one_active_ai_model_config`) is the actual source of truth — this
-    exists to translate the resulting IntegrityError into a message an admin
-    can act on, since the raw constraint-violation text names an index, not
-    a row.
-    """
 
 
 class AIModelConfig(models.Model):
@@ -408,3 +265,165 @@ class AIModelConfig(models.Model):
                     "Another admin just changed the active AI model at the "
                     "same time. Reload and try again."
                 ) from exc
+
+
+class BetaSignup(models.Model):
+    """
+    A waitlist row, created before any User exists. This is triage, not
+    authorization -- manual admin approval (a later slice) is the real gate.
+    `normalized_email` (not `email`) carries the uniqueness constraint, since
+    a raw-email unique index does nothing against `+tag` or Gmail-dot abuse;
+    see services.normalize_email for the normalization rule it depends on.
+    """
+
+    email = models.EmailField()
+    normalized_email = models.EmailField(unique=True)
+    status = models.CharField(
+        max_length=10, choices=BETA_SIGNUP_STATUSES, default="pending"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="approved_beta_signups",
+    )
+    invited_user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="beta_signups",
+    )
+    # HMAC of the submitting client's IP, salted with SECRET_KEY -- never the
+    # raw address. Enough to correlate abuse across signups without storing PII.
+    signup_ip_hash = models.CharField(max_length=64, blank=True)
+    converted_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self) -> str:
+        return f"{self.email} ({self.status})"
+
+
+class Fragrance(models.Model):
+    """
+    The user's fragrane collection, managed directly through the app.
+
+    This is the authoritative source for preference analysis
+    """
+
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name="fragrances"
+    )
+    name = models.CharField(max_length=255)
+    house = models.CharField(max_length=255)
+    status = models.CharField(max_length=10, choices=FRAGRANCE_STATUSES)
+    notes = models.TextField(
+        blank=True
+    )  # Users personal notes "I like it because..."
+    added_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    source_recommendation = models.OneToOneField(
+        "Recommendation",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="promoted_fragrance",
+    )  # if a user records a fragrance from a recommendation, linking the recommendation record it came from
+
+    class Meta:
+        unique_together = [["user", "name"]]
+
+
+# Create your models here.
+class FragranceConfig(models.Model):
+    """Per-user configuration.  One config per user"""
+
+    user = models.OneToOneField(
+        User, on_delete=models.CASCADE, related_name="fragrance_config"
+    )
+    recipient_email = models.EmailField(
+        help_text="The email we will deliver fragrance recommendations to"
+    )
+    # Fragrance Recommendation Schedule
+    frequency = models.CharField(
+        max_length=10, choices=FREQUENCIES, default="monthly"
+    )
+    run_hour = models.PositiveIntegerField(default=9)
+    run_day_of_week = models.PositiveIntegerField(
+        default=1
+    )  # Only weekly (0=Sun, 1=Mon, etc)
+    run_day_of_month = models.PositiveIntegerField(default=1)
+    run_month = models.PositiveBigIntegerField(default=1)
+
+
+class ProcessedPayment(models.Model):
+    """
+    Grant-level idempotency, keyed on the Stripe **invoice** id, not the
+    PaymentIntent id. One invoice is one billing period is one grant; a
+    single PaymentIntent can settle several invoices, so keying on it would
+    under-grant. The insert happens inside the same transaction that extends
+    Subscription.access_expires_at, so a concurrent double-call loses the
+    race on this unique constraint rather than granting two periods.
+    """
+
+    stripe_invoice_id = models.CharField(max_length=255, unique=True)
+    stripe_payment_intent_id = models.CharField(max_length=255, blank=True)
+    stripe_subscription_id = models.CharField(max_length=255, blank=True)
+    subscription = models.ForeignKey(
+        Subscription,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="processed_payments",
+    )
+    amount_paid_cents = models.PositiveIntegerField()
+    applied_at = models.DateTimeField(auto_now_add=True)
+    period_end = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self) -> str:
+        return self.stripe_invoice_id
+
+
+class Recommendation(models.Model):
+    """
+    A single frangrance pick from a single run.
+    Serves as a permanent degdupilication guard and can be used to generate Fragrance records if the user tries a recommendation and provides feedback.
+    """
+
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name="recommendations"
+    )
+    run = models.ForeignKey(
+        RecommendationRun, on_delete=models.CASCADE, related_name="picks"
+    )
+    name = models.CharField(max_length=255)
+    house = models.CharField(max_length=255)
+    status = models.CharField(
+        max_length=10, choices=PICK_STATUSES, default="confirmed"
+    )
+    rationale = models.TextField()  # LLM generated: why was this recommended?
+    search_source_url = models.URLField(blank=True)
+
+
+class StripeEvent(models.Model):
+    """
+    Delivery-level idempotency: stops Stripe's duplicate *deliveries* of the
+    same event id. This is distinct from ProcessedPayment, which stops a
+    *period being granted twice* for the same money -- the webhook and the
+    Checkout success page reach the same fulfillment function by different
+    routes, and only one of them has an event id.
+    """
+
+    stripe_event_id = models.CharField(max_length=255, unique=True)
+    event_type = models.CharField(max_length=255)
+    stripe_created = models.DateTimeField(null=True, blank=True)
+    received_at = models.DateTimeField(auto_now_add=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(max_length=10, choices=STRIPE_EVENT_STATUSES, default="received")
+    error = models.TextField(blank=True)
+    payload = models.JSONField(default=dict, blank=True)
+
+    def __str__(self) -> str:
+        return f"{self.stripe_event_id} ({self.event_type}, {self.status})"

@@ -7,9 +7,12 @@ from django.db import transaction
 
 from fragrance.models import Recommendation, RecommendationRun
 
+
+SENTINEL_DATE = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+
 # Distinguishes the sentinel from real runs so get_or_create is idempotent across re-runs.
 SENTINEL_TASK_ID = "pre-migration-sentinel"
-SENTINEL_DATE = datetime(2000, 1, 1, tzinfo=timezone.utc)
 
 
 class Command(BaseCommand):

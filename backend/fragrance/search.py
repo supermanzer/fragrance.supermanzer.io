@@ -14,6 +14,23 @@ from .ai_providers.base import StructuredLLMProvider
 from .models import PreferenceProfile, Recommendation
 
 
+def run_discovery_searches(user_id: int, profile_id: int) -> str:
+    """Pipeline step 2. Fires both search angles and returns combined result text."""
+    profile = PreferenceProfile.objects.get(id=profile_id)
+    results_1 = searxng_search(query=profile.search_angle_1)
+    results_2 = searxng_search(query=profile.search_angle_2)
+    return "\n\n".join(
+        [
+            _format_results(
+                label=f"Search 1: {profile.search_angle_1}", results=results_1
+            ),
+            _format_results(
+                label=f"Search 2: {profile.search_angle_2}", results=results_2
+            ),
+        ]
+    )
+
+
 def searxng_search(query: str, num_results: int = 5) -> list[dict]:
     resp = requests.get(
         url=f"{settings.SEARXNG_URL}/search",
@@ -31,30 +48,6 @@ def searxng_search(query: str, num_results: int = 5) -> list[dict]:
         }
         for r in results
     ]
-
-
-def _format_results(label: str, results: list[dict]) -> str:
-    lines = "\n".join(
-        f"- {r['title']}: {r['content']} ({r['url']})" for r in results
-    )
-    return f"{label}:\n{lines}"
-
-
-def run_discovery_searches(user_id: int, profile_id: int) -> str:
-    """Pipeline step 2. Fires both search angles and returns combined result text."""
-    profile = PreferenceProfile.objects.get(id=profile_id)
-    results_1 = searxng_search(query=profile.search_angle_1)
-    results_2 = searxng_search(query=profile.search_angle_2)
-    return "\n\n".join(
-        [
-            _format_results(
-                label=f"Search 1: {profile.search_angle_1}", results=results_1
-            ),
-            _format_results(
-                label=f"Search 2: {profile.search_angle_2}", results=results_2
-            ),
-        ]
-    )
 
 
 def verify_candidates(
@@ -160,3 +153,10 @@ def verify_candidates(
             )
 
     return all_picks
+
+
+def _format_results(label: str, results: list[dict]) -> str:
+    lines = "\n".join(
+        f"- {r['title']}: {r['content']} ({r['url']})" for r in results
+    )
+    return f"{label}:\n{lines}"

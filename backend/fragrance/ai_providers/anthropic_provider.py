@@ -11,34 +11,6 @@ import anthropic
 from .base import PROVIDER_TIMEOUT_SECONDS, StructuredOutputError
 
 
-def extract_tool_result(response: "anthropic.types.Message") -> dict:
-    # tool_choice forces exactly one tool_use block; this is always the first content item.
-    for block in response.content:
-        if block.type == "tool_use":
-            return block.input
-    raise StructuredOutputError(
-        f"No tool_use block in Anthropic response. Stop reason: {response.stop_reason}"
-    )
-
-
-def _contains_enum(node: object) -> bool:
-    """
-    True if `node` (a JSON Schema fragment) declares an `enum` anywhere. Used
-    to decide whether to request Anthropic's `strict: true` tool mode, which
-    grammar-enforces `enum` but requires `additionalProperties: false`
-    throughout and does not support minItems/maxItems — so it's requested only
-    for schemas that actually need enum enforcement (currently: email content
-    only), preserving the pre-refactor request shape for the other three calls.
-    """
-    if isinstance(node, dict):
-        if "enum" in node:
-            return True
-        return any(_contains_enum(node=value) for value in node.values())
-    if isinstance(node, list):
-        return any(_contains_enum(node=item) for item in node)
-    return False
-
-
 class AnthropicProvider:
     def __init__(self, *, model_id: str, api_key: str, workspace_id: str = "") -> None:
         self._model_id = model_id
@@ -91,3 +63,31 @@ class AnthropicProvider:
             messages=[{"role": "user", "content": prompt}],
         )
         return extract_tool_result(response=response)
+
+
+def extract_tool_result(response: "anthropic.types.Message") -> dict:
+    # tool_choice forces exactly one tool_use block; this is always the first content item.
+    for block in response.content:
+        if block.type == "tool_use":
+            return block.input
+    raise StructuredOutputError(
+        f"No tool_use block in Anthropic response. Stop reason: {response.stop_reason}"
+    )
+
+
+def _contains_enum(node: object) -> bool:
+    """
+    True if `node` (a JSON Schema fragment) declares an `enum` anywhere. Used
+    to decide whether to request Anthropic's `strict: true` tool mode, which
+    grammar-enforces `enum` but requires `additionalProperties: false`
+    throughout and does not support minItems/maxItems — so it's requested only
+    for schemas that actually need enum enforcement (currently: email content
+    only), preserving the pre-refactor request shape for the other three calls.
+    """
+    if isinstance(node, dict):
+        if "enum" in node:
+            return True
+        return any(_contains_enum(node=value) for value in node.values())
+    if isinstance(node, list):
+        return any(_contains_enum(node=item) for item in node)
+    return False

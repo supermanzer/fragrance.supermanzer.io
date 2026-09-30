@@ -35,71 +35,8 @@ from django.core.management.base import BaseCommand, CommandError
 from fragrance import billing
 from fragrance.ai_providers.base import sanitize_sdk_error_message
 
+
 _METADATA = {"app": "fragrances", "managed_by": "configure_stripe_portal"}
-
-
-def desired_configuration() -> ConfigurationUpdateParams:
-    """
-    Returned type is ConfigurationUpdateParams (the superset of the two
-    Stripe accepts -- it additionally has "active", which this dict never
-    sets). The .create() call site below casts to ConfigurationCreateParams:
-    both are all-NotRequired TypedDicts describing the identical wire body,
-    but their nested sub-TypedDicts (e.g. *Features) are nominally distinct
-    types, so a type checker won't treat one as freely assignable to the
-    other even though the JSON shapes are the same -- cast documents that
-    deliberately, rather than re-declaring this whole dict twice.
-    """
-    from django.conf import settings
-
-    frontend_url = settings.FRONTEND_URL.rstrip("/")
-    config: ConfigurationUpdateParams = {
-        "business_profile": {
-            "headline": "Manage your Fragrances subscription",
-            "terms_of_service_url": f"{frontend_url}/terms",
-            "privacy_policy_url": f"{frontend_url}/privacy",
-        },
-        "features": {
-            "payment_method_update": {"enabled": True},
-            "invoice_history": {"enabled": True},
-            "customer_update": {"enabled": True, "allowed_updates": ["email"]},
-            "subscription_cancel": {
-                "enabled": True,
-                "mode": "at_period_end",
-                "proration_behavior": "none",
-                "cancellation_reason": {
-                    "enabled": True,
-                    "options": [
-                        "too_expensive",
-                        "missing_features",
-                        "unused",
-                        "switched_service",
-                        "other",
-                    ],
-                },
-            },
-            "subscription_update": {"enabled": False},
-        },
-        "login_page": {"enabled": False},
-        "metadata": dict(_METADATA),
-    }
-    # "subscription_pause" is not a real key of Stripe's portal Configuration
-    # Features (confirmed: absent from both ConfigurationCreateParamsFeatures
-    # and ConfigurationUpdateParamsFeatures in stripe-python 15.6.1 -- ty's
-    # invalid-key check caught this). It has silently never actually
-    # configured anything; flagged for operator review rather than changed
-    # here, since the intended control (does Stripe's portal expose a pause
-    # toggle at all in this API version, and if so under what key) is a real
-    # product/business question, not a typo this file's author could safely
-    # guess at. Assigned after construction, with its own narrowly-scoped
-    # suppression, so the dict literal above still type-checks cleanly.
-    config["features"]["subscription_pause"] = {"enabled": False}  # ty: ignore[invalid-key]
-    return config
-
-
-def _is_ours(*, configuration: object) -> bool:
-    metadata = getattr(configuration, "metadata", None)
-    md = metadata.to_dict() if metadata is not None and hasattr(metadata, "to_dict") else {}
-    return all(md.get(key) == value for key, value in _METADATA.items())
 
 
 class Command(BaseCommand):
@@ -175,3 +112,67 @@ class Command(BaseCommand):
             )
         )
         self.stdout.write(f"Set STRIPE_PORTAL_CONFIGURATION_ID={configuration.id} in backend/.env")
+
+
+def desired_configuration() -> ConfigurationUpdateParams:
+    """
+    Returned type is ConfigurationUpdateParams (the superset of the two
+    Stripe accepts -- it additionally has "active", which this dict never
+    sets). The .create() call site below casts to ConfigurationCreateParams:
+    both are all-NotRequired TypedDicts describing the identical wire body,
+    but their nested sub-TypedDicts (e.g. *Features) are nominally distinct
+    types, so a type checker won't treat one as freely assignable to the
+    other even though the JSON shapes are the same -- cast documents that
+    deliberately, rather than re-declaring this whole dict twice.
+    """
+    from django.conf import settings
+
+    frontend_url = settings.FRONTEND_URL.rstrip("/")
+    config: ConfigurationUpdateParams = {
+        "business_profile": {
+            "headline": "Manage your Fragrances subscription",
+            "terms_of_service_url": f"{frontend_url}/terms",
+            "privacy_policy_url": f"{frontend_url}/privacy",
+        },
+        "features": {
+            "payment_method_update": {"enabled": True},
+            "invoice_history": {"enabled": True},
+            "customer_update": {"enabled": True, "allowed_updates": ["email"]},
+            "subscription_cancel": {
+                "enabled": True,
+                "mode": "at_period_end",
+                "proration_behavior": "none",
+                "cancellation_reason": {
+                    "enabled": True,
+                    "options": [
+                        "too_expensive",
+                        "missing_features",
+                        "unused",
+                        "switched_service",
+                        "other",
+                    ],
+                },
+            },
+            "subscription_update": {"enabled": False},
+        },
+        "login_page": {"enabled": False},
+        "metadata": dict(_METADATA),
+    }
+    # "subscription_pause" is not a real key of Stripe's portal Configuration
+    # Features (confirmed: absent from both ConfigurationCreateParamsFeatures
+    # and ConfigurationUpdateParamsFeatures in stripe-python 15.6.1 -- ty's
+    # invalid-key check caught this). It has silently never actually
+    # configured anything; flagged for operator review rather than changed
+    # here, since the intended control (does Stripe's portal expose a pause
+    # toggle at all in this API version, and if so under what key) is a real
+    # product/business question, not a typo this file's author could safely
+    # guess at. Assigned after construction, with its own narrowly-scoped
+    # suppression, so the dict literal above still type-checks cleanly.
+    config["features"]["subscription_pause"] = {"enabled": False}  # ty: ignore[invalid-key]
+    return config
+
+
+def _is_ours(*, configuration: object) -> bool:
+    metadata = getattr(configuration, "metadata", None)
+    md = metadata.to_dict() if metadata is not None and hasattr(metadata, "to_dict") else {}
+    return all(md.get(key) == value for key, value in _METADATA.items())

@@ -67,19 +67,29 @@ from ..llm import (
 from ..models import AIModelConfig
 from .base import StructuredLLMProvider, StructuredOutputError, sanitize_sdk_error_message
 
+
 DUMMY_COLLECTION = (
     "Aventus by Creed [own] - my signature scent\n"
     "Bleu de Chanel by Chanel [like]\n"
     "Sauvage by Dior [dislike] - too generic"
 )
+
+
+DUMMY_CONFIRMED_NAMES = ["Aventus", "Bleu de Chanel"]
+
+
 DUMMY_PAST_RECOMMENDATIONS = "Silver Mountain Water"
+
+
+DUMMY_PICKS_TEXT = "- Aventus by Creed\n- Bleu de Chanel by Chanel"
+
+
 DUMMY_SEARCH_RESULTS = (
     "Search 1: niche oud fragrances:\n"
     "- Oud Wood by Tom Ford: A smoky, creamy oud blend. (https://example.com/oud-wood)\n"
     "- Black Afgano by Nasomatto: A dense, resinous oud. (https://example.com/black-afgano)"
 )
-DUMMY_CONFIRMED_NAMES = ["Aventus", "Bleu de Chanel"]
-DUMMY_PICKS_TEXT = "- Aventus by Creed\n- Bleu de Chanel by Chanel"
+
 
 # The one check that actually requests enum-constrained structured output
 # (see anthropic_provider.py's _contains_enum: it's the only schema of the
@@ -104,198 +114,6 @@ class CheckResult:
     # keyword CheckResult(...) construction elsewhere (tests, callers) is
     # unaffected.
     inconclusive: bool = False
-
-
-def _validate_against_schema(data: object, schema: dict, path: str = "$") -> list[str]:
-    """
-    Minimal JSON Schema validator covering exactly the subset our four
-    pipeline schemas use (object/array/string, properties/required/items/enum/
-    additionalProperties/minItems/maxItems) — not a general-purpose validator.
-    """
-    errors: list[str] = []
-    expected_type = schema.get("type")
-
-    if expected_type == "object":
-        if not isinstance(data, dict):
-            return [f"{path}: expected object, got {type(data).__name__}"]
-        for required_key in schema.get("required", []):
-            if required_key not in data:
-                errors.append(f"{path}: missing required property '{required_key}'")
-        properties = schema.get("properties", {})
-        for key, value in data.items():
-            if key in properties:
-                errors.extend(
-                    _validate_against_schema(
-                        data=value, schema=properties[key], path=f"{path}.{key}"
-                    )
-                )
-            elif schema.get("additionalProperties") is False:
-                errors.append(f"{path}: unexpected property '{key}'")
-
-    elif expected_type == "array":
-        if not isinstance(data, list):
-            return [f"{path}: expected array, got {type(data).__name__}"]
-        item_schema = schema.get("items")
-        if item_schema:
-            for index, item in enumerate(data):
-                errors.extend(
-                    _validate_against_schema(
-                        data=item, schema=item_schema, path=f"{path}[{index}]"
-                    )
-                )
-        min_items = schema.get("minItems")
-        if min_items is not None and len(data) < min_items:
-            errors.append(f"{path}: expected at least {min_items} items, got {len(data)}")
-        max_items = schema.get("maxItems")
-        if max_items is not None and len(data) > max_items:
-            errors.append(f"{path}: expected at most {max_items} items, got {len(data)}")
-
-    elif expected_type == "string":
-        if not isinstance(data, str):
-            errors.append(f"{path}: expected string, got {type(data).__name__}")
-        elif "enum" in schema and data not in schema["enum"]:
-            errors.append(f"{path}: value {data!r} not in enum {schema['enum']}")
-
-    return errors
-
-
-def _build_checks() -> list[dict]:
-    return [
-        {
-            "label": "profile",
-            "prompt": PROFILE_PROMPT.format(
-                collection=DUMMY_COLLECTION,
-                past_recommendations=DUMMY_PAST_RECOMMENDATIONS,
-            ),
-            "tool_name": PROFILE_TOOL_NAME,
-            "description": PROFILE_TOOL_DESCRIPTION,
-            "schema": PROFILE_SCHEMA,
-            "max_tokens": 1024,
-        },
-        {
-            "label": "candidates",
-            "prompt": CANDIDATES_PROMPT.format(
-                loved_notes="oud, amber",
-                liked_notes="citrus",
-                disliked_notes="aquatic",
-                owns_list="Aventus",
-                past_recommendations=DUMMY_PAST_RECOMMENDATIONS,
-                search_results=DUMMY_SEARCH_RESULTS,
-            ),
-            "tool_name": CANDIDATES_TOOL_NAME,
-            "description": CANDIDATES_TOOL_DESCRIPTION,
-            "schema": CANDIDATES_SCHEMA,
-            "max_tokens": 1024,
-        },
-        {
-            "label": "replacement",
-            "prompt": REPLACEMENT_PROMPT.format(
-                failed_name="Silver Mountain Water",
-                loved_notes="oud, amber",
-                liked_notes="citrus",
-                disliked_notes="aquatic",
-                past_recommendations=DUMMY_PAST_RECOMMENDATIONS,
-                search_results=DUMMY_SEARCH_RESULTS,
-            ),
-            "tool_name": REPLACEMENT_TOOL_NAME,
-            "description": REPLACEMENT_TOOL_DESCRIPTION,
-            "schema": REPLACEMENT_SCHEMA,
-            "max_tokens": 512,
-        },
-        {
-            "label": ENUM_CHECK_LABEL,
-            "prompt": EMAIL_CONTENT_PROMPT.format(
-                loved_notes="oud, amber",
-                liked_notes="citrus",
-                picks=DUMMY_PICKS_TEXT,
-            ),
-            "tool_name": EMAIL_CONTENT_TOOL_NAME,
-            "description": EMAIL_CONTENT_TOOL_DESCRIPTION,
-            "schema": build_email_content_tool_schema(
-                confirmed_names=DUMMY_CONFIRMED_NAMES
-            ),
-            "max_tokens": 2048,
-        },
-    ]
-
-
-def run_verification_checks(*, provider: StructuredLLMProvider) -> list[CheckResult]:
-    """
-    Issues all four pipeline schema shapes against `provider` and validates
-    each response. Never raises for a per-check provider/schema failure —
-    those become a failing CheckResult so the caller can report all four
-    outcomes together; only truly unexpected bugs in this function itself
-    would propagate.
-    """
-    results: list[CheckResult] = []
-    for check in _build_checks():
-        label = check["label"]
-        try:
-            response = provider.generate_structured(
-                prompt=check["prompt"],
-                tool_name=check["tool_name"],
-                description=check["description"],
-                schema=check["schema"],
-                max_tokens=check["max_tokens"],
-            )
-        except StructuredOutputError as exc:
-            # The model answered and the answer couldn't be turned into the
-            # requested shape — a genuine, definitive failure.
-            results.append(CheckResult(label=label, passed=False, detail=f"provider error: {exc}"))
-            continue
-        except (anthropic.BadRequestError, openai.BadRequestError) as exc:
-            # A BadRequestError only carries capability signal on the one
-            # check that actually requests strict/enum-constrained tool mode
-            # (ENUM_CHECK_LABEL — see anthropic_provider.py's _contains_enum
-            # gating and openai_provider.py's unconditional strict mode). On
-            # that check, a 400 rejecting the request shape IS the signal
-            # this harness exists to catch, so it's a definitive failure.
-            #
-            # On the other three checks (profile, candidates, replacement),
-            # nothing about the request ever asks for strict/enum mode, so a
-            # BadRequestError there cannot mean "the model rejected
-            # strict-schema mode" — it means something else entirely
-            # (malformed request, invalid model_id, missing required header,
-            # bad max_tokens, a misconfigured workspace id, ...). Treating
-            # that as capability evidence is wrong, so it's routed to the
-            # same inconclusive=True treatment as the general `except
-            # Exception` branch below: uninformative about model capability
-            # either way.
-            results.append(
-                CheckResult(
-                    label=label,
-                    passed=False,
-                    inconclusive=label != ENUM_CHECK_LABEL,
-                    detail=f"provider rejected request: {sanitize_sdk_error_message(exc)}",
-                )
-            )
-            continue
-        except Exception as exc:  # connectivity/auth/rate-limit/timeout — no signal about model capability
-            # Sanitized: an OpenAI/Qwen auth failure's exception text can
-            # carry a vendor-masked key fragment, and both the command's
-            # stdout and the admin's message_user() are known capture
-            # surfaces for this project. inconclusive=True: the request
-            # never reached the model (or never got a real response back),
-            # so this carries zero information about the model's actual
-            # capability — persist_verification_results must not treat it as
-            # evidence of anything.
-            results.append(
-                CheckResult(
-                    label=label,
-                    passed=False,
-                    inconclusive=True,
-                    detail=f"unexpected error: {sanitize_sdk_error_message(exc)}",
-                )
-            )
-            continue
-
-        errors = _validate_against_schema(data=response, schema=check["schema"])
-        if errors:
-            results.append(CheckResult(label=label, passed=False, detail="; ".join(errors)))
-        else:
-            results.append(CheckResult(label=label, passed=True, detail="ok"))
-
-    return results
 
 
 @dataclass(frozen=True)
@@ -387,3 +205,195 @@ def persist_verification_results(
     config.supports_strict_schema = False
     config.save(update_fields=["supports_enum_enforcement", "supports_strict_schema"])
     return PersistOutcome(config=config, status="partial_fail")
+
+
+def run_verification_checks(*, provider: StructuredLLMProvider) -> list[CheckResult]:
+    """
+    Issues all four pipeline schema shapes against `provider` and validates
+    each response. Never raises for a per-check provider/schema failure —
+    those become a failing CheckResult so the caller can report all four
+    outcomes together; only truly unexpected bugs in this function itself
+    would propagate.
+    """
+    results: list[CheckResult] = []
+    for check in _build_checks():
+        label = check["label"]
+        try:
+            response = provider.generate_structured(
+                prompt=check["prompt"],
+                tool_name=check["tool_name"],
+                description=check["description"],
+                schema=check["schema"],
+                max_tokens=check["max_tokens"],
+            )
+        except StructuredOutputError as exc:
+            # The model answered and the answer couldn't be turned into the
+            # requested shape — a genuine, definitive failure.
+            results.append(CheckResult(label=label, passed=False, detail=f"provider error: {exc}"))
+            continue
+        except (anthropic.BadRequestError, openai.BadRequestError) as exc:
+            # A BadRequestError only carries capability signal on the one
+            # check that actually requests strict/enum-constrained tool mode
+            # (ENUM_CHECK_LABEL — see anthropic_provider.py's _contains_enum
+            # gating and openai_provider.py's unconditional strict mode). On
+            # that check, a 400 rejecting the request shape IS the signal
+            # this harness exists to catch, so it's a definitive failure.
+            #
+            # On the other three checks (profile, candidates, replacement),
+            # nothing about the request ever asks for strict/enum mode, so a
+            # BadRequestError there cannot mean "the model rejected
+            # strict-schema mode" — it means something else entirely
+            # (malformed request, invalid model_id, missing required header,
+            # bad max_tokens, a misconfigured workspace id, ...). Treating
+            # that as capability evidence is wrong, so it's routed to the
+            # same inconclusive=True treatment as the general `except
+            # Exception` branch below: uninformative about model capability
+            # either way.
+            results.append(
+                CheckResult(
+                    label=label,
+                    passed=False,
+                    inconclusive=label != ENUM_CHECK_LABEL,
+                    detail=f"provider rejected request: {sanitize_sdk_error_message(exc)}",
+                )
+            )
+            continue
+        except Exception as exc:  # connectivity/auth/rate-limit/timeout — no signal about model capability
+            # Sanitized: an OpenAI/Qwen auth failure's exception text can
+            # carry a vendor-masked key fragment, and both the command's
+            # stdout and the admin's message_user() are known capture
+            # surfaces for this project. inconclusive=True: the request
+            # never reached the model (or never got a real response back),
+            # so this carries zero information about the model's actual
+            # capability — persist_verification_results must not treat it as
+            # evidence of anything.
+            results.append(
+                CheckResult(
+                    label=label,
+                    passed=False,
+                    inconclusive=True,
+                    detail=f"unexpected error: {sanitize_sdk_error_message(exc)}",
+                )
+            )
+            continue
+
+        errors = _validate_against_schema(data=response, schema=check["schema"])
+        if errors:
+            results.append(CheckResult(label=label, passed=False, detail="; ".join(errors)))
+        else:
+            results.append(CheckResult(label=label, passed=True, detail="ok"))
+
+    return results
+
+
+def _build_checks() -> list[dict]:
+    return [
+        {
+            "label": "profile",
+            "prompt": PROFILE_PROMPT.format(
+                collection=DUMMY_COLLECTION,
+                past_recommendations=DUMMY_PAST_RECOMMENDATIONS,
+            ),
+            "tool_name": PROFILE_TOOL_NAME,
+            "description": PROFILE_TOOL_DESCRIPTION,
+            "schema": PROFILE_SCHEMA,
+            "max_tokens": 1024,
+        },
+        {
+            "label": "candidates",
+            "prompt": CANDIDATES_PROMPT.format(
+                loved_notes="oud, amber",
+                liked_notes="citrus",
+                disliked_notes="aquatic",
+                owns_list="Aventus",
+                past_recommendations=DUMMY_PAST_RECOMMENDATIONS,
+                search_results=DUMMY_SEARCH_RESULTS,
+            ),
+            "tool_name": CANDIDATES_TOOL_NAME,
+            "description": CANDIDATES_TOOL_DESCRIPTION,
+            "schema": CANDIDATES_SCHEMA,
+            "max_tokens": 1024,
+        },
+        {
+            "label": "replacement",
+            "prompt": REPLACEMENT_PROMPT.format(
+                failed_name="Silver Mountain Water",
+                loved_notes="oud, amber",
+                liked_notes="citrus",
+                disliked_notes="aquatic",
+                past_recommendations=DUMMY_PAST_RECOMMENDATIONS,
+                search_results=DUMMY_SEARCH_RESULTS,
+            ),
+            "tool_name": REPLACEMENT_TOOL_NAME,
+            "description": REPLACEMENT_TOOL_DESCRIPTION,
+            "schema": REPLACEMENT_SCHEMA,
+            "max_tokens": 512,
+        },
+        {
+            "label": ENUM_CHECK_LABEL,
+            "prompt": EMAIL_CONTENT_PROMPT.format(
+                loved_notes="oud, amber",
+                liked_notes="citrus",
+                picks=DUMMY_PICKS_TEXT,
+            ),
+            "tool_name": EMAIL_CONTENT_TOOL_NAME,
+            "description": EMAIL_CONTENT_TOOL_DESCRIPTION,
+            "schema": build_email_content_tool_schema(
+                confirmed_names=DUMMY_CONFIRMED_NAMES
+            ),
+            "max_tokens": 2048,
+        },
+    ]
+
+
+def _validate_against_schema(data: object, schema: dict, path: str = "$") -> list[str]:
+    """
+    Minimal JSON Schema validator covering exactly the subset our four
+    pipeline schemas use (object/array/string, properties/required/items/enum/
+    additionalProperties/minItems/maxItems) — not a general-purpose validator.
+    """
+    errors: list[str] = []
+    expected_type = schema.get("type")
+
+    if expected_type == "object":
+        if not isinstance(data, dict):
+            return [f"{path}: expected object, got {type(data).__name__}"]
+        for required_key in schema.get("required", []):
+            if required_key not in data:
+                errors.append(f"{path}: missing required property '{required_key}'")
+        properties = schema.get("properties", {})
+        for key, value in data.items():
+            if key in properties:
+                errors.extend(
+                    _validate_against_schema(
+                        data=value, schema=properties[key], path=f"{path}.{key}"
+                    )
+                )
+            elif schema.get("additionalProperties") is False:
+                errors.append(f"{path}: unexpected property '{key}'")
+
+    elif expected_type == "array":
+        if not isinstance(data, list):
+            return [f"{path}: expected array, got {type(data).__name__}"]
+        item_schema = schema.get("items")
+        if item_schema:
+            for index, item in enumerate(data):
+                errors.extend(
+                    _validate_against_schema(
+                        data=item, schema=item_schema, path=f"{path}[{index}]"
+                    )
+                )
+        min_items = schema.get("minItems")
+        if min_items is not None and len(data) < min_items:
+            errors.append(f"{path}: expected at least {min_items} items, got {len(data)}")
+        max_items = schema.get("maxItems")
+        if max_items is not None and len(data) > max_items:
+            errors.append(f"{path}: expected at most {max_items} items, got {len(data)}")
+
+    elif expected_type == "string":
+        if not isinstance(data, str):
+            errors.append(f"{path}: expected string, got {type(data).__name__}")
+        elif "enum" in schema and data not in schema["enum"]:
+            errors.append(f"{path}: value {data!r} not in enum {schema['enum']}")
+
+    return errors

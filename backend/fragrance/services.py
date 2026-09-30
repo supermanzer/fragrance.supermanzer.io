@@ -25,7 +25,60 @@ from .models import (
 )
 from .permissions import SubscriptionRequired
 
+
+logger = logging.getLogger(__name__)
+
+
+# The beat schedule is calendar-monthly (day_of_month), but quota_period_days
+# is a rolling window measured in exact days. A 28- or 30-day month, or
+# sub-second scheduling jitter around a 30-day boundary, can put the
+# previous scheduled run inside the new rolling window even though a full
+# calendar month has genuinely elapsed. Only the beat path gets this slack;
+# a manual API trigger keeps the strict rolling quota_period_days so a user
+# cannot use the "Run Now" button to get extra runs.
+BEAT_QUOTA_TOLERANCE = timedelta(days=4)
+
+
+BETA_INVITE_MAX_AGE = 60 * 60 * 24 * 14  # 14 days
+
+
+BETA_INVITE_SALT = "beta-invite"
+
+
+DEFAULT_FAILED_RUN_GRACE = 1
+
+
+DEFAULT_MAX_RUNS_PER_QUOTA_PERIOD = 1
+
+
+# Terms used when a subscription has no Plan (staff, comped/plan-less rows).
+DEFAULT_QUOTA_PERIOD_DAYS = 30
+
+
+EMAIL_REVERT_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
+
+
+EMAIL_REVERT_MAX_TOKEN_LENGTH = 2048
+
+
+EMAIL_REVERT_SALT = "email-revert"
+
+
+# A pending/running row older than this is presumed stranded (worker OOM,
+# SIGKILL, container recreate) and no longer blocks a new trigger; the
+# reap_stale_runs task marks it failed. Comfortably above the task's worst
+# case: 3 attempts x 1500s hard limit + 2 x 300s retry backoff.
+IN_FLIGHT_MAX_AGE = timedelta(hours=2)
+
+
+RECOMMENDATION_FEEDBACK_MAX_AGE = 60 * 60 * 24 * 90  # 90 days
+
+
+RECOMMENDATION_FEEDBACK_SALT = "recommendation-feedback"
+
+
 REQUIRED_COLUMNS = {"fragrance", "status", "house", "notes"}
+
 
 # Maps normalized CSV values → internal status. Keys are lowercased + stripped.
 STATUS_ALIASES: dict[str, str] = {
@@ -38,58 +91,55 @@ STATUS_ALIASES: dict[str, str] = {
 }
 
 
-@transaction.atomic
-def import_collection_from_csv(user: User, file_obj: IO[str]) -> dict:
+TriggerSource = Literal["api", "beat"]
+
+
+# Domains where the mailbox provider itself ignores dots in the local part,
+# so "r.yan@gmail.com" and "ryan@gmail.com" are the same inbox. Only Gmail's
+# own domains are known to do this widely enough to normalize on safely --
+# stripping dots elsewhere would risk merging two genuinely distinct addresses.
+_DOT_INSENSITIVE_DOMAINS = {"gmail.com", "googlemail.com"}
+
+
+_IN_FLIGHT_STATUSES = ("pending", "running")
+
+
+_MAX_USERNAME_LENGTH = 150
+
+
+# A failed run does not burn the allowance; everything else that was
+# dispatched does.
+_QUOTA_CONSUMING_STATUSES = ("pending", "running", "done")
+
+
+class BetaInviteTokenError(Exception):
+    """Base for resolve_beta_invite_signup rejections."""
+
+
+class BetaInviteTokenAlreadyUsedError(BetaInviteTokenError):
     """
-    Parse a CSV and upsert Fragrance records for the given user.
-
-    Accepts any text-mode file-like object (open(), InMemoryUploadedFile wrapped
-    in a UTF-8 codec reader, StringIO, etc.).
-
-    Returns {'created': int, 'updated': int, 'skipped': int}.
-    Raises ValueError for structural problems (missing columns, empty file).
-    Row-level problems (empty name, invalid status) increment skipped silently.
+    Signup status is already 'converted'. The only rejection reason this
+    project's BetaAcceptView tells the caller apart from a generic invalid
+    link: a signed invite token is not something a third party can guess or
+    type in the way an email address can, so holding one already proves
+    receipt of the one email it was sent in, and "already used" leaks
+    nothing that holder didn't already have. Maps to 409
+    {"code": "already_used"}.
     """
-    reader = csv.DictReader(file_obj)
 
-    if not reader.fieldnames:
-        raise ValueError("CSV file is empty or has no header row.")
 
-    lowered_fieldnames = {f.lower() for f in reader.fieldnames}
-    missing = REQUIRED_COLUMNS - lowered_fieldnames
-    if missing:
-        raise ValueError(
-            f"Missing required columns: {', '.join(sorted(missing))}. "
-            f"Found: {', '.join(reader.fieldnames)}"
-        )
+class BetaInviteTokenInvalidError(BetaInviteTokenError):
+    """
+    Token missing/tampered/expired, unknown signup, wrong status (anything
+    other than 'approved' or 'converted'), or invited_user missing/inactive/
+    mismatched. Maps to 400 {"code": "invalid_or_expired"}.
+    """
 
-    created = updated = skipped = 0
 
-    for row in reader:
-        row = {k.lower(): v for k, v in row.items()}
-        name = row["fragrance"].strip().removeprefix("'")
-        status = STATUS_ALIASES.get(row["status"].strip().lower())
-        house = row.get("house", "").strip().removeprefix("'")
-        notes = row.get("notes", "").strip().removeprefix("'")
-
-        if not name or status is None:
-            skipped += 1
-            continue
-
-        _, was_created = Fragrance.objects.update_or_create(
-            user=user,
-            name=name,
-            defaults={"house": house, "status": status, "notes": notes},
-        )
-        if was_created:
-            created += 1
-        else:
-            updated += 1
-
-    if created == 0 and updated == 0 and skipped == 0:
-        raise ValueError("CSV contains no data rows.")
-
-    return {"created": created, "updated": updated, "skipped": skipped}
+class QuotaExceeded(Exception):
+    def __init__(self, *, next_eligible_at: datetime | None) -> None:
+        super().__init__("Run quota exhausted for this period.")
+        self.next_eligible_at = next_eligible_at
 
 
 class RatingConflict(Exception):
@@ -98,6 +148,10 @@ class RatingConflict(Exception):
     def __init__(self, existing_action: str) -> None:
         self.existing_action = existing_action
         super().__init__(f"Recommendation already rated as {existing_action}.")
+
+
+class RunInProgress(Exception):
+    pass
 
 
 @transaction.atomic
@@ -188,86 +242,62 @@ def apply_recommendation_rating(recommendation: Recommendation, action: str) -> 
         return _resolve_after_race(recommendation=recommendation, action=action, original=exc)
 
 
-def _resolve_after_race(
-    recommendation: Recommendation, action: str, original: IntegrityError
-) -> tuple[Fragrance, bool]:
-    """Re-resolves from committed state after apply_recommendation_rating loses a create/claim race."""
-    linked = Fragrance.objects.filter(source_recommendation_id=recommendation.id).first()
-    if linked is not None:
-        if linked.status == action:
-            return linked, False
-        raise RatingConflict(existing_action=linked.status)
-
-    existing = Fragrance.objects.filter(
-        user=recommendation.user, name=recommendation.name
-    ).first()
-    if existing is not None:
-        raise RatingConflict(existing_action=existing.status)
-
-    raise original
+def default_schedule_for(*, user_id: int) -> tuple[int, int]:
+    """
+    Stable, evenly-spread (day_of_month, hour) derived from the user id: 672
+    slots. Day is 1-28 only -- 29-31 would silently skip short months.
+    Deterministic, so a user always lands in the same slot.
+    """
+    return (user_id % 28) + 1, (user_id // 28) % 24
 
 
-RECOMMENDATION_FEEDBACK_SALT = "recommendation-feedback"
-RECOMMENDATION_FEEDBACK_MAX_AGE = 60 * 60 * 24 * 90  # 90 days
+def derive_unique_username(*, email: str) -> str:
+    """
+    Derives a unique Django username from an email's local part.
+
+    Two different addresses can reduce to the same local part (ryan@gmail.com
+    and ryan@example.com both slugify to "ryan"), so this always checks for an
+    existing row and appends a numeric suffix on collision. The base is
+    truncated up front to leave room for that suffix, rather than truncating
+    the final candidate -- truncating after appending could silently reproduce
+    a collision by chopping the suffix back off.
+    """
+    local = email.split("@", 1)[0]
+    base = slugify(local).replace("-", "_") or "user"
+    base = base[: _MAX_USERNAME_LENGTH - 5]
+
+    candidate = base
+    suffix = 1
+    while User.objects.filter(username=candidate).exists():
+        suffix += 1
+        candidate = f"{base}_{suffix}"[:_MAX_USERNAME_LENGTH]
+    return candidate
+
+
+def generate_beta_invite_token(*, signup: BetaSignup) -> str:
+    """
+    Signs a payload identifying which BetaSignup/User an invite-accept link
+    represents. Deliberately not Django's PasswordResetTokenGenerator --
+    PASSWORD_RESET_TIMEOUT is 1 hour, and raising it globally to suit a
+    14-day invite window would weaken actual password resets.
+    """
+    payload = {"sid": signup.id, "uid": signup.invited_user_id}
+    return signing.dumps(payload, salt=BETA_INVITE_SALT)
+
+
+def generate_email_revert_token(*, user_id: int, old_email: str, new_email: str) -> str:
+    """
+    Signs the "this wasn't me" link put in the old-address notice. The signed
+    addresses are what make the token single-use without a table: it is only
+    honoured while User.email still equals `new`, see billing.revert_customer_email.
+    """
+    return signing.dumps({"uid": user_id, "old": old_email, "new": new_email}, salt=EMAIL_REVERT_SALT)
 
 
 def generate_recommendation_token(recommendation: Recommendation, action: str) -> str:
     """Signs a payload identifying which recommendation/action a feedback link represents."""
     payload = {"rid": recommendation.id, "action": action, "uid": recommendation.user_id}
     return signing.dumps(payload, salt=RECOMMENDATION_FEEDBACK_SALT)
-
-
-def verify_recommendation_token(token: str) -> dict | None:
-    """
-    Decodes and verifies a recommendation feedback token.
-
-    Returns the payload dict on success, or None if the token is missing, tampered,
-    expired, or malformed in any way. Callers should treat None as a generic "not found"
-    so an invalid link carries no signal about whether a matching recommendation exists.
-    """
-    if not token:
-        return None
-    try:
-        payload = signing.loads(
-            token, salt=RECOMMENDATION_FEEDBACK_SALT, max_age=RECOMMENDATION_FEEDBACK_MAX_AGE
-        )
-    except (signing.BadSignature, ValueError, TypeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if {"rid", "action", "uid"} - payload.keys():
-        return None
-    if payload["action"] not in {value for value, _ in FRAGRANCE_STATUSES}:
-        return None
-    return payload
-
-
-# Domains where the mailbox provider itself ignores dots in the local part,
-# so "r.yan@gmail.com" and "ryan@gmail.com" are the same inbox. Only Gmail's
-# own domains are known to do this widely enough to normalize on safely --
-# stripping dots elsewhere would risk merging two genuinely distinct addresses.
-_DOT_INSENSITIVE_DOMAINS = {"gmail.com", "googlemail.com"}
-
-
-def normalize_email(*, email: str) -> str:
-    """
-    Lowercase, strip +tags, and strip dots for Gmail-class domains.
-
-    A `unique` constraint on the raw email does nothing against
-    `ryan+1@gmail.com`, `ryan+2@gmail.com`, or `r.y.a.n@gmail.com` -- all of
-    which land in the same inbox as `ryan@gmail.com`. `BetaSignup`'s unique
-    constraint is keyed on this function's output, not the raw address, so
-    this is the anti-abuse primitive that actually stops one person from
-    occupying many waitlist slots.
-    """
-    email = email.strip().lower()
-    local, sep, domain = email.partition("@")
-    if not sep:
-        return email
-    local = local.split("+", 1)[0]
-    if domain in _DOT_INSENSITIVE_DOMAINS:
-        local = local.replace(".", "")
-    return f"{local}@{domain}"
 
 
 def get_client_ip(*, request: Request) -> str:
@@ -298,6 +328,19 @@ def get_client_ip(*, request: Request) -> str:
     return request.META.get("REMOTE_ADDR", "")
 
 
+def get_or_create_fragrance_config(*, user: User) -> FragranceConfig:
+    """
+    The one place a FragranceConfig is first created with a jittered schedule.
+    Applied only at creation via `defaults` -- get_or_create never overwrites
+    an existing row, so a user's own choice is never touched.
+    """
+    day, hour = default_schedule_for(user_id=user.pk)
+    config, _ = FragranceConfig.objects.get_or_create(
+        user=user, defaults={"run_day_of_month": day, "run_hour": hour}
+    )
+    return config
+
+
 def hash_signup_ip(*, ip: str) -> str:
     """HMACs a client IP with SECRET_KEY so BetaSignup never stores the raw address."""
     return hmac.new(
@@ -305,128 +348,120 @@ def hash_signup_ip(*, ip: str) -> str:
     ).hexdigest()
 
 
-_MAX_USERNAME_LENGTH = 150
-
-
-def derive_unique_username(*, email: str) -> str:
+@transaction.atomic
+def import_collection_from_csv(user: User, file_obj: IO[str]) -> dict:
     """
-    Derives a unique Django username from an email's local part.
+    Parse a CSV and upsert Fragrance records for the given user.
 
-    Two different addresses can reduce to the same local part (ryan@gmail.com
-    and ryan@example.com both slugify to "ryan"), so this always checks for an
-    existing row and appends a numeric suffix on collision. The base is
-    truncated up front to leave room for that suffix, rather than truncating
-    the final candidate -- truncating after appending could silently reproduce
-    a collision by chopping the suffix back off.
+    Accepts any text-mode file-like object (open(), InMemoryUploadedFile wrapped
+    in a UTF-8 codec reader, StringIO, etc.).
+
+    Returns {'created': int, 'updated': int, 'skipped': int}.
+    Raises ValueError for structural problems (missing columns, empty file).
+    Row-level problems (empty name, invalid status) increment skipped silently.
     """
-    local = email.split("@", 1)[0]
-    base = slugify(local).replace("-", "_") or "user"
-    base = base[: _MAX_USERNAME_LENGTH - 5]
+    reader = csv.DictReader(file_obj)
 
-    candidate = base
-    suffix = 1
-    while User.objects.filter(username=candidate).exists():
-        suffix += 1
-        candidate = f"{base}_{suffix}"[:_MAX_USERNAME_LENGTH]
-    return candidate
+    if not reader.fieldnames:
+        raise ValueError("CSV file is empty or has no header row.")
+
+    lowered_fieldnames = {f.lower() for f in reader.fieldnames}
+    missing = REQUIRED_COLUMNS - lowered_fieldnames
+    if missing:
+        raise ValueError(
+            f"Missing required columns: {', '.join(sorted(missing))}. "
+            f"Found: {', '.join(reader.fieldnames)}"
+        )
+
+    created = updated = skipped = 0
+
+    for row in reader:
+        row = {k.lower(): v for k, v in row.items()}
+        name = row["fragrance"].strip().removeprefix("'")
+        status = STATUS_ALIASES.get(row["status"].strip().lower())
+        house = row.get("house", "").strip().removeprefix("'")
+        notes = row.get("notes", "").strip().removeprefix("'")
+
+        if not name or status is None:
+            skipped += 1
+            continue
+
+        _, was_created = Fragrance.objects.update_or_create(
+            user=user,
+            name=name,
+            defaults={"house": house, "status": status, "notes": notes},
+        )
+        if was_created:
+            created += 1
+        else:
+            updated += 1
+
+    if created == 0 and updated == 0 and skipped == 0:
+        raise ValueError("CSV contains no data rows.")
+
+    return {"created": created, "updated": updated, "skipped": skipped}
 
 
-BETA_INVITE_SALT = "beta-invite"
-BETA_INVITE_MAX_AGE = 60 * 60 * 24 * 14  # 14 days
+def in_flight_runs(*, user: User, now: datetime):
+    """Sole definition of "a run is in flight", shared by every guard so they cannot drift."""
+    return RecommendationRun.objects.filter(
+        user=user,
+        status__in=_IN_FLIGHT_STATUSES,
+        triggered_at__gte=now - IN_FLIGHT_MAX_AGE,
+    )
 
 
-def generate_beta_invite_token(*, signup: BetaSignup) -> str:
+def normalize_email(*, email: str) -> str:
     """
-    Signs a payload identifying which BetaSignup/User an invite-accept link
-    represents. Deliberately not Django's PasswordResetTokenGenerator --
-    PASSWORD_RESET_TIMEOUT is 1 hour, and raising it globally to suit a
-    14-day invite window would weaken actual password resets.
+    Lowercase, strip +tags, and strip dots for Gmail-class domains.
+
+    A `unique` constraint on the raw email does nothing against
+    `ryan+1@gmail.com`, `ryan+2@gmail.com`, or `r.y.a.n@gmail.com` -- all of
+    which land in the same inbox as `ryan@gmail.com`. `BetaSignup`'s unique
+    constraint is keyed on this function's output, not the raw address, so
+    this is the anti-abuse primitive that actually stops one person from
+    occupying many waitlist slots.
     """
-    payload = {"sid": signup.id, "uid": signup.invited_user_id}
-    return signing.dumps(payload, salt=BETA_INVITE_SALT)
+    email = email.strip().lower()
+    local, sep, domain = email.partition("@")
+    if not sep:
+        return email
+    local = local.split("+", 1)[0]
+    if domain in _DOT_INSENSITIVE_DOMAINS:
+        local = local.replace(".", "")
+    return f"{local}@{domain}"
 
 
-def verify_beta_invite_token(*, token: str) -> dict | None:
+def quota_snapshot(*, user: User, subscription: Subscription | None) -> dict:
     """
-    Decodes and verifies a beta-invite token. Returns the payload dict on
-    success, or None if the token is missing, tampered, expired, or
-    malformed -- callers should treat None as a generic "invalid or expired
-    link" so a bad token carries no signal about whether a matching signup
-    exists, matching verify_recommendation_token's rule.
+    Frontend-facing quota state. Read-only: no writes, no locks.
+
+    Always evaluated with source="api" (the default), deliberately: this
+    backs the "Run Now" button and the "next eligible" display, both of
+    which describe what a *manual* trigger would do right now. Reporting
+    the beat-tolerant window here would show can_trigger=True for a user
+    whose actual manual trigger would still be refused by the strict
+    rolling window in start_recommendation_run.
     """
-    if not token:
-        return None
-    try:
-        payload = signing.loads(token, salt=BETA_INVITE_SALT, max_age=BETA_INVITE_MAX_AGE)
-    except (signing.BadSignature, ValueError, TypeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if {"sid", "uid"} - payload.keys():
-        return None
-    return payload
-
-
-EMAIL_REVERT_SALT = "email-revert"
-EMAIL_REVERT_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
-EMAIL_REVERT_MAX_TOKEN_LENGTH = 2048
-
-
-def generate_email_revert_token(*, user_id: int, old_email: str, new_email: str) -> str:
-    """
-    Signs the "this wasn't me" link put in the old-address notice. The signed
-    addresses are what make the token single-use without a table: it is only
-    honoured while User.email still equals `new`, see billing.revert_customer_email.
-    """
-    return signing.dumps({"uid": user_id, "old": old_email, "new": new_email}, salt=EMAIL_REVERT_SALT)
-
-
-def verify_email_revert_token(*, token: object) -> dict | None:
-    """
-    Returns {"uid": int, "old": str, "new": str} or None for a missing,
-    non-string, oversized, tampered, expired or malformed token. Callers must
-    treat None as one undifferentiated "invalid or expired" outcome.
-    """
-    if not isinstance(token, str) or not token or len(token) > EMAIL_REVERT_MAX_TOKEN_LENGTH:
-        return None
-    try:
-        payload = signing.loads(token, salt=EMAIL_REVERT_SALT, max_age=EMAIL_REVERT_MAX_AGE)
-    except (signing.BadSignature, ValueError, TypeError):
-        return None
-    if not isinstance(payload, dict):
-        return None
-    if (
-        not isinstance(payload.get("uid"), int)
-        or isinstance(payload.get("uid"), bool)
-        or not isinstance(payload.get("old"), str)
-        or not isinstance(payload.get("new"), str)
-    ):
-        return None
-    return payload
-
-
-class BetaInviteTokenError(Exception):
-    """Base for resolve_beta_invite_signup rejections."""
-
-
-class BetaInviteTokenInvalidError(BetaInviteTokenError):
-    """
-    Token missing/tampered/expired, unknown signup, wrong status (anything
-    other than 'approved' or 'converted'), or invited_user missing/inactive/
-    mismatched. Maps to 400 {"code": "invalid_or_expired"}.
-    """
-
-
-class BetaInviteTokenAlreadyUsedError(BetaInviteTokenError):
-    """
-    Signup status is already 'converted'. The only rejection reason this
-    project's BetaAcceptView tells the caller apart from a generic invalid
-    link: a signed invite token is not something a third party can guess or
-    type in the way an email address can, so holding one already proves
-    receipt of the one email it was sent in, and "already used" leaks
-    nothing that holder didn't already have. Maps to 409
-    {"code": "already_used"}.
-    """
+    now = timezone.now()
+    staff = _is_staff(user=user)
+    plan = subscription.plan if subscription else None
+    _, max_runs, _ = _quota_terms(plan=plan)
+    has_access = staff or bool(subscription and subscription.has_active_access)
+    consumed, blocked, quota_next = _evaluate_quota(user=user, plan=plan, now=now)
+    refusal, next_eligible_at = _check_can_start(
+        user=user, subscription=subscription, now=now, quota=(consumed, blocked, quota_next)
+    )
+    if isinstance(refusal, RunInProgress):
+        # A run in flight hides the quota verdict; still report when a quota block lifts.
+        next_eligible_at = None if (staff or not blocked) else quota_next
+    return {
+        # None means unlimited (exempt staff); 0 means lapsed.
+        "runs_allowed": None if staff else (max_runs if has_access else 0),
+        "runs_used": consumed,
+        "next_eligible_at": next_eligible_at,
+        "can_trigger": refusal is None,
+    }
 
 
 def resolve_beta_invite_signup(*, token: str) -> BetaSignup:
@@ -459,72 +494,132 @@ def resolve_beta_invite_signup(*, token: str) -> BetaSignup:
     return signup
 
 
-logger = logging.getLogger(__name__)
+def start_recommendation_run(*, user: User, source: TriggerSource) -> RecommendationRun:
+    """
+    The single chokepoint both trigger paths (the API view and the beat task)
+    go through. Serialised per user by a row lock on their Subscription, which
+    get_or_create guarantees exists first -- select_for_update on a missing
+    row would lock nothing. The OneToOne unique constraint makes concurrent
+    creation safe. Raises SubscriptionRequired, RunInProgress or QuotaExceeded;
+    otherwise returns a new 'pending' run created inside the lock.
 
-# Terms used when a subscription has no Plan (staff, comped/plan-less rows).
-DEFAULT_QUOTA_PERIOD_DAYS = 30
-DEFAULT_MAX_RUNS_PER_QUOTA_PERIOD = 1
-DEFAULT_FAILED_RUN_GRACE = 1
-
-# A failed run does not burn the allowance; everything else that was
-# dispatched does.
-_QUOTA_CONSUMING_STATUSES = ("pending", "running", "done")
-_IN_FLIGHT_STATUSES = ("pending", "running")
-
-# A pending/running row older than this is presumed stranded (worker OOM,
-# SIGKILL, container recreate) and no longer blocks a new trigger; the
-# reap_stale_runs task marks it failed. Comfortably above the task's worst
-# case: 3 attempts x 1500s hard limit + 2 x 300s retry backoff.
-IN_FLIGHT_MAX_AGE = timedelta(hours=2)
-
-# The beat schedule is calendar-monthly (day_of_month), but quota_period_days
-# is a rolling window measured in exact days. A 28- or 30-day month, or
-# sub-second scheduling jitter around a 30-day boundary, can put the
-# previous scheduled run inside the new rolling window even though a full
-# calendar month has genuinely elapsed. Only the beat path gets this slack;
-# a manual API trigger keeps the strict rolling quota_period_days so a user
-# cannot use the "Run Now" button to get extra runs.
-BEAT_QUOTA_TOLERANCE = timedelta(days=4)
-
-TriggerSource = Literal["api", "beat"]
-
-
-class QuotaExceeded(Exception):
-    def __init__(self, *, next_eligible_at: datetime | None) -> None:
-        super().__init__("Run quota exhausted for this period.")
-        self.next_eligible_at = next_eligible_at
-
-
-class RunInProgress(Exception):
-    pass
-
-
-def in_flight_runs(*, user: User, now: datetime):
-    """Sole definition of "a run is in flight", shared by every guard so they cannot drift."""
-    return RecommendationRun.objects.filter(
-        user=user,
-        status__in=_IN_FLIGHT_STATUSES,
-        triggered_at__gte=now - IN_FLIGHT_MAX_AGE,
-    )
-
-
-def _is_staff(*, user: User) -> bool:
-    return bool(user.is_staff or user.is_superuser)
-
-
-def _quota_terms(*, plan: Plan | None) -> tuple[timedelta, int, int]:
-    """Reads quota_period_days, never billing_interval -- an annual plan must not allow twelve runs on day one."""
-    if plan is None:
-        return (
-            timedelta(days=DEFAULT_QUOTA_PERIOD_DAYS),
-            DEFAULT_MAX_RUNS_PER_QUOTA_PERIOD,
-            DEFAULT_FAILED_RUN_GRACE,
+    source distinguishes the beat-tolerant quota window from the strict one
+    (see _evaluate_quota) -- it is not just a log label.
+    """
+    with transaction.atomic():
+        subscription, _ = Subscription.objects.get_or_create(user=user)
+        subscription = Subscription.objects.select_for_update().get(pk=subscription.pk)
+        refusal, _ = _check_can_start(
+            user=user, subscription=subscription, now=timezone.now(), source=source
         )
-    return (
-        timedelta(days=plan.quota_period_days),
-        plan.max_runs_per_quota_period,
-        plan.failed_run_grace,
-    )
+        if refusal is not None:
+            raise refusal
+        run = RecommendationRun.objects.create(user=user, status="pending")
+    logger.info("started recommendation run %s for user %s (source=%s)", run.id, user.id, source)
+    return run
+
+
+def verify_beta_invite_token(*, token: str) -> dict | None:
+    """
+    Decodes and verifies a beta-invite token. Returns the payload dict on
+    success, or None if the token is missing, tampered, expired, or
+    malformed -- callers should treat None as a generic "invalid or expired
+    link" so a bad token carries no signal about whether a matching signup
+    exists, matching verify_recommendation_token's rule.
+    """
+    if not token:
+        return None
+    try:
+        payload = signing.loads(token, salt=BETA_INVITE_SALT, max_age=BETA_INVITE_MAX_AGE)
+    except (signing.BadSignature, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if {"sid", "uid"} - payload.keys():
+        return None
+    return payload
+
+
+def verify_email_revert_token(*, token: object) -> dict | None:
+    """
+    Returns {"uid": int, "old": str, "new": str} or None for a missing,
+    non-string, oversized, tampered, expired or malformed token. Callers must
+    treat None as one undifferentiated "invalid or expired" outcome.
+    """
+    if not isinstance(token, str) or not token or len(token) > EMAIL_REVERT_MAX_TOKEN_LENGTH:
+        return None
+    try:
+        payload = signing.loads(token, salt=EMAIL_REVERT_SALT, max_age=EMAIL_REVERT_MAX_AGE)
+    except (signing.BadSignature, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if (
+        not isinstance(payload.get("uid"), int)
+        or isinstance(payload.get("uid"), bool)
+        or not isinstance(payload.get("old"), str)
+        or not isinstance(payload.get("new"), str)
+    ):
+        return None
+    return payload
+
+
+def verify_recommendation_token(token: str) -> dict | None:
+    """
+    Decodes and verifies a recommendation feedback token.
+
+    Returns the payload dict on success, or None if the token is missing, tampered,
+    expired, or malformed in any way. Callers should treat None as a generic "not found"
+    so an invalid link carries no signal about whether a matching recommendation exists.
+    """
+    if not token:
+        return None
+    try:
+        payload = signing.loads(
+            token, salt=RECOMMENDATION_FEEDBACK_SALT, max_age=RECOMMENDATION_FEEDBACK_MAX_AGE
+        )
+    except (signing.BadSignature, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if {"rid", "action", "uid"} - payload.keys():
+        return None
+    if payload["action"] not in {value for value, _ in FRAGRANCE_STATUSES}:
+        return None
+    return payload
+
+
+def _check_can_start(
+    *,
+    user: User,
+    subscription: Subscription | None,
+    now: datetime,
+    quota: tuple[int, bool, datetime | None] | None = None,
+    source: TriggerSource = "api",
+) -> tuple[Exception | None, datetime | None]:
+    """
+    The single rule set behind both start_recommendation_run (which calls it
+    under the row lock) and quota_snapshot (read-only, no lock), so the two
+    cannot drift. Returns (refusal or None, next_eligible_at). Creates nothing.
+
+    source only matters when the caller doesn't already have a precomputed
+    quota tuple -- it picks the strict or beat-tolerant window in
+    _evaluate_quota. If a caller passes `quota` in, that tuple's source
+    already won and this parameter is ignored for the quota check.
+    """
+    staff = _is_staff(user=user)
+    if not (staff or (subscription is not None and subscription.has_active_access)):
+        return SubscriptionRequired(), None
+    if in_flight_runs(user=user, now=now).exists():
+        return RunInProgress(), None
+    if staff:
+        return None, None
+    if quota is None:
+        quota = _evaluate_quota(user=user, plan=subscription.plan, now=now, source=source)
+    _, blocked, next_eligible_at = quota
+    if blocked:
+        return QuotaExceeded(next_eligible_at=next_eligible_at), next_eligible_at
+    return None, None
 
 
 def _evaluate_quota(
@@ -572,113 +667,39 @@ def _evaluate_quota(
     return consumed, blocked, (max(frees_at) if frees_at else None)
 
 
-def _check_can_start(
-    *,
-    user: User,
-    subscription: Subscription | None,
-    now: datetime,
-    quota: tuple[int, bool, datetime | None] | None = None,
-    source: TriggerSource = "api",
-) -> tuple[Exception | None, datetime | None]:
-    """
-    The single rule set behind both start_recommendation_run (which calls it
-    under the row lock) and quota_snapshot (read-only, no lock), so the two
-    cannot drift. Returns (refusal or None, next_eligible_at). Creates nothing.
-
-    source only matters when the caller doesn't already have a precomputed
-    quota tuple -- it picks the strict or beat-tolerant window in
-    _evaluate_quota. If a caller passes `quota` in, that tuple's source
-    already won and this parameter is ignored for the quota check.
-    """
-    staff = _is_staff(user=user)
-    if not (staff or (subscription is not None and subscription.has_active_access)):
-        return SubscriptionRequired(), None
-    if in_flight_runs(user=user, now=now).exists():
-        return RunInProgress(), None
-    if staff:
-        return None, None
-    if quota is None:
-        quota = _evaluate_quota(user=user, plan=subscription.plan, now=now, source=source)
-    _, blocked, next_eligible_at = quota
-    if blocked:
-        return QuotaExceeded(next_eligible_at=next_eligible_at), next_eligible_at
-    return None, None
+def _is_staff(*, user: User) -> bool:
+    return bool(user.is_staff or user.is_superuser)
 
 
-def quota_snapshot(*, user: User, subscription: Subscription | None) -> dict:
-    """
-    Frontend-facing quota state. Read-only: no writes, no locks.
-
-    Always evaluated with source="api" (the default), deliberately: this
-    backs the "Run Now" button and the "next eligible" display, both of
-    which describe what a *manual* trigger would do right now. Reporting
-    the beat-tolerant window here would show can_trigger=True for a user
-    whose actual manual trigger would still be refused by the strict
-    rolling window in start_recommendation_run.
-    """
-    now = timezone.now()
-    staff = _is_staff(user=user)
-    plan = subscription.plan if subscription else None
-    _, max_runs, _ = _quota_terms(plan=plan)
-    has_access = staff or bool(subscription and subscription.has_active_access)
-    consumed, blocked, quota_next = _evaluate_quota(user=user, plan=plan, now=now)
-    refusal, next_eligible_at = _check_can_start(
-        user=user, subscription=subscription, now=now, quota=(consumed, blocked, quota_next)
-    )
-    if isinstance(refusal, RunInProgress):
-        # A run in flight hides the quota verdict; still report when a quota block lifts.
-        next_eligible_at = None if (staff or not blocked) else quota_next
-    return {
-        # None means unlimited (exempt staff); 0 means lapsed.
-        "runs_allowed": None if staff else (max_runs if has_access else 0),
-        "runs_used": consumed,
-        "next_eligible_at": next_eligible_at,
-        "can_trigger": refusal is None,
-    }
-
-
-def start_recommendation_run(*, user: User, source: TriggerSource) -> RecommendationRun:
-    """
-    The single chokepoint both trigger paths (the API view and the beat task)
-    go through. Serialised per user by a row lock on their Subscription, which
-    get_or_create guarantees exists first -- select_for_update on a missing
-    row would lock nothing. The OneToOne unique constraint makes concurrent
-    creation safe. Raises SubscriptionRequired, RunInProgress or QuotaExceeded;
-    otherwise returns a new 'pending' run created inside the lock.
-
-    source distinguishes the beat-tolerant quota window from the strict one
-    (see _evaluate_quota) -- it is not just a log label.
-    """
-    with transaction.atomic():
-        subscription, _ = Subscription.objects.get_or_create(user=user)
-        subscription = Subscription.objects.select_for_update().get(pk=subscription.pk)
-        refusal, _ = _check_can_start(
-            user=user, subscription=subscription, now=timezone.now(), source=source
+def _quota_terms(*, plan: Plan | None) -> tuple[timedelta, int, int]:
+    """Reads quota_period_days, never billing_interval -- an annual plan must not allow twelve runs on day one."""
+    if plan is None:
+        return (
+            timedelta(days=DEFAULT_QUOTA_PERIOD_DAYS),
+            DEFAULT_MAX_RUNS_PER_QUOTA_PERIOD,
+            DEFAULT_FAILED_RUN_GRACE,
         )
-        if refusal is not None:
-            raise refusal
-        run = RecommendationRun.objects.create(user=user, status="pending")
-    logger.info("started recommendation run %s for user %s (source=%s)", run.id, user.id, source)
-    return run
-
-
-def default_schedule_for(*, user_id: int) -> tuple[int, int]:
-    """
-    Stable, evenly-spread (day_of_month, hour) derived from the user id: 672
-    slots. Day is 1-28 only -- 29-31 would silently skip short months.
-    Deterministic, so a user always lands in the same slot.
-    """
-    return (user_id % 28) + 1, (user_id // 28) % 24
-
-
-def get_or_create_fragrance_config(*, user: User) -> FragranceConfig:
-    """
-    The one place a FragranceConfig is first created with a jittered schedule.
-    Applied only at creation via `defaults` -- get_or_create never overwrites
-    an existing row, so a user's own choice is never touched.
-    """
-    day, hour = default_schedule_for(user_id=user.pk)
-    config, _ = FragranceConfig.objects.get_or_create(
-        user=user, defaults={"run_day_of_month": day, "run_hour": hour}
+    return (
+        timedelta(days=plan.quota_period_days),
+        plan.max_runs_per_quota_period,
+        plan.failed_run_grace,
     )
-    return config
+
+
+def _resolve_after_race(
+    recommendation: Recommendation, action: str, original: IntegrityError
+) -> tuple[Fragrance, bool]:
+    """Re-resolves from committed state after apply_recommendation_rating loses a create/claim race."""
+    linked = Fragrance.objects.filter(source_recommendation_id=recommendation.id).first()
+    if linked is not None:
+        if linked.status == action:
+            return linked, False
+        raise RatingConflict(existing_action=linked.status)
+
+    existing = Fragrance.objects.filter(
+        user=recommendation.user, name=recommendation.name
+    ).first()
+    if existing is not None:
+        raise RatingConflict(existing_action=existing.status)
+
+    raise original

@@ -25,55 +25,6 @@ import openai
 from .base import PROVIDER_TIMEOUT_SECONDS, StructuredOutputError
 
 
-def _to_strict_schema(schema: dict) -> dict:
-    """Returns a deep copy of `schema` normalized for OpenAI strict json_schema mode."""
-    return _strict_walk(node=deepcopy(schema))
-
-
-def _strict_walk(node: Any) -> Any:
-    if isinstance(node, dict):
-        node.pop("minItems", None)
-        node.pop("maxItems", None)
-        properties = node.get("properties")
-        if isinstance(properties, dict):
-            node["additionalProperties"] = False
-            node["required"] = list(properties.keys())
-            for value in properties.values():
-                _strict_walk(node=value)
-        items = node.get("items")
-        if items is not None:
-            _strict_walk(node=items)
-        return node
-    return node
-
-
-def _parse_response(response: "openai.types.chat.ChatCompletion", tool_name: str) -> dict:
-    try:
-        message = response.choices[0].message
-    except (IndexError, AttributeError) as exc:
-        raise StructuredOutputError(
-            f"OpenAI response for '{tool_name}' had no choices/message"
-        ) from exc
-
-    if getattr(message, "refusal", None):
-        raise StructuredOutputError(
-            f"OpenAI refused to generate '{tool_name}': {message.refusal}"
-        )
-
-    content = message.content
-    if not content:
-        raise StructuredOutputError(
-            f"OpenAI response for '{tool_name}' had empty content"
-        )
-
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise StructuredOutputError(
-            f"OpenAI response for '{tool_name}' was not valid JSON: {exc}"
-        ) from exc
-
-
 class OpenAIProvider:
     def __init__(
         self,
@@ -130,3 +81,52 @@ class OpenAIProvider:
             **{self._token_param_name: max_tokens},
         )
         return _parse_response(response=response, tool_name=tool_name)
+
+
+def _parse_response(response: "openai.types.chat.ChatCompletion", tool_name: str) -> dict:
+    try:
+        message = response.choices[0].message
+    except (IndexError, AttributeError) as exc:
+        raise StructuredOutputError(
+            f"OpenAI response for '{tool_name}' had no choices/message"
+        ) from exc
+
+    if getattr(message, "refusal", None):
+        raise StructuredOutputError(
+            f"OpenAI refused to generate '{tool_name}': {message.refusal}"
+        )
+
+    content = message.content
+    if not content:
+        raise StructuredOutputError(
+            f"OpenAI response for '{tool_name}' had empty content"
+        )
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise StructuredOutputError(
+            f"OpenAI response for '{tool_name}' was not valid JSON: {exc}"
+        ) from exc
+
+
+def _strict_walk(node: Any) -> Any:
+    if isinstance(node, dict):
+        node.pop("minItems", None)
+        node.pop("maxItems", None)
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            node["additionalProperties"] = False
+            node["required"] = list(properties.keys())
+            for value in properties.values():
+                _strict_walk(node=value)
+        items = node.get("items")
+        if items is not None:
+            _strict_walk(node=items)
+        return node
+    return node
+
+
+def _to_strict_schema(schema: dict) -> dict:
+    """Returns a deep copy of `schema` normalized for OpenAI strict json_schema mode."""
+    return _strict_walk(node=deepcopy(schema))
