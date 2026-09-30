@@ -1,8 +1,20 @@
+# Container log rotation. Docker's default json-file driver keeps every line a container writes
+# until the container is recreated, with no size limit, so a chatty service can fill the droplet's
+# disk over time. Every service below merges this in: at most 3 files of 10 MB each (30 MB) per
+# service. This bounds storage, not age: a low-traffic service can hold weeks of lines inside
+# its cap. It takes effect when a container is (re)created, i.e. at the next deploy.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
 
   # ─── Data layer ───────────────────────────────────────────────────────────────
 
   db:
+    logging: *default-logging
     image: postgres:16
     restart: unless-stopped
     volumes:
@@ -20,6 +32,7 @@ services:
       - internal
 
   redis:
+    logging: *default-logging
     image: redis:7-alpine
     restart: unless-stopped
     command: redis-server --requirepass ${REDIS_PASSWORD}
@@ -36,6 +49,7 @@ services:
   # ─── Search ───────────────────────────────────────────────────────────────────
 
   searxng:
+    logging: *default-logging
     image: searxng/searxng:latest
     restart: unless-stopped
     volumes:
@@ -56,6 +70,7 @@ services:
   # ─── Backend ──────────────────────────────────────────────────────────────────
 
   backend:
+    logging: *default-logging
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -83,6 +98,7 @@ services:
       - public
 
   celery-worker:
+    logging: *default-logging
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -109,6 +125,7 @@ services:
       - public
 
   celery-beat:
+    logging: *default-logging
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -132,6 +149,7 @@ services:
   # ─── Frontend ─────────────────────────────────────────────────────────────────
 
   frontend:
+    logging: *default-logging
     build:
       context: ./frontend
       dockerfile: Dockerfile
@@ -146,6 +164,7 @@ services:
   # ─── Reverse proxy ────────────────────────────────────────────────────────────
 
   nginx:
+    logging: *default-logging
     image: nginx:alpine
     restart: unless-stopped
     ports:

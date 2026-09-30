@@ -180,9 +180,12 @@ http {
         # for Stripe. Same invariants as the other API locations (see /api/v1/beta/ above).
         location /api/v1/billing/ {
             limit_req zone=billing burst=20 nodelay;
-            # A change-plan POST makes several sequential Stripe calls (worst case ~60-80s);
-            # nginx's 60s default would 504 while gunicorn is still working and holding the lock.
-            proxy_read_timeout 90s;
+            # A change-plan POST makes up to 6 sequential Stripe calls (~78s worst case; ~91s if the
+            # defensive unexpanded-schedule fetch also fires). nginx's 60s default would 504 while
+            # gunicorn is still working and holding the plan-change lock. Ordered under the two
+            # ceilings above it: this 110s < gunicorn --timeout 120 < Cloudflare's 125s proxy read
+            # timeout (fixed on non-Enterprise plans, per Cloudflare's Error 524 docs).
+            proxy_read_timeout 110s;
             proxy_hide_header  X-Content-Type-Options;
             proxy_hide_header  Referrer-Policy;
             set $backend_upstream http://backend:8000;
