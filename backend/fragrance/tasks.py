@@ -430,6 +430,7 @@ def render_and_send_email(user_id: int, run_id: int) -> None:
         body=html,
         from_email=settings.DEFAULT_FROM_EMAIL,
         to=[recipient],
+        reply_to=_support_reply_to(),
     )
     email.content_subtype = 'html'
     email.send()
@@ -567,6 +568,7 @@ def send_account_email_change_notice(
             body=render_to_string(template_name='fragrance/email_changed_notice.txt', context=context),
             from_email=settings.DEFAULT_FROM_EMAIL,
             to=[recipient],
+            reply_to=_support_reply_to(),
         )
         message.attach_alternative(
             render_to_string(template_name='fragrance/email_changed_notice.html', context=context),
@@ -593,16 +595,16 @@ def send_beta_invite_email(self: 'send_beta_invite_email', signup_id: int) -> No
     token = generate_beta_invite_token(signup=signup)
     accept_url = f"{settings.FRONTEND_URL}/beta/accept?token={token}"
     try:
-        send_mail(
+        EmailMessage(
             subject="You're in — set up your Fragrance Journey account",
-            message=render_to_string(
+            body=render_to_string(
                 template_name='fragrance/beta_invite_email.txt',
                 context={'accept_url': accept_url},
             ),
             from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[signup.email],
-            fail_silently=False,
-        )
+            to=[signup.email],
+            reply_to=_support_reply_to(),
+        ).send(fail_silently=False)
     except Exception as exc:
         if self.request.retries >= self.max_retries:
             raise
@@ -631,6 +633,7 @@ def send_email_reverted_notice(self: 'send_email_reverted_notice', user_id: int,
             body=render_to_string(template_name='fragrance/email_reverted_notice.txt', context=context),
             from_email=settings.DEFAULT_FROM_EMAIL,
             to=[recipient],
+            reply_to=_support_reply_to(),
         )
         message.attach_alternative(
             render_to_string(template_name='fragrance/email_reverted_notice.html', context=context),
@@ -733,16 +736,16 @@ def send_password_reset_email(self: 'send_password_reset_email', user_id: int) -
     token = default_token_generator.make_token(user=user)
     reset_url = f"{settings.FRONTEND_URL}/auth/reset-password?uid={uid}&token={token}"
     try:
-        send_mail(
+        EmailMessage(
             subject='Reset your password',
-            message=render_to_string(
+            body=render_to_string(
                 template_name='fragrance/password_reset_email.txt',
                 context={'username': user.username, 'reset_url': reset_url},
             ),
             from_email=settings.DEFAULT_FROM_EMAIL,
-            recipient_list=[user.email],
-            fail_silently=False,
-        )
+            to=[user.email],
+            reply_to=_support_reply_to(),
+        ).send(fail_silently=False)
     except Exception as exc:
         if self.request.retries >= self.max_retries:
             raise
@@ -785,6 +788,7 @@ def send_price_change_notice_email(self: 'send_price_change_notice_email', notic
             body=render_to_string(template_name='fragrance/price_change_notice_email.txt', context=context),
             from_email=settings.DEFAULT_FROM_EMAIL,
             to=[user.email],
+            reply_to=_support_reply_to(),
         )
         message.attach_alternative(
             render_to_string(template_name='fragrance/price_change_notice_email.html', context=context),
@@ -850,6 +854,7 @@ def send_run_failure_notice(self: 'send_run_failure_notice', run_id: int, kind: 
             body=render_to_string(template_name=f'fragrance/run_failed_{kind}_email.txt', context=context),
             from_email=settings.DEFAULT_FROM_EMAIL,
             to=[_delivery_address(user_id=run.user_id)],
+            reply_to=_support_reply_to(),
         )
         message.attach_alternative(
             render_to_string(template_name=f'fragrance/run_failed_{kind}_email.html', context=context),
@@ -861,6 +866,11 @@ def send_run_failure_notice(self: 'send_run_failure_notice', run_id: int, kind: 
         if self.request.retries >= self.max_retries:
             raise
         raise self.retry(exc=exc, countdown=300)
+
+
+def _support_reply_to() -> list[str]:
+    """Reply-To for end-user mail: replies land in the support mailbox (Postmark is send-only). Empty when unset."""
+    return [settings.SUPPORT_EMAIL] if settings.SUPPORT_EMAIL else []
 
 
 def _delivery_address(*, user_id: int) -> str:

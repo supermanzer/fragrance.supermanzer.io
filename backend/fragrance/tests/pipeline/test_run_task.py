@@ -256,7 +256,7 @@ class EmailTaskRetryTests(TestCase):
         signup = BetaSignup.objects.create(
             email="i@example.com", normalized_email="i@example.com", invited_user=invited
         )
-        with patch("fragrance.tasks.send_mail", side_effect=OSError("smtp down")):
+        with patch("fragrance.tasks.EmailMessage.send", side_effect=OSError("smtp down")):
             with patch.object(send_beta_invite_email, "retry", side_effect=Retry()) as mock_retry:
                 with self.assertRaises(Retry):
                     self._run(task=send_beta_invite_email, retries=0, signup_id=signup.id)
@@ -268,7 +268,7 @@ class EmailTaskRetryTests(TestCase):
         signup = BetaSignup.objects.create(
             email="i2@example.com", normalized_email="i2@example.com", invited_user=invited
         )
-        with patch("fragrance.tasks.send_mail", side_effect=OSError("smtp down")):
+        with patch("fragrance.tasks.EmailMessage.send", side_effect=OSError("smtp down")):
             with patch.object(send_beta_invite_email, "retry") as mock_retry:
                 with self.assertRaises(OSError):
                     self._run(

@@ -168,7 +168,7 @@ class PasswordResetQueuedTests(TestCase):
 
     def test_task_retries_on_send_failure(self) -> None:
         user = User.objects.create_user(username="r1", email="r@example.com")
-        with patch("fragrance.tasks.send_mail", side_effect=RuntimeError("smtp down")):
+        with patch("fragrance.tasks.EmailMessage.send", side_effect=RuntimeError("smtp down")):
             with patch.object(send_password_reset_email, "retry", side_effect=RuntimeError("retried")) as mock_retry:
                 result = send_password_reset_email.apply(kwargs={"user_id": user.pk})
         self.assertTrue(result.failed())
