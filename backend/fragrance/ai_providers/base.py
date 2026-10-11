@@ -10,11 +10,12 @@ schema); keeping the wrapper out of the protocol is what stops the abstraction
 from leaking a specific vendor's schema envelope into callers.
 """
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import anthropic
 import openai
 import stripe
+from config.log_setup import redact
 
 
 # Both SDKs default to a 600s read timeout with 2 retries, far exceeding
@@ -87,3 +88,58 @@ def sanitize_sdk_error_message(exc: Exception) -> str:
     if isinstance(exc, stripe.StripeError):
         return "Stripe rejected the request. Check the Stripe configuration and try again."
     return str(exc)
+
+
+def sanitized_exc_info(
+    exc: Exception, drop_message: bool = False
+) -> tuple[type[BaseException], BaseException, Any]:
+    """
+    An exc_info tuple for logging that keeps the traceback frames but swaps the
+    exception (and anything chained to it) for one carrying only
+    sanitize_sdk_error_message(exc). Passing the real exception as exc_info
+    would put the raw SDK message, which sanitize_sdk_error_message exists to
+    keep out of logs, straight back into the traceback's last line.
+
+    drop_message=True keeps only the exception's class name: for failures
+    whose text this code does not control and that sanitize_sdk_error_message
+    would pass through unchanged (a broker or cache error can echo its
+    connection URL).
+    """
+    stand_in_type = type(type(exc).__name__, (Exception,), {'__module__': type(exc).__module__})
+    stand_in = stand_in_type('' if drop_message else sanitize_sdk_error_message(exc=exc))
+    return stand_in_type, stand_in, exc.__traceback__
+
+
+def sanitized_exception(*, exc: Exception, drop_message: bool = False) -> Exception:
+    """
+    A stand-in for exc that is safe to hand to Celery's self.retry(exc=...) or
+    to re-raise out of a task. Celery logs a retry as "Retry in Ns: <repr(exc)>"
+    (no exc_info, so no log filter can repair it) and writes the exception to
+    the result backend; the stand-in carries only the redacted
+    sanitize_sdk_error_message(exc), or nothing when drop_message is set.
+
+    The stand-in subclasses type(exc), so isinstance checks and
+    `except SomeError` in callers keep working, and keeps exc's traceback
+    frames. The original __init__ is never run (SDK constructors need request
+    and response objects), and __str__/__repr__ are BaseException's because
+    SDK overrides read attributes the stand-in does not have. Never raises: if
+    the subclass cannot be built it falls back to a plain Exception subclass
+    with the same name and module.
+    """
+    try:
+        message = '' if drop_message else redact(text=sanitize_sdk_error_message(exc=exc))
+    except Exception:
+        message = ''
+    namespace = {
+        '__module__': type(exc).__module__,
+        '__str__': BaseException.__str__,
+        '__repr__': BaseException.__repr__,
+    }
+    try:
+        stand_in_type = type(type(exc).__name__, (type(exc),), namespace)
+        stand_in = stand_in_type.__new__(stand_in_type, message)
+        BaseException.__init__(stand_in, message)
+    except Exception:
+        stand_in_type = type(type(exc).__name__, (Exception,), namespace)
+        stand_in = stand_in_type(message)
+    return stand_in.with_traceback(exc.__traceback__)

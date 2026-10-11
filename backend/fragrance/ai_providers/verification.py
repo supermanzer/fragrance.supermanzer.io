@@ -40,6 +40,7 @@ that already exists for (family, model_id); an operator creates the row via
 /admin/ first.
 """
 
+import logging
 from dataclasses import dataclass
 
 import anthropic
@@ -65,7 +66,14 @@ from ..llm import (
     build_email_content_tool_schema,
 )
 from ..models import AIModelConfig
-from .base import StructuredLLMProvider, StructuredOutputError, sanitize_sdk_error_message
+from .base import (
+    StructuredLLMProvider,
+    StructuredOutputError,
+    sanitize_sdk_error_message,
+    sanitized_exc_info,
+)
+
+logger = logging.getLogger(__name__)
 
 
 DUMMY_COLLECTION = (
@@ -267,6 +275,13 @@ def run_verification_checks(*, provider: StructuredLLMProvider) -> list[CheckRes
             # so this carries zero information about the model's actual
             # capability — persist_verification_results must not treat it as
             # evidence of anything.
+            logger.warning(
+                "verification check %r hit an unexpected %s: %s",
+                label,
+                type(exc).__name__,
+                sanitize_sdk_error_message(exc=exc),
+                exc_info=sanitized_exc_info(exc=exc),
+            )
             results.append(
                 CheckResult(
                     label=label,

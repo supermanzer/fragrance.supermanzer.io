@@ -7,10 +7,17 @@ import os
 from celery import Celery
 from celery.schedules import crontab
 
+from .log_setup import connect_celery_signals
+
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
 app = Celery("config")
 app.config_from_object("django.conf:settings", namespace="CELERY")
 app.autodiscover_tasks()
+
+# Worker and beat would otherwise hijack the root logger with Celery's own
+# format; this makes them apply settings.LOGGING (so the `-l info` command-line
+# flag no longer sets levels) and propagates request ids into tasks.
+connect_celery_signals()
 
 # Version-controlled system schedules. The DatabaseScheduler syncs these into
 # django_celery_beat's tables at beat start; the per-user

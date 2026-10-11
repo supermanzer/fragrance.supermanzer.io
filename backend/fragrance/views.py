@@ -27,10 +27,11 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
+from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from . import billing
-from .ai_providers.base import sanitize_sdk_error_message
+from .ai_providers.base import sanitize_sdk_error_message, sanitized_exc_info
 from .models import (
     BetaSignup,
     Fragrance,
@@ -452,7 +453,12 @@ class BillingCheckoutView(generics.GenericAPIView):
         except billing.UnknownPlanError:
             return Response({"detail": "Unknown plan."}, status=status.HTTP_400_BAD_REQUEST)
         except ImproperlyConfigured as exc:
-            logger.error("checkout unavailable: %s", exc)
+            logger.error(
+                "checkout unavailable for user %s: %s",
+                request.user.pk,
+                exc,
+                exc_info=sanitized_exc_info(exc=exc),
+            )
             return Response(
                 {"detail": "Checkout is temporarily unavailable."},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -467,7 +473,12 @@ class BillingCheckoutView(generics.GenericAPIView):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
         except stripe.StripeError as exc:
-            logger.error("stripe checkout session creation failed: %s", sanitize_sdk_error_message(exc))
+            logger.error(
+                "stripe checkout session creation failed for user %s: %s",
+                request.user.pk,
+                sanitize_sdk_error_message(exc=exc),
+                exc_info=sanitized_exc_info(exc=exc),
+            )
             return Response(
                 {"detail": "Could not start checkout. Please try again shortly."},
                 status=status.HTTP_502_BAD_GATEWAY,
@@ -549,13 +560,23 @@ class BillingSessionView(generics.GenericAPIView):
                 {"detail": "Checkout session not found."}, status=status.HTTP_404_NOT_FOUND
             )
         except ImproperlyConfigured as exc:
-            logger.error("billing session lookup unavailable: %s", exc)
+            logger.error(
+                "billing session lookup unavailable for user %s: %s",
+                request.user.pk,
+                exc,
+                exc_info=sanitized_exc_info(exc=exc),
+            )
             return Response(
                 {"detail": "Billing is temporarily unavailable."},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
         except stripe.StripeError as exc:
-            logger.error("stripe session lookup failed: %s", sanitize_sdk_error_message(exc))
+            logger.error(
+                "stripe session lookup failed for user %s: %s",
+                request.user.pk,
+                sanitize_sdk_error_message(exc=exc),
+                exc_info=sanitized_exc_info(exc=exc),
+            )
             return Response(
                 {"detail": "Could not verify checkout session. Please try again shortly."},
                 status=status.HTTP_502_BAD_GATEWAY,
@@ -602,8 +623,15 @@ class ChangePasswordView(generics.GenericAPIView):
         if refresh_token:
             try:
                 RefreshToken(token=refresh_token).blacklist()
-            except Exception:
+            except TokenError:
+                # Already expired, blacklisted or malformed: nothing to revoke.
                 pass
+            except Exception as exc:
+                logger.error(
+                    "could not blacklist the refresh token on password change for user %s",
+                    user.pk,
+                    exc_info=sanitized_exc_info(exc=exc, drop_message=True),
+                )
         return Response({'detail': 'Password changed successfully.'})
 
 
@@ -743,10 +771,11 @@ class PasswordResetRequestView(generics.GenericAPIView):
         for user in users:
             try:
                 send_password_reset_email.delay(user_id=user.pk)
-            except OperationalError:
+            except OperationalError as exc:
                 logger.error(
                     "could not enqueue password reset email for user_id=%s; broker unavailable",
                     user.pk,
+                    exc_info=sanitized_exc_info(exc=exc, drop_message=True),
                 )
         return Response(_RESET_RESPONSE)
 
@@ -1097,7 +1126,12 @@ def _stripe_failure_response(*, exc: Exception, action: str, unavailable: str, f
     ever leaks str(exc) into the response body.
     """
     if isinstance(exc, ImproperlyConfigured):
-        logger.error("%s unavailable: %s", action, exc)
+        logger.error("%s unavailable: %s", action, exc, exc_info=sanitized_exc_info(exc=exc))
         return Response({"detail": unavailable}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
-    logger.error("stripe %s failed: %s", action, sanitize_sdk_error_message(exc))
+    logger.error(
+        "stripe %s failed: %s",
+        action,
+        sanitize_sdk_error_message(exc=exc),
+        exc_info=sanitized_exc_info(exc=exc),
+    )
     return Response({"detail": failed}, status=status.HTTP_502_BAD_GATEWAY)

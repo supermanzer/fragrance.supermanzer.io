@@ -43,7 +43,7 @@ from django.core.validators import validate_email
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from .ai_providers.base import sanitize_sdk_error_message
+from .ai_providers.base import sanitize_sdk_error_message, sanitized_exc_info
 from .models import (
     BetaSignup,
     Plan,
@@ -1083,15 +1083,19 @@ def reconcile_subscriptions(
             except Exception as exc:
                 summary["errors"] += 1
                 logger.error(
-                    "reconcile: invoice %s failed: %s",
+                    "reconcile: invoice %s for customer %s failed: %s",
                     getattr(invoice, "id", "?"),
+                    customer_id,
                     sanitize_sdk_error_message(exc),
+                    exc_info=sanitized_exc_info(exc=exc),
                 )
     except Exception as exc:
         summary["errors"] += 1
         logger.error(
-            "reconcile: listing invoices failed: %s",
+            "reconcile: listing invoices failed after %d invoice(s) seen: %s",
+            summary["invoices_seen"],
             sanitize_sdk_error_message(exc),
+            exc_info=sanitized_exc_info(exc=exc),
         )
 
     if not dry_run and summary["errors"] and not summary["recorded"] and pending:
@@ -1309,17 +1313,20 @@ def revert_customer_email(*, token: object) -> bool:
             restore_stripe_customer_email.delay(
                 user_id=user.pk, customer_id=customer_id, email=old_email
             )
-        except Exception:
+        except Exception as exc:
             logger.error(
-                "could not enqueue stripe email restore for user %s; broker unavailable",
+                "could not enqueue stripe email restore for user %s customer %s; broker unavailable",
                 user.pk,
+                customer_id,
+                exc_info=sanitized_exc_info(exc=exc, drop_message=True),
             )
     try:
         send_email_reverted_notice.delay(user_id=user.pk, recipient=old_email)
-    except Exception:
+    except Exception as exc:
         logger.error(
             "could not enqueue email-restored notice for user %s; broker unavailable",
             user.pk,
+            exc_info=sanitized_exc_info(exc=exc, drop_message=True),
         )
     return True
 
@@ -1354,10 +1361,13 @@ def revoke_for_dispute(
         client = get_stripe_client()
     try:
         pi = client.v1.payment_intents.retrieve(payment_intent_id)
-    except stripe.InvalidRequestError:
+    except stripe.InvalidRequestError as exc:
         logger.error(
-            "could not retrieve payment_intent %s for dispute; revoking nothing",
+            "could not retrieve payment_intent %s for dispute %s; revoking nothing: %s",
             payment_intent_id,
+            dispute.get("id", "?"),
+            sanitize_sdk_error_message(exc=exc),
+            exc_info=sanitized_exc_info(exc=exc),
         )
         return
 
@@ -1414,13 +1424,21 @@ def revoke_for_dispute(
     # This is the "flag for the operator" step from the plan -- there is
     # no ticketing/ops-alert integration in this codebase yet, so a
     # loud, unambiguous log line is the mechanism.
+    dispute_id = str(dispute.get("id") or "?")
     logger.critical(
-        "REVOKED subscription for stripe customer %s due to charge.dispute.created and "
-        "cancelled stripe subscription(s) %s immediately and expired %d open checkout "
-        "session(s) -- operator review required",
+        "REVOKED subscription for user %s (stripe customer %s) due to charge.dispute.created "
+        "%s on payment_intent %s (amount=%s currency=%s) and cancelled stripe "
+        "subscription(s) %s immediately and expired %d open checkout session(s) "
+        "-- operator review required",
+        ", ".join(str(uid) for uid in local.values_list("user_id", flat=True)) or "?",
         customer_id,
+        dispute_id,
+        payment_intent_id,
+        dispute.get("amount", "?"),
+        dispute.get("currency", "?"),
         ", ".join(cancelled) or "(none live)",
         expired_sessions,
+        extra={"alert_key": dispute_id},
     )
 
 
@@ -1807,15 +1825,21 @@ def _cancel_live_stripe_subscriptions(
                 already_done = False
             if not already_done:
                 logger.error(
-                    "dispute: could not cancel stripe subscription %s",
+                    "dispute: could not cancel stripe subscription %s for customer %s: %s",
                     subscription_id,
+                    customer_id,
+                    sanitize_sdk_error_message(exc=exc),
+                    exc_info=sanitized_exc_info(exc=exc),
                 )
                 failure = failure or exc
                 continue
         except stripe.StripeError as exc:
             logger.error(
-                "dispute: could not cancel stripe subscription %s",
+                "dispute: could not cancel stripe subscription %s for customer %s: %s",
                 subscription_id,
+                customer_id,
+                sanitize_sdk_error_message(exc=exc),
+                exc_info=sanitized_exc_info(exc=exc),
             )
             failure = failure or exc
             continue
@@ -1875,7 +1899,11 @@ def _expire_open_checkout_sessions(
             pass
         except stripe.StripeError as exc:
             logger.error(
-                "dispute: could not look up checkout session %s", known_session_id
+                "dispute: could not look up checkout session %s for customer %s: %s",
+                known_session_id,
+                customer_id,
+                sanitize_sdk_error_message(exc=exc),
+                exc_info=sanitized_exc_info(exc=exc),
             )
             failure = exc
     expired = 0
@@ -1891,12 +1919,22 @@ def _expire_open_checkout_sessions(
                 already_done = False
             if not already_done:
                 logger.error(
-                    "dispute: could not expire checkout session %s", session_id
+                    "dispute: could not expire checkout session %s for customer %s: %s",
+                    session_id,
+                    customer_id,
+                    sanitize_sdk_error_message(exc=exc),
+                    exc_info=sanitized_exc_info(exc=exc),
                 )
                 failure = failure or exc
             continue
         except stripe.StripeError as exc:
-            logger.error("dispute: could not expire checkout session %s", session_id)
+            logger.error(
+                "dispute: could not expire checkout session %s for customer %s: %s",
+                session_id,
+                customer_id,
+                sanitize_sdk_error_message(exc=exc),
+                exc_info=sanitized_exc_info(exc=exc),
+            )
             failure = failure or exc
             continue
         expired += 1
@@ -2079,27 +2117,36 @@ def _grant_period_for_invoice(
 
         if locked.status == "revoked":
             logger.critical(
-                "MONEY RECEIVED ON A LOCKED ACCOUNT: stripe invoice %s (%s cents paid) for "
-                "revoked subscription %s (stripe customer %s) was recorded but granted NOTHING. "
-                "Needs a manual refund in Stripe; unlock the account in Django admin only "
-                "after that is settled.",
+                "MONEY RECEIVED ON A LOCKED ACCOUNT: stripe invoice %s (%s %s minor units paid, "
+                "payment_intent %s) for user %s, revoked subscription %s (stripe customer %s) "
+                "was recorded but granted NOTHING. Needs a manual refund in Stripe; unlock the "
+                "account in Django admin only after that is settled.",
                 invoice.id,
-                invoice.amount_paid,
+                getattr(invoice, "amount_paid", "?"),
+                str(getattr(invoice, "currency", "") or "?").upper(),
+                _invoice_payment_intent_id(invoice=invoice, known=payment_intent_id) or "?",
+                locked.user_id,
                 locked.pk,
                 invoice_customer_id,
+                extra={"alert_key": invoice.id},
             )
             return True
         if new_expiry is None:
             logger.critical(
-                "PAID INVOICE WITH NO PERIOD: stripe invoice %s (%s cents paid) for "
-                "subscription %s (stripe customer %s) matched plan %s but its line carries no "
-                "period.end. The payment was recorded and access was NOT granted; the operator "
-                "must resolve it (comp access with grant_access, or refund).",
+                "PAID INVOICE WITH NO PERIOD: stripe invoice %s (%s %s minor units paid, "
+                "payment_intent %s) for user %s, subscription %s (stripe customer %s) matched "
+                "plan %s but its line carries no period.end. The payment was recorded and "
+                "access was NOT granted; the operator must resolve it (comp access with "
+                "grant_access, or refund).",
                 invoice.id,
-                invoice.amount_paid,
+                getattr(invoice, "amount_paid", "?"),
+                str(getattr(invoice, "currency", "") or "?").upper(),
+                _invoice_payment_intent_id(invoice=invoice, known=payment_intent_id) or "?",
+                locked.user_id,
                 locked.pk,
                 invoice_customer_id,
                 plan.slug,
+                extra={"alert_key": invoice.id},
             )
             return True
 
@@ -2316,11 +2363,27 @@ def _plan_change_lock(*, user: User, required: bool) -> Iterator[bool]:
         try:
             if cache.get(key) == token:
                 cache.delete(key)
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "could not release plan-change lock for user %s; it will expire",
                 user.pk,
+                exc_info=sanitized_exc_info(exc=exc, drop_message=True),
             )
+
+
+def _invoice_payment_intent_id(*, invoice: Any, known: str) -> str:
+    """
+    The PaymentIntent id for alert context only. The caller's id wins; the
+    invoice's own `payment_intent` is a best-effort fallback (absent on the
+    2026-08-26.dahlia invoice shape, where payments hang off InvoicePayment),
+    and may be an expanded object.
+    """
+    if known:
+        return known
+    candidate = getattr(invoice, "payment_intent", None)
+    if candidate is not None and not isinstance(candidate, str):
+        candidate = getattr(candidate, "id", None)
+    return candidate if isinstance(candidate, str) else ""
 
 
 def _price_id_of(*, price: Any) -> str:
@@ -2541,9 +2604,11 @@ def _schedule_plan_change_locked(
             client.v1.subscription_schedules.release(schedule.id)
         except stripe.StripeError as cleanup_exc:
             logger.error(
-                "could not release half-built schedule %s: %s",
+                "could not release half-built schedule %s for user %s: %s",
                 schedule.id,
+                user.pk,
                 sanitize_sdk_error_message(cleanup_exc),
+                exc_info=sanitized_exc_info(exc=cleanup_exc),
             )
         raise
 

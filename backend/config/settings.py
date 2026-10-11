@@ -11,10 +11,13 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 import re
+import sys
 from pathlib import Path
 
 from decouple import Csv, config
 from django.core.exceptions import ImproperlyConfigured
+
+from config.log_setup import resolve_alert_delivery
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -81,6 +84,7 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    "config.log_setup.RequestIdMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
@@ -182,6 +186,25 @@ CELERY_BROKER_URL = config(
     default=f"redis://{_redis_auth}{_redis_host}:6379/0",
 )
 CELERY_RESULT_BACKEND = CELERY_BROKER_URL
+# Nothing reads task results (the run row and logs carry outcomes; celery_task_id
+# is stored but never queried). Ignoring them stops every .delay() from
+# subscribing to a result channel nobody reads and stops exceptions being
+# stored in Redis for a day.
+CELERY_TASK_IGNORE_RESULT = True
+# Short connect/read timeouts on the broker connection: without them a
+# black-holed Redis parks a publisher in the kernel connect timeout. Measured
+# in the dev container against an unroutable address: send_task(retry=False)
+# 75 s -> 6 s, cache.add 75 s -> 2 s. A throwaway worker (solo pool, DB 15)
+# stayed connected and answered `inspect ping` after 78 s idle with these
+# values, so the BRPOP/pidbox connections tolerate socket_timeout=5.
+# visibility_timeout is deliberately left at its default (1 h) and
+# result-backend reads keep Celery's 120 s redis_socket_timeout; only the
+# connect is bounded there.
+CELERY_BROKER_TRANSPORT_OPTIONS = {
+    "socket_connect_timeout": 2,
+    "socket_timeout": 5,
+}
+CELERY_REDIS_SOCKET_CONNECT_TIMEOUT = 2
 CELERY_BEAT_SCHEDULER = "django_celery_beat.schedulers:DatabaseScheduler"
 
 # DRF's SimpleRateThrottle reads django.core.cache's "default" backend. Left
@@ -197,6 +220,9 @@ CACHES = {
     "default": {
         "BACKEND": "django.core.cache.backends.redis.RedisCache",
         "LOCATION": f"redis://{_redis_auth}{_redis_host}:6379/1",
+        # Cache calls are single small commands; bounding them keeps a hung
+        # Redis from stalling throttling or the CRITICAL-alert rate limiter.
+        "OPTIONS": {"socket_connect_timeout": 2, "socket_timeout": 2},
     }
 }
 
@@ -225,6 +251,83 @@ SUPPORT_EMAIL = config("SUPPORT_EMAIL", default="support@supermanzer.io")
 ADMIN_EMAIL = config("ADMIN_EMAIL", default="")
 ANYMAIL = {
     "POSTMARK_SERVER_TOKEN": config("POSTMARK_SERVER_TOKEN"),
+}
+
+# Free-form deployment label ("production", "staging", ...) shown in CRITICAL alert emails.
+ENVIRONMENT = config("ENVIRONMENT", default="")
+
+# Logging: one stdout console handler for everything, so `docker compose logs`
+# carries gunicorn-side app logs, Celery worker and beat alike. Celery picks
+# this up through the setup_logging signal (config/celery.py), not by
+# re-declaring it. FRAGRANCE_LOG_LEVEL=DEBUG turns on debug output for the app.
+# CRITICAL records from any logger (fragrance, celery, django, ...) are also
+# emailed to ADMIN_EMAIL (rate limited; see config/log_setup.py).
+# True: CriticalEmailHandler does its I/O on a background thread. config/testing.py
+# turns it off so the test suite never spawns that thread.
+CRITICAL_ALERT_ASYNC = True
+# How the alert thread delivers: "direct" sends from the process itself (backend,
+# celery-worker: both have mail egress, and an alert must not wait behind the
+# worker's queue); "queue" publishes send_operator_critical_alert for a process
+# with no egress. celery-beat is on the internal-only network, so the
+# `celery ... beat` command line selects "queue" without any per-service
+# configuration; CRITICAL_ALERT_DELIVERY overrides it.
+CRITICAL_ALERT_DELIVERY = resolve_alert_delivery(
+    configured=config("CRITICAL_ALERT_DELIVERY", default=""), argv=sys.argv
+)
+# `manage.py test` defaults to WARNING so routine INFO lines do not bury test output.
+FRAGRANCE_LOG_LEVEL = config(
+    "FRAGRANCE_LOG_LEVEL", default="WARNING" if "test" in sys.argv[1:2] else "INFO"
+).upper()
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "filters": {
+        "context": {"()": "config.log_setup.RequestContextFilter"},
+        "redact": {"()": "config.log_setup.RedactionFilter"},
+        "scrub": {"()": "config.log_setup.ExceptionScrubFilter"},
+    },
+    "formatters": {
+        "single_line": {"()": "config.log_setup.SingleLineFormatter"},
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stdout",
+            "formatter": "single_line",
+            "filters": ["context", "redact"],
+        },
+        "alert_email": {
+            "()": "config.log_setup.CriticalEmailHandler",
+            "level": "CRITICAL",
+            "filters": ["context", "redact"],
+        },
+    },
+    # alert_email is on root so celery.*, django.* and fragrance.* CRITICALs are
+    # all mailed, each exactly once (child loggers only propagate).
+    "root": {"handlers": ["console", "alert_email"], "level": "WARNING"},
+    "loggers": {
+        "fragrance": {
+            "handlers": [],
+            "level": FRAGRANCE_LOG_LEVEL,
+            "propagate": True,
+        },
+        "config": {"level": "INFO"},
+        # Django's own console/mail_admins handlers would duplicate lines.
+        "django": {"handlers": [], "level": "WARNING", "propagate": True},
+        "django.request": {"handlers": [], "filters": ["scrub"], "level": "ERROR", "propagate": True},
+        "django.security": {"handlers": [], "level": "ERROR", "propagate": True},
+        "celery": {"level": "INFO"},
+        # Failure lines carry the raw exception; scrubbed before the console
+        # handler's own redaction runs.
+        "celery.app.trace": {"filters": ["scrub"], "level": "INFO"},
+        "kombu": {"level": "WARNING"},
+        "urllib3": {"level": "WARNING"},
+        "stripe": {"level": "WARNING"},
+        "httpx": {"level": "WARNING"},
+        "httpcore": {"level": "WARNING"},
+        "anthropic": {"level": "WARNING"},
+        "openai": {"level": "WARNING"},
+    },
 }
 
 # SearXNG URL

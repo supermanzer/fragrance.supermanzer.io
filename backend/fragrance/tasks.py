@@ -6,9 +6,10 @@ Implements Celery tasks for Fragrance Recommendation Runs
 
 import logging
 from datetime import datetime, timedelta
+from typing import Any, NoReturn
 
 from celery import shared_task
-from celery.exceptions import SoftTimeLimitExceeded
+from celery.exceptions import Retry, SoftTimeLimitExceeded
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
@@ -21,7 +22,12 @@ from django.utils.http import urlsafe_base64_encode
 from kombu.exceptions import OperationalError
 
 from .ai_providers import registry
-from .ai_providers.base import StructuredLLMProvider, sanitize_sdk_error_message
+from .ai_providers.base import (
+    StructuredLLMProvider,
+    sanitize_sdk_error_message,
+    sanitized_exc_info,
+    sanitized_exception,
+)
 from .ai_providers.registry import (
     EnumEnforcementUnsupportedError,
     MissingCredentialError,
@@ -236,7 +242,7 @@ def monthly_fragrance_run(
         # A run that overran its budget is a failure, not a transient error:
         # retrying would just burn another 20 minutes.
         fail_run_and_notify(run_id=run.id, error_message=STALE_RUN_TIMEOUT_MESSAGE)  # ty: ignore[unresolved-attribute]
-        logger.error("run %s for user %s exceeded its soft time limit", run.id, user_id)  # ty: ignore[unresolved-attribute]
+        logger.exception("run %s for user %s exceeded its soft time limit", run.id, user_id)  # ty: ignore[unresolved-attribute]
         return
     except Exception as exc:
         # Config errors fail immediately, on any attempt — retrying can't fix
@@ -247,13 +253,21 @@ def monthly_fragrance_run(
         # vendor-masked key fragment.
         is_config_error = isinstance(exc, NON_RETRYABLE_CONFIG_EXCEPTIONS)
         is_final_attempt = self.request.retries >= self.max_retries
+        logger.exception(
+            "run %s for user %s failed (%s, run attempt %s, provider=%s/%s, "
+            "config_error=%s): %s",
+            run.id, user_id, type(exc).__name__,  # ty: ignore[unresolved-attribute]
+            run.attempt, run.provider_family or '-', run.provider_model_id or '-',
+            is_config_error, sanitize_sdk_error_message(exc=exc),
+            exc_info=sanitized_exc_info(exc=exc),
+        )
         if is_config_error or is_final_attempt:
             fail_run_and_notify(run_id=run.id, error_message=sanitize_sdk_error_message(exc))  # ty: ignore[unresolved-attribute]
-            raise
+            _raise_sanitized(exc=exc)
         # Retry against the run we already own: re-entering the beat path would
         # be refused by the in-flight guard and strand this run as 'running'.
         raise self.retry(
-            exc=exc,
+            exc=sanitized_exception(exc=exc),
             countdown=300,
             kwargs={'user_id': user_id, 'run_id': run.id, 'attempt': run.attempt},  # ty: ignore[unresolved-attribute]
         )
@@ -307,18 +321,24 @@ def process_stripe_event(self: 'process_stripe_event', stripe_event_id: str) -> 
         event_row.error = ''
         event_row.save(update_fields=['status', 'processed_at', 'error'])
     except Exception as exc:
+        logger.exception(
+            "stripe event %s (%s) failed processing, attempt %d/%d: %s",
+            event_row.stripe_event_id, event_row.event_type, self.request.retries + 1,
+            self.max_retries + 1, sanitize_sdk_error_message(exc=exc),
+            exc_info=sanitized_exc_info(exc=exc),
+        )
         event_row.status = 'failed'
         event_row.error = sanitize_sdk_error_message(exc)
         event_row.save(update_fields=['status', 'error'])
         if self.request.retries >= self.max_retries:
-            raise
+            _raise_sanitized(exc=exc)
         if isinstance(exc, InvoiceNotSettledError):
             countdown = STRIPE_UNSETTLED_RETRY_COUNTDOWNS[
                 min(self.request.retries, len(STRIPE_UNSETTLED_RETRY_COUNTDOWNS) - 1)
             ]
         else:
             countdown = 300
-        raise self.retry(exc=exc, countdown=countdown)
+        _retry_sanitized(task=self, exc=exc, countdown=countdown)
 
 
 @shared_task
@@ -471,15 +491,18 @@ def restore_stripe_customer_email(
         client.v1.customers.update(customer_id, params={'email': email})
         logger.info('restored email on stripe customer %s for user %s', customer_id, user_id)
     except Exception as exc:
-        logger.error(
-            'could not restore email on stripe customer %s for user %s: %s',
+        logger.exception(
+            'could not restore email on stripe customer %s for user %s (attempt %d/%d): %s',
             customer_id,
             user_id,
+            self.request.retries + 1,
+            self.max_retries + 1,
             sanitize_sdk_error_message(exc),
+            exc_info=sanitized_exc_info(exc=exc),
         )
         if self.request.retries >= self.max_retries:
-            raise
-        raise self.retry(exc=exc, countdown=300)
+            _raise_sanitized(exc=exc)
+        _retry_sanitized(task=self, exc=exc, countdown=300)
 
 
 @shared_task
@@ -515,8 +538,12 @@ def retry_failed_runs() -> int:
             claimed = False
             RecommendationRun.objects.filter(id=run_id).update(celery_task_id=task.id)  # ty: ignore[unresolved-attribute]
             dispatched += 1
-        except OperationalError:
-            logger.warning("could not queue retry of run %s; will try again", run_id)
+        except OperationalError as exc:
+            logger.warning(
+                "could not queue retry of run %s; will try again",
+                run_id,
+                exc_info=sanitized_exc_info(exc=exc, drop_message=True),
+            )
             if claimed:
                 unclaim_run_retry(run_id=run_id, retry_at=now + RETRY_REQUEUE_DELAY)
         except Exception:
@@ -576,9 +603,10 @@ def send_account_email_change_notice(
         )
         message.send(fail_silently=False)
     except Exception as exc:
+        _log_task_retry(task=self, exc=exc, user_id=user_id, is_new_address=is_new_address)
         if self.request.retries >= self.max_retries:
-            raise
-        raise self.retry(exc=exc, countdown=300)
+            _raise_sanitized(exc=exc)
+        _retry_sanitized(task=self, exc=exc, countdown=300)
 
 
 @shared_task(bind=True, max_retries=5)
@@ -606,9 +634,10 @@ def send_beta_invite_email(self: 'send_beta_invite_email', signup_id: int) -> No
             reply_to=_support_reply_to(),
         ).send(fail_silently=False)
     except Exception as exc:
+        _log_task_retry(task=self, exc=exc, signup_id=signup_id)
         if self.request.retries >= self.max_retries:
-            raise
-        raise self.retry(exc=exc, countdown=300)
+            _raise_sanitized(exc=exc)
+        _retry_sanitized(task=self, exc=exc, countdown=300)
 
 
 @shared_task(bind=True, max_retries=5)
@@ -641,9 +670,10 @@ def send_email_reverted_notice(self: 'send_email_reverted_notice', user_id: int,
         )
         message.send(fail_silently=False)
     except Exception as exc:
+        _log_task_retry(task=self, exc=exc, user_id=user_id)
         if self.request.retries >= self.max_retries:
-            raise
-        raise self.retry(exc=exc, countdown=300)
+            _raise_sanitized(exc=exc)
+        _retry_sanitized(task=self, exc=exc, countdown=300)
 
 
 @shared_task
@@ -683,6 +713,24 @@ def send_operator_failure_digest() -> int:
     return len(runs)
 
 
+@shared_task(bind=True, max_retries=3)
+def send_operator_critical_alert(self: 'send_operator_critical_alert', subject: str, body: str) -> None:
+    """
+    Delivers a CRITICAL log record to ADMIN_EMAIL (queued by
+    config.log_setup.CriticalEmailHandler). Operator mail: no reply_to. Failure
+    retries a few times, then surfaces as an ordinary task error; it never logs
+    at CRITICAL, so it cannot trigger another alert.
+    """
+    from config.log_setup import deliver_alert_email
+
+    try:
+        deliver_alert_email(subject=subject, body=body)
+    except Exception as exc:
+        if self.request.retries >= self.max_retries:
+            _raise_sanitized(exc=exc)
+        _retry_sanitized(task=self, exc=exc, countdown=60)
+
+
 @shared_task(bind=True, max_retries=5)
 def send_operator_run_exhausted_alert(self: 'send_operator_run_exhausted_alert', run_id: int) -> None:
     """
@@ -714,9 +762,10 @@ def send_operator_run_exhausted_alert(self: 'send_operator_run_exhausted_alert',
             fail_silently=False,
         )
     except Exception as exc:
+        _log_task_retry(task=self, exc=exc, run_id=run_id)
         if self.request.retries >= self.max_retries:
-            raise
-        raise self.retry(exc=exc, countdown=300)
+            _raise_sanitized(exc=exc)
+        _retry_sanitized(task=self, exc=exc, countdown=300)
     RecommendationRun.objects.filter(pk=run.id).update(operator_notified_at=timezone.now())  # ty: ignore[unresolved-attribute]
 
 
@@ -747,9 +796,10 @@ def send_password_reset_email(self: 'send_password_reset_email', user_id: int) -
             reply_to=_support_reply_to(),
         ).send(fail_silently=False)
     except Exception as exc:
+        _log_task_retry(task=self, exc=exc, user_id=user_id)
         if self.request.retries >= self.max_retries:
-            raise
-        raise self.retry(exc=exc, countdown=60 * 2 ** self.request.retries)
+            _raise_sanitized(exc=exc)
+        _retry_sanitized(task=self, exc=exc, countdown=60 * 2 ** self.request.retries)
 
 
 @shared_task(bind=True, max_retries=5)
@@ -796,9 +846,10 @@ def send_price_change_notice_email(self: 'send_price_change_notice_email', notic
         )
         message.send(fail_silently=False)
     except Exception as exc:
+        _log_task_retry(task=self, exc=exc, notice_id=notice_id, user_id=user_id)
         if self.request.retries >= self.max_retries:
-            raise
-        raise self.retry(exc=exc, countdown=300)
+            _raise_sanitized(exc=exc)
+        _retry_sanitized(task=self, exc=exc, countdown=300)
 
 
 @shared_task(bind=True, max_retries=5)
@@ -807,13 +858,17 @@ def send_recommendation_email(self: 'send_recommendation_email', user_id: int, r
     try:
         render_and_send_email(user_id=user_id, run_id=run_id)
     except Exception as exc:
+        _log_task_retry(task=self, exc=exc, user_id=user_id, run_id=run_id)
         if self.request.retries >= self.max_retries:
             RecommendationRun.objects.filter(id=run_id).update(  # ty: ignore[unresolved-attribute]
                 email_status='failed',
-                error_message=f"Email delivery failed after {self.max_retries} retries: {exc}",
+                error_message=(
+                    f"Email delivery failed after {self.max_retries} retries: "
+                    f"{sanitized_exception(exc=exc)}"
+                ),
             )
-            raise
-        raise self.retry(exc=exc, countdown=300)
+            _raise_sanitized(exc=exc)
+        _retry_sanitized(task=self, exc=exc, countdown=300)
 
 
 @shared_task(bind=True, max_retries=5)
@@ -862,10 +917,50 @@ def send_run_failure_notice(self: 'send_run_failure_notice', run_id: int, kind: 
         )
         message.send(fail_silently=False)
     except Exception as exc:
+        _log_task_retry(task=self, exc=exc, run_id=run_id, kind=kind)
         RecommendationRun.objects.filter(pk=run_id).update(**{marker: None})  # ty: ignore[unresolved-attribute]
         if self.request.retries >= self.max_retries:
-            raise
-        raise self.retry(exc=exc, countdown=300)
+            _raise_sanitized(exc=exc)
+        _retry_sanitized(task=self, exc=exc, countdown=300)
+
+
+def _retry_sanitized(*, task: Any, exc: Exception, countdown: int) -> NoReturn:
+    """
+    Schedules task.retry with a sanitized stand-in for exc. Celery logs
+    "Retry in Ns: <repr(exc)>" without exc_info and stores the exception in the
+    result backend, so the raw SDK/broker text must never reach task.retry.
+    """
+    safe = sanitized_exception(exc=exc)
+    try:
+        result = task.retry(exc=safe, countdown=countdown)
+    except Retry as retry:
+        raise retry from None
+    raise result
+
+
+def _raise_sanitized(*, exc: Exception) -> NoReturn:
+    """Final-attempt re-raise: same exception type and frames, sanitized message, no chained raw cause."""
+    raise sanitized_exception(exc=exc) from None
+
+
+def _log_task_retry(*, task: Any, exc: Exception, **context: Any) -> None:
+    """
+    Records a failed send before the retry/raise decision, with the traceback
+    and the ids needed to act. Pass identifiers only (never addresses or
+    tokens). The final attempt logs at ERROR, earlier ones at WARNING.
+    """
+    final = task.request.retries >= task.max_retries
+    logger.log(
+        logging.ERROR if final else logging.WARNING,
+        "%s failed (attempt %d/%d, %s): %s: %s",
+        task.name,
+        task.request.retries + 1,
+        task.max_retries + 1,
+        " ".join(f"{key}={value}" for key, value in context.items()),
+        type(exc).__name__,
+        sanitize_sdk_error_message(exc=exc),
+        exc_info=sanitized_exc_info(exc=exc),
+    )
 
 
 def _support_reply_to() -> list[str]:

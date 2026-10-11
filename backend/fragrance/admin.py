@@ -14,6 +14,7 @@ from django.utils import timezone
 
 from . import billing
 from .ai_providers import registry
+from .ai_providers.base import sanitize_sdk_error_message, sanitized_exc_info
 from .ai_providers.verification import persist_verification_results, run_verification_checks
 from .models import (
     AIModelConfig,
@@ -282,6 +283,13 @@ class BetaSignupAdmin(admin.ModelAdmin):
                     )
                     approved.append(locked.email)
             except Exception as exc:
+                logger.exception(
+                    "could not approve beta signup %s: %s: %s",
+                    signup.pk,
+                    type(exc).__name__,
+                    sanitize_sdk_error_message(exc=exc),
+                    exc_info=sanitized_exc_info(exc=exc),
+                )
                 skipped.append(f"{signup.email} (error: {exc})")
 
         if approved:

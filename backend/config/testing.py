@@ -68,7 +68,7 @@ class RedisSafeTestRunner(DiscoverRunner):
         # broker, never the live Redis a running celery-worker consumes.
         self._previous_celery_env = {name: os.environ.get(name) for name in _TEST_CELERY_ENV}
         os.environ.update(_TEST_CELERY_ENV)
-        self._cache_override = override_settings(CACHES=_TEST_CACHES)
+        self._cache_override = override_settings(CACHES=_TEST_CACHES, CRITICAL_ALERT_ASYNC=False)
         self._cache_override.enable()
 
     def teardown_test_environment(self, **kwargs: Any) -> None:
