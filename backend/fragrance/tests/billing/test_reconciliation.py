@@ -309,6 +309,35 @@ class ReconcileStuckEventsTests(StripeClientTestCase):
         self.assertEqual(summary["events_requeued"], 2)
         self.assertEqual(summary["events_skipped_no_payload"], 1)
 
+    def _stuck_events(self, *, count: int) -> None:
+        payload = {"data": {"object": {"id": "pi_x"}}}
+        for index in range(count):
+            self._event(evt_id=f"evt_{index}", status="received", age=timedelta(hours=1), payload=payload)
+
+    def test_broker_outage_stops_the_requeue_pass_with_one_log_line(self) -> None:
+        from fragrance.billing import _requeue_stuck_events
+        from kombu.exceptions import OperationalError
+
+        self._stuck_events(count=3)
+        summary = {"events_requeued": 0, "events_skipped_no_payload": 0}
+        with patch("fragrance.tasks.process_stripe_event.delay", side_effect=OperationalError("down")) as mock_delay:
+            with self.assertLogs("fragrance.billing", level="ERROR") as logs:
+                _requeue_stuck_events(summary=summary, now=timezone.now(), dry_run=False)
+
+        self.assertEqual(mock_delay.call_count, 1)
+        self.assertEqual(len(logs.output), 1)
+        self.assertEqual(summary["events_requeued"], 0)
+
+    def test_soft_time_limit_during_requeue_propagates(self) -> None:
+        from celery.exceptions import SoftTimeLimitExceeded
+        from fragrance.billing import _requeue_stuck_events
+
+        self._stuck_events(count=2)
+        summary = {"events_requeued": 0, "events_skipped_no_payload": 0}
+        with patch("fragrance.tasks.process_stripe_event.delay", side_effect=SoftTimeLimitExceeded()):
+            with self.assertRaises(SoftTimeLimitExceeded):
+                _requeue_stuck_events(summary=summary, now=timezone.now(), dry_run=False)
+
     @patch("fragrance.billing.reconcile_subscriptions")
     def test_celery_task_delegates(self, mock_reconcile) -> None:
         from fragrance.tasks import reconcile_stripe_subscriptions

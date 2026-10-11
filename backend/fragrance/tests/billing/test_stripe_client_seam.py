@@ -137,11 +137,11 @@ class StripeClientConstructionTests(TestCase):
         with _wire_capture() as (attempts, wire_calls):
             with self.assertRaises(stripe.APIConnectionError):
                 client.v1.customers.create(params={"email": "wire-default@example.test"})
-        self.assertEqual(len(attempts), 3)  # 1 + max_network_retries=2
+        self.assertEqual(len(attempts), 4)  # 1 + max_network_retries=3
         self.assertTrue(all(attempt["self"] is billing._HTTP_CLIENT for attempt in attempts))
         self.assertEqual(wire_calls[0]["headers"]["Authorization"], "Bearer sk_test_construction")
         self.assertEqual(wire_calls[0]["headers"]["Stripe-Version"], "2026-08-26.dahlia")
-        self.assertEqual(wire_calls[0]["timeout"], 20)
+        self.assertEqual(wire_calls[0]["timeout"], (5.0, 15.0))
         self._assert_globals_untouched()
 
     @override_settings(STRIPE_SECRET_KEY="sk_test_construction", STRIPE_API_VERSION="2026-08-26.dahlia")
@@ -182,12 +182,12 @@ class StripeClientConstructionTests(TestCase):
                 billing.get_stripe_client().v1.customers.create(params={"email": "pool-a@example.test"})
             with self.assertRaises(stripe.APIConnectionError):
                 billing.get_stripe_client().v1.customers.create(params={"email": "pool-b@example.test"})
-        # Two default-client calls x 3 attempts each (1 + max_network_retries=2).
+        # Two default-client calls x 4 attempts each (1 + max_network_retries=3).
         # Without this count check, all() over an empty `attempts` list would
         # still pass if _wire_capture's patches silently failed to intercept
         # anything (e.g. a future stripe-python upgrade renames the patched
         # method), so this is what actually makes the test non-vacuous.
-        self.assertEqual(len(attempts), 6)
+        self.assertEqual(len(attempts), 8)
         self.assertTrue(all(attempt["self"] is billing._HTTP_CLIENT for attempt in attempts))
 
         with _wire_capture() as (interactive_attempts, _wire_calls2):
@@ -226,9 +226,9 @@ class StripeClientConstructionTests(TestCase):
                 billing.get_interactive_stripe_client().v1.customers.create(
                     params={"email": "budget-interactive@example.test"}
                 )
-        self.assertEqual(len(default_attempts), 3)
+        self.assertEqual(len(default_attempts), 4)
         self.assertEqual(len(interactive_attempts), 1)
-        self.assertEqual(default_wire[0]["timeout"], 20)
+        self.assertEqual(default_wire[0]["timeout"], (5.0, 15.0))
         self.assertEqual(interactive_wire[0]["timeout"], (3.05, 10))
 
     @override_settings(STRIPE_SECRET_KEY="sk_test_wire", STRIPE_API_VERSION="2026-08-26.dahlia")
@@ -528,7 +528,7 @@ class WhichClientIsUsedOverHTTPTests(TestCase):
         )
         session_client = APIClient()
         session_client.force_authenticate(user=session_user)
-        response = session_client.get("/api/v1/billing/session/cs_seam/")
+        response = session_client.get("/api/v1/billing/session/cs_test_seam/")
         self.assertEqual(response.status_code, 200)
         self.mock_interactive.assert_called()
         self.mock_default.assert_not_called()

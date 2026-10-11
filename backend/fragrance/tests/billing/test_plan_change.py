@@ -56,6 +56,24 @@ class BillingChangePlanViewTests(StripeClientTestCase):
         self.assertEqual(anon.post(self.url, {"plan": "beta-annual"}, format="json").status_code, 401)
         self.assertEqual(anon.delete(self.url).status_code, 401)
 
+    def test_revoked_account_is_409_account_locked_on_every_method(self) -> None:
+        Subscription.objects.filter(user=self.user).update(
+            status="revoked", access_expires_at=timezone.now()
+        )
+
+        responses = [
+            self.client.get(self.url),
+            self.client.post(self.url, {"plan": "beta-annual"}, format="json"),
+            self.client.delete(self.url),
+        ]
+
+        for response in responses:
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.json()["code"], "account_locked")
+        self.stripe.v1.subscriptions.retrieve.assert_not_called()
+        self.stripe.v1.subscription_schedules.create.assert_not_called()
+        self.stripe.v1.subscription_schedules.release.assert_not_called()
+
     def test_staff_is_409_exempt_on_every_method(self) -> None:
         User.objects.filter(pk=self.user.pk).update(is_staff=True)
         self.user.refresh_from_db()
@@ -585,14 +603,16 @@ class StripeInteractiveBudgetTests(TestCase):
         return seen
 
     def test_interactive_timeout_is_a_connect_read_tuple_only_inside_the_budget(self) -> None:
-        self.assertEqual(billing._HTTP_CLIENT._timeout, 20)
+        self.assertEqual(billing._HTTP_CLIENT._timeout, billing._BACKGROUND_TIMEOUT_SECONDS)
+        self.assertEqual(billing._BACKGROUND_TIMEOUT_SECONDS, (5.0, 15.0))
         self.assertEqual(billing._INTERACTIVE_HTTP_CLIENT._timeout, billing._INTERACTIVE_TIMEOUT_SECONDS)
         self.assertEqual(billing._INTERACTIVE_TIMEOUT_SECONDS, (3.05, 10))
 
     @override_settings(STRIPE_SECRET_KEY="sk_test_budget", STRIPE_API_VERSION="2026-08-26.dahlia")
     def test_timeout_and_retries_are_capped_only_inside_the_budget(self) -> None:
         seen_retries = self._record_max_network_retries()
-        self.assertEqual(seen_retries, [2, 0])
+        self.assertEqual(seen_retries, [billing._BACKGROUND_MAX_NETWORK_RETRIES, 0])
+        self.assertEqual(billing._BACKGROUND_MAX_NETWORK_RETRIES, 3)
 
     @override_settings(STRIPE_SECRET_KEY="sk_test_budget", STRIPE_API_VERSION="2026-08-26.dahlia")
     def test_zero_retries_forced_inside_the_budget(self) -> None:

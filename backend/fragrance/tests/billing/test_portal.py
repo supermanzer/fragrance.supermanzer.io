@@ -6,6 +6,7 @@ from django.core.cache.backends.locmem import LocMemCache
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import override_settings
+from django.utils import timezone
 from unittest.mock import patch
 
 from fragrance.models import Subscription
@@ -41,6 +42,34 @@ class BillingPortalViewTests(StripeClientTestCase):
 
     def test_get_is_not_allowed(self) -> None:
         self.assertEqual(self.client.get(self.url).status_code, 405)
+
+    def test_revoked_account_is_409_account_locked_and_makes_no_stripe_call(self) -> None:
+        Subscription.objects.filter(user=self.user).update(
+            status="revoked", access_expires_at=timezone.now()
+        )
+
+        response = self.client.post(self.url)
+
+        self.assertEqual(response.status_code, 409)
+        body = response.json()
+        self.assertEqual(body["code"], "account_locked")
+        self.assertEqual(
+            body["detail"],
+            "This account can no longer be managed here. "
+            "You're welcome to sign up again with a new account.",
+        )
+        self.stripe.v1.billing_portal.sessions.create.assert_not_called()
+        self.stripe.v1.subscriptions.retrieve.assert_not_called()
+
+    def test_revoked_account_without_a_customer_is_still_account_locked(self) -> None:
+        Subscription.objects.filter(user=self.user).update(
+            status="revoked", stripe_customer_id=""
+        )
+
+        response = self.client.post(self.url)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["code"], "account_locked")
 
     def test_returns_url_for_the_callers_own_customer_with_server_built_params(self) -> None:
         self.stripe.v1.subscriptions.retrieve.return_value = _stripe_subscription()

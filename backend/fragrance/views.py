@@ -3,6 +3,7 @@ import codecs
 import csv
 import io
 import logging
+import re
 from datetime import datetime
 from datetime import timezone as dt_timezone
 
@@ -98,6 +99,15 @@ _CONFIRM_NOT_FOUND = {"detail": "Not found."}
 _EXEMPT_RESPONSE_BODY = {
     "code": "exempt",
     "detail": "This account has full access, so there is no billing to manage.",
+}
+
+
+_ACCOUNT_LOCKED_MANAGE_BODY = {
+    "code": "account_locked",
+    "detail": (
+        "This account can no longer be managed here. "
+        "You're welcome to sign up again with a new account."
+    ),
 }
 
 
@@ -336,6 +346,8 @@ class BillingChangePlanView(generics.GenericAPIView):
             state = billing.get_plan_change_state(user=request.user)
         except billing.ExemptAccountError:
             return Response(_EXEMPT_RESPONSE_BODY, status=status.HTTP_409_CONFLICT)
+        except billing.AccountLockedError:
+            return Response(_ACCOUNT_LOCKED_MANAGE_BODY, status=status.HTTP_409_CONFLICT)
         except billing.PlanChangeError as exc:
             return self._plan_change_conflict(exc=exc)
         except (ImproperlyConfigured, stripe.StripeError) as exc:
@@ -363,6 +375,8 @@ class BillingChangePlanView(generics.GenericAPIView):
             )
         except billing.ExemptAccountError:
             return Response(_EXEMPT_RESPONSE_BODY, status=status.HTTP_409_CONFLICT)
+        except billing.AccountLockedError:
+            return Response(_ACCOUNT_LOCKED_MANAGE_BODY, status=status.HTTP_409_CONFLICT)
         except billing.UnknownPlanError:
             return Response({"detail": "Unknown plan."}, status=status.HTTP_400_BAD_REQUEST)
         except billing.PlanChangeError as exc:
@@ -386,6 +400,8 @@ class BillingChangePlanView(generics.GenericAPIView):
             billing.cancel_plan_change(user=request.user)
         except billing.ExemptAccountError:
             return Response(_EXEMPT_RESPONSE_BODY, status=status.HTTP_409_CONFLICT)
+        except billing.AccountLockedError:
+            return Response(_ACCOUNT_LOCKED_MANAGE_BODY, status=status.HTTP_409_CONFLICT)
         except billing.PlanChangeError as exc:
             return self._plan_change_conflict(exc=exc)
         except (ImproperlyConfigured, stripe.StripeError) as exc:
@@ -431,7 +447,7 @@ class BillingCheckoutView(generics.GenericAPIView):
                 status=status.HTTP_409_CONFLICT,
             )
         try:
-            url = billing.create_checkout_session(
+            checkout = billing.start_checkout_session(
                 user=request.user, plan_slug=serializer.validated_data["slug"]
             )
         except billing.AccountLockedError:
@@ -450,6 +466,17 @@ class BillingCheckoutView(generics.GenericAPIView):
                 {"detail": "You already have an active subscription."},
                 status=status.HTTP_409_CONFLICT,
             )
+        except billing.CheckoutPaymentPendingError:
+            return Response(
+                {
+                    "code": "payment_pending",
+                    "detail": (
+                        "Your payment is still being confirmed. Please check back in a "
+                        "minute; you will not be charged twice."
+                    ),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
         except billing.UnknownPlanError:
             return Response({"detail": "Unknown plan."}, status=status.HTTP_400_BAD_REQUEST)
         except ImproperlyConfigured as exc:
@@ -466,8 +493,10 @@ class BillingCheckoutView(generics.GenericAPIView):
         except (
             billing.TermsUrlNotConfiguredError,
             billing.CheckoutSessionUrlMissingError,
+            billing.CheckoutRaceUnresolvedError,
         ):
-            # Already logged by billing.create_checkout_session.
+            # Already logged by billing.create_checkout_session /
+            # _settle_checkout_race.
             return Response(
                 {"detail": "Could not start checkout. Please try again shortly."},
                 status=status.HTTP_502_BAD_GATEWAY,
@@ -483,7 +512,10 @@ class BillingCheckoutView(generics.GenericAPIView):
                 {"detail": "Could not start checkout. Please try again shortly."},
                 status=status.HTTP_502_BAD_GATEWAY,
             )
-        return Response({"url": url}, status=status.HTTP_200_OK)
+        return Response(
+            {"url": checkout.url, "resumed": checkout.resumed},
+            status=status.HTTP_200_OK,
+        )
 
 
 class BillingPortalView(generics.GenericAPIView):
@@ -503,6 +535,8 @@ class BillingPortalView(generics.GenericAPIView):
             url = billing.create_portal_session(user=request.user)
         except billing.ExemptAccountError:
             return Response(_EXEMPT_RESPONSE_BODY, status=status.HTTP_409_CONFLICT)
+        except billing.AccountLockedError:
+            return Response(_ACCOUNT_LOCKED_MANAGE_BODY, status=status.HTTP_409_CONFLICT)
         except billing.NoBillingAccountError:
             return Response(
                 {
@@ -519,6 +553,9 @@ class BillingPortalView(generics.GenericAPIView):
                 failed="Could not open billing management. Please try again shortly.",
             )
         return Response({"url": url}, status=status.HTTP_200_OK)
+
+
+_CHECKOUT_SESSION_ID_PATTERN = re.compile(r"cs_(?:test|live)_[A-Za-z0-9]{1,255}")
 
 
 class BillingSessionView(generics.GenericAPIView):
@@ -539,16 +576,23 @@ class BillingSessionView(generics.GenericAPIView):
         # load, and once access is granted (typically by the webhook) every
         # further poll would otherwise cost a Stripe round trip for nothing.
         subscription = (
-            Subscription.objects.select_related("plan")  # ty: ignore[unresolved-attribute]
+            Subscription.objects.select_related("plan", "user")  # ty: ignore[unresolved-attribute]
             .filter(user=request.user)
             .first()
         )
+        if subscription is not None and subscription.status == "revoked":
+            return Response(_ACCOUNT_LOCKED_MANAGE_BODY, status=status.HTTP_409_CONFLICT)
         if subscription is not None and subscription.has_active_access:
             return Response(
                 {
                     **billing.subscription_status_payload(subscription=subscription),
                     "granted": False,
                 }
+            )
+        if not _CHECKOUT_SESSION_ID_PATTERN.fullmatch(session_id):
+            # Never forwarded to Stripe: same body as an unknown or foreign id.
+            return Response(
+                {"detail": "Checkout session not found."}, status=status.HTTP_404_NOT_FOUND
             )
         try:
             result = billing.fulfill_checkout_session(session_id=session_id, user=request.user)
@@ -604,7 +648,7 @@ class BillingSubscriptionView(generics.GenericAPIView):
 
     def get(self, request: Request) -> Response:
         subscription = (
-            Subscription.objects.select_related("plan").filter(user=request.user).first()  # ty: ignore[unresolved-attribute]
+            Subscription.objects.select_related("plan", "user").filter(user=request.user).first()  # ty: ignore[unresolved-attribute]
             or Subscription(user=request.user)
         )
         return Response(billing.subscription_status_payload(subscription=subscription))

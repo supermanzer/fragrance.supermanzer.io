@@ -104,7 +104,7 @@ STRIPE_EVENT_PAYLOAD_RETENTION_DAYS = 90
 
 
 # The only event types the endpoint is configured for in the Stripe
-# Dashboard -- kept here, not in views.stripe_webhook, since this is the
+# Dashboard (test AND live endpoints) -- kept here, not in views.stripe_webhook, since this is the
 # point that decides whether to act, not just whether to store. Anything
 # else that reaches this task (a Dashboard misconfiguration, or an event
 # type added there without a matching handler) is a documented no-op, not
@@ -114,6 +114,8 @@ STRIPE_HANDLED_EVENT_TYPES = {
     "charge.dispute.created",
     "customer.updated",
     "payment_method.attached",
+    "customer.subscription.updated",
+    "customer.subscription.deleted",
 }
 
 
@@ -273,7 +275,12 @@ def monthly_fragrance_run(
         )
 
 
-@shared_task(bind=True, max_retries=3)
+# soft 300 / hard 330: one attempt may be 2-3 background Stripe calls (~84s
+# each when Stripe is black-holed). SoftTimeLimitExceeded is an Exception, so
+# the handler below records the row as failed and takes the normal 300s retry
+# ladder; the hard limit only fires if that bookkeeping itself hangs, and a
+# killed attempt leaves a row reconcile's _requeue_stuck_events replays.
+@shared_task(bind=True, max_retries=3, soft_time_limit=300, time_limit=330)
 def process_stripe_event(self: 'process_stripe_event', stripe_event_id: str) -> None:
     """
     Does the real Stripe work views.stripe_webhook deliberately doesn't:
@@ -290,6 +297,7 @@ def process_stripe_event(self: 'process_stripe_event', stripe_event_id: str) -> 
     from .billing import (
         InvoiceNotSettledError,
         fulfill_payment_intent,
+        record_subscription_lapse_signal,
         recover_past_due_invoice,
         revoke_for_dispute,
         sync_customer_email,
@@ -314,6 +322,11 @@ def process_stripe_event(self: 'process_stripe_event', stripe_event_id: str) -> 
             )
         elif event_row.event_type == 'payment_method.attached':
             recover_past_due_invoice(payment_method=data_object)
+        elif event_row.event_type in (
+            'customer.subscription.updated',
+            'customer.subscription.deleted',
+        ):
+            record_subscription_lapse_signal(stripe_subscription=data_object)
         elif event_row.event_type not in STRIPE_HANDLED_EVENT_TYPES:
             pass  # unsubscribed event type reached the endpoint anyway -- ignored, not an error
         event_row.status = 'processed'

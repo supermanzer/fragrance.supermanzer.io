@@ -52,6 +52,12 @@ PAYMENT_RECOVERY_STATES = [
 ]
 
 
+LAPSE_REASONS = [
+    ("payment_failed", "Payment failed"),
+    ("cancelled", "Cancelled"),
+]
+
+
 PICK_STATUSES = [("confirmed", "Confirmed"), ("replaced", "Replaced")]
 
 
@@ -287,6 +293,16 @@ class Subscription(models.Model):
         max_length=10, choices=PAYMENT_RECOVERY_STATES, blank=True, default="", db_default=""
     )
     payment_recovery_attempted_at = models.DateTimeField(null=True, blank=True)
+    # Why the customer's Stripe subscription stopped renewing, as last observed
+    # from Stripe by billing.record_subscription_lapse_signal (blank = unknown
+    # or healthy). Advisory only: it never grants or removes access and is
+    # surfaced as `lapse_reason` solely while the account is lapsed, and only
+    # if no payment has been recorded since lapse_signal_at (the moment of
+    # that observation) -- see billing.lapse_reason_payload.
+    lapse_reason = models.CharField(
+        max_length=20, choices=LAPSE_REASONS, blank=True, default="", db_default=""
+    )
+    lapse_signal_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self) -> str:
         return f"{self.user} ({self.status})"

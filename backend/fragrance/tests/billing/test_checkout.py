@@ -704,6 +704,36 @@ class BillingSubscriptionViewTests(TestCase):
         response = APIClient().get(self.url)
         self.assertEqual(response.status_code, 401)
 
+    def test_revoked_account_reports_status_revoked_and_cannot_manage_billing(self) -> None:
+        Subscription.objects.create(
+            user=self.user, status="revoked", stripe_customer_id="cus_locked",
+            access_expires_at=timezone.now(),
+        )
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "revoked")
+        self.assertFalse(body["has_active_access"])
+        self.assertFalse(body["can_manage_billing"])
+
+    def test_existing_row_does_not_query_auth_user_again(self) -> None:
+        from django.test.utils import CaptureQueriesContext
+
+        Subscription.objects.create(
+            user=self.user, status="active", stripe_customer_id="cus_q",
+            access_expires_at=timezone.now() + timedelta(days=5),
+        )
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(
+            [q["sql"] for q in queries.captured_queries if 'FROM "auth_user"' in q["sql"]]
+        )
+
     def test_no_subscription_row_yet_returns_none_status_and_writes_nothing(self) -> None:
         self.assertFalse(Subscription.objects.filter(user=self.user).exists())
         response = self.client.get(self.url)

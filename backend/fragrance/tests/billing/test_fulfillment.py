@@ -8,7 +8,9 @@ import stripe
 from django.contrib.auth.models import User
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.db import connection
 from django.test import TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from fragrance.billing import (
     ComplimentaryGrantError,
@@ -572,11 +574,28 @@ class BillingSessionViewTests(StripeClientTestCase):
         response = self.client.get(self.url_tpl.format("cs_bogus"))
         self.assertEqual(response.status_code, 404)
 
+    def test_malformed_session_ids_are_404_without_calling_stripe(self) -> None:
+        for bad in ("cs_bogus", "cs_test_", "cs_test_a-b", "cs_dev_abc", "cs_test_..", "x" * 300, "cs_test_" + "a" * 300):
+            with self.subTest(session_id=bad[:20]):
+                response = self.client.get(self.url_tpl.format(bad))
+                self.assertEqual(response.status_code, 404)
+                self.assertEqual(response.json(), {"detail": "Checkout session not found."})
+        self.stripe.v1.checkout.sessions.retrieve.assert_not_called()
+
+    def test_well_formed_unknown_session_returns_the_same_404_body(self) -> None:
+        self.stripe.v1.checkout.sessions.retrieve.side_effect = stripe.InvalidRequestError(
+            "no such session", None
+        )
+        response = self.client.get(self.url_tpl.format("cs_live_a1B2c3"))
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json(), {"detail": "Checkout session not found."})
+        self.stripe.v1.checkout.sessions.retrieve.assert_called_once()
+
     def test_other_users_session_returns_404_not_403(self) -> None:
         self.stripe.v1.checkout.sessions.retrieve.return_value = _session(
-            id="cs_not_mine", client_reference_id="999999", customer="cus_view_1", invoice=None, subscription=None,
+            id="cs_test_notmine", client_reference_id="999999", customer="cus_view_1", invoice=None, subscription=None,
         )
-        response = self.client.get(self.url_tpl.format("cs_not_mine"))
+        response = self.client.get(self.url_tpl.format("cs_test_notmine"))
         self.assertEqual(response.status_code, 404)
 
     def test_success_returns_shared_subscription_shape_plus_granted(self) -> None:
@@ -586,11 +605,11 @@ class BillingSessionViewTests(StripeClientTestCase):
             amount_paid=400, lines=[_sdk_line(price_id="price_mo", period_end=period_end)],
         )
         self.stripe.v1.checkout.sessions.retrieve.return_value = _session(
-            id="cs_view_1", client_reference_id=str(self.user.id), customer="cus_view_1",
+            id="cs_test_view1", client_reference_id=str(self.user.id), customer="cus_view_1",
             invoice=invoice, subscription="sub_view_1",
         )
 
-        response = self.client.get(self.url_tpl.format("cs_view_1"))
+        response = self.client.get(self.url_tpl.format("cs_test_view1"))
 
         self.assertEqual(response.status_code, 200)
         body = response.json()
@@ -626,6 +645,57 @@ class BillingSessionViewTests(StripeClientTestCase):
         )
         self.assertTrue(body["has_active_access"])
         self.assertFalse(body["granted"])
+
+    def test_revoked_account_returns_409_account_locked_without_calling_stripe(self) -> None:
+        self.subscription.status = "revoked"
+        self.subscription.access_expires_at = timezone.now()
+        self.subscription.save()
+
+        response = self.client.get(self.url_tpl.format("cs_locked"))
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["code"], "account_locked")
+        self.stripe.v1.checkout.sessions.retrieve.assert_not_called()
+
+    def test_lapsed_row_with_an_unpaid_session_stays_active_status_without_access(self) -> None:
+        # status stays "active" after the window lapses (nothing downgrades it);
+        # has_active_access is the timestamp check, and an unpaid session must
+        # not move either field.
+        expired = timezone.now() - timedelta(days=3)
+        self.subscription.status = "active"
+        self.subscription.plan = self.plan
+        self.subscription.access_expires_at = expired
+        self.subscription.save()
+        self.stripe.v1.checkout.sessions.retrieve.return_value = _session(
+            id="cs_test_unpaid", client_reference_id=str(self.user.id), customer="cus_view_1",
+            invoice=None, subscription=None, payment_status="unpaid",
+        )
+
+        response = self.client.get(self.url_tpl.format("cs_test_unpaid"))
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["status"], "active")
+        self.assertFalse(body["has_active_access"])
+        self.assertFalse(body["granted"])
+        self.stripe.v1.checkout.sessions.retrieve.assert_called_once()
+        self.subscription.refresh_from_db()
+        self.assertEqual(self.subscription.status, "active")
+        self.assertEqual(self.subscription.access_expires_at, expired)
+
+    def test_active_short_circuit_does_not_query_auth_user_again(self) -> None:
+        self.subscription.status = "active"
+        self.subscription.plan = self.plan
+        self.subscription.access_expires_at = timezone.now() + timedelta(days=10)
+        self.subscription.save()
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(self.url_tpl.format("cs_already_active"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(
+            [q["sql"] for q in queries.captured_queries if 'FROM "auth_user"' in q["sql"]]
+        )
 
     def test_throttled_after_scope_limit(self) -> None:
         from django.core.cache import cache

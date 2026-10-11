@@ -18,15 +18,19 @@ on the constraint, not the read.
 """
 
 import logging
+import threading
 import time
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
+from urllib.parse import urlsplit
 
 import stripe
+from celery.exceptions import SoftTimeLimitExceeded
+from kombu.exceptions import OperationalError
 from stripe.params import (
     CustomerCreateParams,
     SubscriptionScheduleCreateParams,
@@ -41,6 +45,7 @@ from django.core.cache import cache
 from django.core.exceptions import ImproperlyConfigured, ValidationError
 from django.core.validators import validate_email
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from .ai_providers.base import sanitize_sdk_error_message, sanitized_exc_info
@@ -76,10 +81,15 @@ logger = logging.getLogger(__name__)
 # value per socket read, not as a total deadline, so the per-call worst case is
 # roughly connect + read = ~13s (0 retries, so exactly one attempt). Per
 # request-path endpoint, worst case: BillingSessionView ~13s (1 call);
-# BillingCheckoutView ~66s (4 calls: reusable-session retrieve, expire a
-# stale session, create-customer, create-session -- create-customer alone is
-# given ONE network retry, see _CUSTOMER_CREATE_MAX_NETWORK_RETRIES, so it is
-# ~13s x 2 attempts plus <=0.5s backoff, ~27s; the other three ~13s each);
+# BillingCheckoutView ~92s (7 calls: reusable-session retrieve, expire a
+# stale session, create-customer, create-session, then on the two-tab race
+# path retrieve + expire the loser -- create-customer alone is given ONE
+# network retry, see _CUSTOMER_CREATE_MAX_NETWORK_RETRIES, so it is ~13s x 2
+# attempts plus <=0.5s backoff, ~27s; the others ~13s each. The call list is
+# not additive: a stored session id implies the Customer already exists, so
+# customer-create and the stored-session lookups never share a request, and
+# the "payment already in flight" path (retrieve + one fulfill_checkout_session
+# retrieve) is shorter still);
 # BillingPortalView and
 # BillingChangePlanView up to ~91s (7 calls on the rare path where an existing
 # schedule must be released before a new one is built) -- all comfortably
@@ -122,9 +132,24 @@ RECONCILE_MAX_CANDIDATES = 200
 RECONCILE_MAX_INVOICES = 5000
 
 
-# Wall-clock budget, below the task's soft_time_limit (240s) so the loop stops
-# itself cleanly before Celery does.
-RECONCILE_TIME_BUDGET_SECONDS = 200.0
+# Wall-clock budget, well below the task's soft_time_limit (240s) so the loop
+# stops itself cleanly before Celery does. It is only checked between invoices.
+# The per-invoice work (_grant_period_for_invoice and what it calls) is ORM-only
+# and makes no Stripe call; the only network I/O in the loop is the paginated
+# list advance at the top of an iteration, before the check. Worst case with
+# Stripe black-holed: the last check passes at ~100s, one page fetch then runs
+# up to ~84s (see _BACKGROUND_TIMEOUT_SECONDS) and the next check breaks, so
+# ~184s against the 240s soft limit. If the soft limit fires anyway it
+# propagates (see reconcile_subscriptions) instead of being counted as a
+# per-invoice error.
+RECONCILE_TIME_BUDGET_SECONDS = 100.0
+
+
+# A stored Checkout Session that completed (paid) within this window and has not
+# been granted yet is a payment in flight, not a stale session: checkout refuses
+# to mint a second payable session over it. Older than this, the webhook retry
+# window and the nightly reconcile own the repair.
+CHECKOUT_PAYMENT_IN_FLIGHT_WINDOW = timedelta(hours=1)
 
 
 STUCK_EVENT_MAX_AGE = timedelta(days=3)
@@ -149,17 +174,88 @@ _CUSTOMER_CREATE_MAX_NETWORK_RETRIES = 1
 # fast." stripe.RequestsClient (not stripe.http_client.RequestsClient) is the
 # public, lazily-exported name in stripe-python 15.x's __init__.py.
 #
-# Default: 20s x up to 2 retries (worst case ~60s per call: 3 attempts x 20s,
-# plus backoff sleep between attempts). Operator-approved rule (2026-09-27):
-# every Stripe call made SYNCHRONOUSLY inside a user's HTTP request uses the
-# interactive client below instead -- this default client is reserved for
-# background/async work (webhook processing in tasks.process_stripe_event,
-# the nightly reconcile_subscriptions sweep, the restore_stripe_customer_email
-# task, and the configure_stripe_portal management command), none of which is
-# bound by gunicorn's --timeout 120. Those are governed by their own Celery
-# soft_time_limit/time_limit instead (see tasks.py), which already accounts
-# for this budget.
-_HTTP_CLIENT = stripe.RequestsClient(timeout=20)
+# Background client (get_stripe_client): every Stripe call made OUTSIDE a user's
+# HTTP request -- webhook processing in tasks.process_stripe_event, the nightly
+# reconcile_subscriptions sweep, the restore_stripe_customer_email task, and
+# the configure_stripe_portal management command -- none of which is bound by
+# gunicorn's --timeout 120. It is the only client allowed to back off, because
+# nobody is waiting on it.
+#
+# Back-off (operator-approved 2026-10-10): up to _BACKGROUND_MAX_NETWORK_RETRIES
+# retries, sleeping 0.5s, 1s, 2s (the SDK's exponential ladder, capped at 5s,
+# each with 50-100% jitter) on timeouts, connection errors, 409, 5xx, and --
+# via _BackoffRequestsClient -- 429, which the SDK alone does not retry unless
+# Stripe sends `stripe-should-retry: true`. Retrying a POST is safe because
+# the SDK sets one Idempotency-Key per call and re-sends the same key on every
+# attempt (proven at the wire in tests/billing/test_stripe_client_seam.py);
+# invoices.pay additionally carries a deterministic key so a Celery re-run of
+# the whole task is also inert. Worst case per call: 4 attempts x (5s connect +
+# 15s read) + 3.5s sleeping, ~84s -- see RECONCILE_TIME_BUDGET_SECONDS.
+_BACKGROUND_TIMEOUT_SECONDS: tuple[float, float] = (5.0, 15.0)
+
+
+_BACKGROUND_MAX_NETWORK_RETRIES = 3
+
+
+class _BackoffRequestsClient(stripe.RequestsClient):
+    """
+    stripe.RequestsClient that also retries HTTP 429 and logs every retry.
+
+    _should_retry is a private SDK hook (stripe==15.6.1 is pinned, and the
+    wire-level tests in test_stripe_client_seam.py fail loudly if an upgrade
+    moves it). The SDK's own decision runs first, so a `stripe-should-retry:
+    false` header is still honoured; 429 is only the fallback. The log line
+    carries the method, URL path (never the query string), status or error
+    class, and attempt number -- no ids, no bodies, no credentials.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._last_request = threading.local()
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        headers: Mapping[str, str] | None,
+        post_data: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        self._last_request.target = f"{method.upper()} {urlsplit(url).path}"
+        return super().request(method, url, headers, post_data, **kwargs)
+
+    def _should_retry(
+        self,
+        response: Any,
+        api_connection_error: Any,
+        num_retries: int,
+        max_network_retries: int | None,
+    ) -> bool:
+        retry = super()._should_retry(
+            response, api_connection_error, num_retries, max_network_retries
+        )
+        reason = ""
+        if not retry and response is not None and num_retries < (max_network_retries or 0):
+            _, status_code, response_headers = response
+            should_retry_header = (response_headers or {}).get("stripe-should-retry")
+            if status_code == 429 and should_retry_header != "false":
+                retry = True
+        if retry:
+            if response is not None:
+                reason = f"http_{response[1]}"
+            elif api_connection_error is not None:
+                reason = type(api_connection_error).__name__
+            logger.warning(
+                "stripe request retry %d/%d for %s: %s",
+                num_retries + 1,
+                max_network_retries or 0,
+                getattr(self._last_request, "target", "unknown"),
+                reason,
+            )
+        return retry
+
+
+_HTTP_CLIENT = _BackoffRequestsClient(timeout=_BACKGROUND_TIMEOUT_SECONDS)
 
 
 _INTERACTIVE_HTTP_CLIENT = stripe.RequestsClient(
@@ -193,6 +289,13 @@ _PERIOD_END_GRACE = timedelta(days=2)
 _PLAN_CHANGE_LOCK_TTL_SECONDS = 130
 
 
+class CheckoutStart(NamedTuple):
+    """Result of start_checkout_session: where to send the user, and whether it is an existing session."""
+
+    url: str
+    resumed: bool
+
+
 class CheckoutError(Exception):
     """Base for checkout-flow errors BillingCheckoutView translates into HTTP responses."""
 
@@ -213,9 +316,10 @@ class SessionLookupError(Exception):
 
 class AccountLockedError(CheckoutError):
     """
-    The Subscription is `revoked` (a dispute). Checkout is refused with a 409
-    until the operator unlocks the account in Django admin; a payment on a
-    locked account is recorded but never grants access.
+    The Subscription is `revoked` (a dispute). Checkout, the billing portal,
+    and plan changes are refused with a 409 until the operator unlocks the
+    account in Django admin; a payment on a locked account is recorded but
+    never grants access.
     """
 
 
@@ -231,6 +335,22 @@ class ChangeInProgressError(PlanChangeError):
     """Another plan-change request for this user holds the lock -- a 409 the client may retry."""
 
     code = "change_in_progress"
+
+
+class CheckoutPaymentPendingError(CheckoutError):
+    """
+    The user's stored Checkout Session has just completed and its payment is
+    not recorded yet (webhook still in flight). A new session would let them
+    subscribe twice, so checkout is refused with a retryable 409.
+    """
+
+
+class CheckoutRaceUnresolvedError(CheckoutError):
+    """
+    Two checkouts raced and the competing session could not be looked up, so
+    which one to keep is unknown. Ours is expired and the user retries: the
+    next attempt resolves from the stored session id.
+    """
 
 
 class CheckoutSessionUrlMissingError(CheckoutError):
@@ -351,6 +471,8 @@ def cancel_plan_change(
     if is_exempt(user=user):
         raise ExemptAccountError()
     local = Subscription.objects.filter(user=user).first()  # ty: ignore[unresolved-attribute]
+    if local is not None and local.status == "revoked":
+        raise AccountLockedError()
     if local is None or not local.stripe_subscription_id:
         raise NoPendingChangeError()
 
@@ -369,6 +491,37 @@ def cancel_plan_change(
 def create_checkout_session(
     *, user: User, plan_slug: str, client: stripe.StripeClient | None = None
 ) -> str:
+    """The Checkout URL for `plan_slug`; see start_checkout_session for the resume semantics."""
+    return start_checkout_session(user=user, plan_slug=plan_slug, client=client).url
+
+
+def start_checkout_session(
+    *, user: User, plan_slug: str, client: stripe.StripeClient | None = None
+) -> CheckoutStart:
+    """
+    Starts Checkout for `plan_slug`, or resumes the user's still-open session.
+    The single tracked session is Subscription.last_checkout_session_id.
+
+    - A stored session that Stripe reports `open` for the same plan, price and
+      ToS setting is retrieved and its (regenerated) url returned with
+      resumed=True: a closed tab or a second click lands on the same page, never
+      on a second payable session.
+    - Open but stale (other plan/price/ToS setting, or no url): expired, then a
+      new session is created.
+    - `complete` and recent (a payment in flight): never replaced -- the grant
+      is attempted through the success-page path and the user is told they are
+      already active (SubscriptionAlreadyActiveError) or to wait
+      (CheckoutPaymentPendingError).
+    - Expired, complete long ago, or unknown to Stripe: forgotten, a new one is
+      created.
+    - Two concurrent first clicks both create a session; under the row lock the
+      later writer notices the other tab's session was stored in the meantime,
+      expires its own and returns the stored one (see _settle_checkout_race),
+      so at most one open session stays tracked.
+
+    A transient Stripe failure while looking the stored session up propagates
+    (a 502): failing closed beats minting a second open session blind.
+    """
     try:
         plan = Plan.objects.get(slug=plan_slug, is_active=True)  # ty: ignore[unresolved-attribute]
     except Plan.DoesNotExist:  # ty: ignore[unresolved-attribute]
@@ -386,11 +539,15 @@ def create_checkout_session(
     if subscription.has_active_access:
         raise SubscriptionAlreadyActiveError()
 
+    seen_session_id = str(subscription.last_checkout_session_id or "")
     reusable_url = _reusable_open_session_url(
-        subscription=subscription, plan=plan, client=client
+        user=user, subscription=subscription, plan=plan, client=client
     )
     if reusable_url:
-        return reusable_url
+        logger.info(
+            "checkout session %s resumed for user %s", seen_session_id, user.pk
+        )
+        return CheckoutStart(url=reusable_url, resumed=True)
 
     # Locked only for the check-and-create-if-missing Customer step. This
     # does span one Stripe network call (Customer.create, up to two attempts
@@ -467,6 +624,7 @@ def create_checkout_session(
     # row must stay "active" so the frontend still sees a lapsed subscriber.
     refusal: AccountLockedError | SubscriptionAlreadyActiveError | None = None
     reason = ""
+    competing_session_id = ""
     with transaction.atomic():
         locked = Subscription.objects.select_for_update().get(  # ty: ignore[unresolved-attribute]
             pk=subscription.pk
@@ -478,10 +636,17 @@ def create_checkout_session(
             refusal = SubscriptionAlreadyActiveError()
             reason = "active"
         else:
-            changes: dict[str, str] = {"last_checkout_session_id": session.id}
-            if locked.status == "none":
-                changes["status"] = "checkout_started"
-            Subscription.objects.filter(pk=locked.pk).update(**changes)  # ty: ignore[unresolved-attribute]
+            stored_session_id = str(locked.last_checkout_session_id or "")
+            if stored_session_id and stored_session_id not in (
+                seen_session_id,
+                session.id,
+            ):
+                competing_session_id = stored_session_id
+            else:
+                changes: dict[str, str] = {"last_checkout_session_id": session.id}
+                if locked.status == "none":
+                    changes["status"] = "checkout_started"
+                Subscription.objects.filter(pk=locked.pk).update(**changes)  # ty: ignore[unresolved-attribute]
     if refusal is not None:
         logger.warning(
             "checkout session %s created for a subscription that became %s mid-request; expiring it",
@@ -498,7 +663,17 @@ def create_checkout_session(
                 sanitize_sdk_error_message(exc),
             )
         raise refusal
-    return url
+    if competing_session_id:
+        return _settle_checkout_race(
+            user=user,
+            subscription_pk=subscription.pk,
+            plan=plan,
+            own_session=session,
+            own_url=url,
+            competing_session_id=competing_session_id,
+            client=client,
+        )
+    return CheckoutStart(url=url, resumed=False)
 
 
 def create_portal_session(
@@ -526,6 +701,10 @@ def create_portal_session(
     if is_exempt(user=user):
         raise ExemptAccountError()
     subscription = Subscription.objects.filter(user=user).first()  # ty: ignore[unresolved-attribute]
+    if subscription is not None and subscription.status == "revoked":
+        # A disputed account gets no Stripe session at all: not even the
+        # best-effort schedule release below runs.
+        raise AccountLockedError()
     if subscription is None or not subscription.stripe_customer_id:
         raise NoBillingAccountError()
 
@@ -856,7 +1035,8 @@ def get_plan_change_state(
 
 def get_stripe_client() -> stripe.StripeClient:
     """
-    The default Stripe client: 20s timeout, up to 2 retries. Built fresh on
+    The background Stripe client: (5, 15)s connect/read timeout, up to 3
+    retries with exponential back-off and jitter (see _BackoffRequestsClient). Built fresh on
     every call (cheap -- StripeClient itself holds only config and a
     reference to the shared, pooled http_client below, so this still honours
     settings changed after process start, e.g. override_settings in tests)
@@ -881,7 +1061,7 @@ def get_stripe_client() -> stripe.StripeClient:
     return stripe.StripeClient(
         api_key=settings.STRIPE_SECRET_KEY,
         stripe_version=settings.STRIPE_API_VERSION,
-        max_network_retries=2,
+        max_network_retries=_BACKGROUND_MAX_NETWORK_RETRIES,
         http_client=_HTTP_CLIENT,
     )
 
@@ -931,6 +1111,33 @@ def grant_complimentary_access(
 
 def is_exempt(*, user: User) -> bool:
     return bool(user.is_staff or user.is_superuser)
+
+
+def lapse_reason_payload(*, subscription: Subscription) -> str | None:
+    """
+    The `lapse_reason` of the subscription payload: "payment_failed",
+    "cancelled", or None (unknown). Non-null only while the account is lapsed
+    -- status `active` with an expired access_expires_at, i.e. a customer who
+    once had access -- and never for revoked or exempt accounts. Hidden once a
+    payment has been recorded after the signal was observed (last_paid_at),
+    which is what clears it on recovery without touching the grant path and
+    keeps a stale failure from resurfacing on a later lapse. Display only:
+    nothing reads this to grant or withhold access.
+    """
+    reason = subscription.lapse_reason
+    signal_at = subscription.lapse_signal_at
+    if not reason or signal_at is None:
+        return None
+    user = subscription.user
+    if subscription.status != "active" or subscription.access_expires_at is None:
+        return None
+    if user.is_staff or user.is_superuser:  # ty: ignore[unresolved-attribute]
+        return None
+    if subscription.has_active_access:
+        return None
+    if subscription.last_paid_at is not None and signal_at <= subscription.last_paid_at:
+        return None
+    return str(reason)
 
 
 def payment_recovery_payload(*, subscription: Subscription) -> dict | None:
@@ -1080,6 +1287,12 @@ def reconcile_subscriptions(
                     )
                 else:
                     summary["rejected"] += 1
+            except SoftTimeLimitExceeded:
+                logger.error(
+                    "reconcile: soft time limit reached after %d invoice(s) seen; stopping",
+                    summary["invoices_seen"],
+                )
+                raise
             except Exception as exc:
                 summary["errors"] += 1
                 logger.error(
@@ -1089,6 +1302,8 @@ def reconcile_subscriptions(
                     sanitize_sdk_error_message(exc),
                     exc_info=sanitized_exc_info(exc=exc),
                 )
+    except SoftTimeLimitExceeded:
+        raise
     except Exception as exc:
         summary["errors"] += 1
         logger.error(
@@ -1231,6 +1446,82 @@ def recover_past_due_invoice(
     if outcome == "paid":
         logger.info("payment recovery for customer %s: paid %d invoice(s)", customer_id, len(open_invoices))
     return outcome
+
+
+def record_subscription_lapse_signal(
+    *, stripe_subscription: dict, client: stripe.StripeClient | None = None
+) -> str:
+    """
+    customer.subscription.updated / .deleted handler, invoked from
+    tasks.process_stripe_event with the event's stored `data.object`. Records
+    WHY the subscription stopped renewing so the paywall can lead with "fix
+    your payment" for a failed charge: Subscription.lapse_reason is
+    "payment_failed" (Stripe status past_due/unpaid, or canceled by Stripe
+    after exhausting retries), "cancelled" (canceled, or cancellation
+    scheduled), or blank (healthy again, or unknown).
+
+    Order-tolerant by construction: the event payload is only the pointer;
+    the state written is re-read from Stripe now, so a late, duplicate or
+    out-of-order event converges on the current truth. The write only applies
+    if it is the newest observation (lapse_signal_at), under one UPDATE.
+
+    Display-only and never an access decision: this writes nothing but the two
+    lapse fields, skips revoked and exempt accounts (disputes stay untouched),
+    and ignores events for a Stripe subscription other than the one the local
+    row tracks (an old, already-replaced subscription). Access still comes
+    only from _grant_period_for_invoice. Returns the outcome name.
+    """
+    customer_id = stripe_subscription.get("customer")
+    if isinstance(customer_id, dict):
+        customer_id = customer_id.get("id")
+    subscription_id = stripe_subscription.get("id")
+    if not customer_id or not subscription_id:
+        return "ignored"
+
+    local = (
+        Subscription.objects.select_related("user")  # ty: ignore[unresolved-attribute]
+        .filter(stripe_customer_id=customer_id)
+        .first()
+    )
+    if local is None:
+        logger.info("subscription event for customer %s has no local Subscription", customer_id)
+        return "unknown_customer"
+    if local.status == "revoked" or is_exempt(user=cast(User, local.user)):
+        return "not_eligible"
+    if local.stripe_subscription_id and local.stripe_subscription_id != subscription_id:
+        return "stale_subscription"
+
+    if client is None:
+        client = get_stripe_client()
+    observed_at = timezone.now()
+    current = client.v1.subscriptions.retrieve(str(subscription_id))
+    # The event picked the row by its customer but the state comes from the
+    # event's subscription id: refuse to write one customer's subscription
+    # state onto another customer's row.
+    current_customer = getattr(current, "customer", None)
+    current_customer_id = (
+        current_customer if isinstance(current_customer, str) else getattr(current_customer, "id", "")
+    )
+    if not current_customer_id or current_customer_id != local.stripe_customer_id:
+        logger.warning(
+            "subscription event for customer %s: subscription %s belongs to a different customer; ignoring",
+            customer_id,
+            subscription_id,
+        )
+        return "ignored"
+    reason = _lapse_reason_for(stripe_subscription=current)
+    if reason is None:
+        return "ignored"
+
+    updated = (
+        Subscription.objects.filter(pk=local.pk)  # ty: ignore[unresolved-attribute]
+        .exclude(status="revoked")
+        .filter(Q(lapse_signal_at__isnull=True) | Q(lapse_signal_at__lt=observed_at))
+        .update(lapse_reason=reason, lapse_signal_at=observed_at)
+    )
+    if not updated:
+        return "stale_event"
+    return reason or "cleared"
 
 
 def revert_customer_email(*, token: object) -> bool:
@@ -1508,18 +1799,20 @@ def subscription_status_payload(*, subscription: Subscription) -> dict:
         # Reads only the in-memory row, so the unsaved placeholder used by
         # BillingSubscriptionView stays DB-free.
         "can_manage_billing": bool(subscription.stripe_customer_id)
-        and not exempt,
+        and not exempt
+        and subscription.status != "revoked",
         # cast, not a runtime check: subscription.user is a required FK, always
         # a real User at runtime -- the static type is only a FK descriptor
         # because no django-stubs is installed (see [tool.ty] in pyproject.toml).
         "quota": quota_snapshot(
             user=cast(User, subscription.user), subscription=subscription
         ),
-        # Not derivable locally: nothing here records whether the lapse was a
-        # failed payment or a cancellation (that needs Stripe's subscription
-        # status and cancellation_details.reason, which no handled event
-        # delivers). Null is the frontend's defined "unknown" fallback.
-        "lapse_reason": None,
+        # "payment_failed" | "cancelled" | null. Recorded from
+        # customer.subscription.updated/deleted by
+        # record_subscription_lapse_signal; null (the frontend's defined
+        # "unknown" fallback) while the account is not lapsed, before either
+        # event has been received, or once a later payment cleared it.
+        "lapse_reason": lapse_reason_payload(subscription=subscription),
         "payment_recovery": payment_recovery_payload(subscription=subscription),
     }
 
@@ -1856,6 +2149,8 @@ def _changeable_subscription(*, user: User) -> Subscription:
     subscription = (
         Subscription.objects.select_related("plan").filter(user=user).first()  # ty: ignore[unresolved-attribute]
     )
+    if subscription is not None and subscription.status == "revoked":
+        raise AccountLockedError()
     if (
         subscription is None
         or not subscription.stripe_subscription_id
@@ -2214,6 +2509,32 @@ def _key_is_live() -> bool:
     return not settings.STRIPE_SECRET_KEY.startswith(("sk_test_", "rk_test_"))
 
 
+def _lapse_reason_for(*, stripe_subscription: Any) -> str | None:
+    """
+    Maps a Stripe subscription's current state to a lapse_reason value:
+    "payment_failed", "cancelled", "" (healthy -- clear it), or None for a
+    state that says nothing (incomplete, paused, a dispute cancellation).
+    """
+    status = getattr(stripe_subscription, "status", None)
+    if status in PAYMENT_RECOVERY_PAYABLE_STATUSES:
+        return "payment_failed"
+    if status == "canceled":
+        details = getattr(stripe_subscription, "cancellation_details", None)
+        cancel_reason = getattr(details, "reason", None)
+        if cancel_reason == "payment_disputed":
+            return None
+        if cancel_reason == "payment_failed":
+            return "payment_failed"
+        return "cancelled"
+    if status in ("active", "trialing"):
+        if getattr(stripe_subscription, "cancel_at_period_end", False) or getattr(
+            stripe_subscription, "cancel_at", None
+        ):
+            return "cancelled"
+        return ""
+    return None
+
+
 def _live_schedule(
     *, stripe_subscription: Any, client: stripe.StripeClient
 ) -> Any | None:
@@ -2457,33 +2778,118 @@ def _requeue_stuck_events(
             )
             continue
         if not dry_run:
-            process_stripe_event.delay(stripe_event_id=event.stripe_event_id)
+            try:
+                process_stripe_event.delay(stripe_event_id=event.stripe_event_id)
+            except SoftTimeLimitExceeded:
+                raise
+            except OperationalError:
+                # The remaining publishes would fail the same way, and each
+                # costs several seconds of broker retries inside the soft limit.
+                logger.error(
+                    "reconcile: broker unavailable; %d stuck event(s) requeued, the rest left for the next sweep",
+                    summary["events_requeued"],
+                )
+                break
         summary["events_requeued"] += 1
 
 
+def _checkout_session_matches_plan(*, session: Any, plan: Plan) -> bool:
+    """
+    Both the slug *and* the price id must match. The slug alone survives
+    exactly the change that matters: if a Plan row is replaced on the same
+    slug with a different Stripe Price (test -> live, or a genuine price
+    change), a stale open session for "beta-monthly" would otherwise be
+    handed back and the user would check out against the old Price --
+    the same "validate the price, not a proxy for it" reasoning the plan
+    applies everywhere else in this file.
+
+    The ToS setting must match too: a reused session created before
+    STRIPE_REQUIRE_TOS_CONSENT was switched would skip the Terms checkbox, or
+    keep demanding one the operator has switched off. The session's own
+    `consent_collection` is the record of what it was created with.
+    """
+    metadata = _metadata_dict(session)
+    consent_collection = getattr(session, "consent_collection", None)
+    has_tos_consent = (
+        getattr(consent_collection, "terms_of_service", None) == "required"
+    )
+    return (
+        metadata.get("plan_slug") == plan.slug
+        and metadata.get("price_id") == plan.stripe_price_id
+        and has_tos_consent == settings.STRIPE_REQUIRE_TOS_CONSENT
+    )
+
+
+def _expire_checkout_session_quietly(
+    *, session_id: str, client: stripe.StripeClient, reason: str
+) -> None:
+    try:
+        client.v1.checkout.sessions.expire(session_id)
+    except stripe.StripeError as exc:
+        logger.warning(
+            "could not expire checkout session %s (%s): %s",
+            session_id,
+            reason,
+            sanitize_sdk_error_message(exc=exc),
+        )
+
+
+def _refuse_if_payment_in_flight(
+    *, user: User, session: Any, client: stripe.StripeClient
+) -> None:
+    """
+    `session` is complete. If it was paid moments ago the grant may simply not
+    have landed yet, and a fresh session would let the user pay twice: run the
+    success-page grant path now (idempotent via ProcessedPayment) and refuse
+    checkout either way -- already active, or still confirming. A session that
+    is old, or whose payment is not paid, is just history and returns.
+    """
+    if getattr(session, "payment_status", None) not in ("paid", "no_payment_required"):
+        return
+    created = getattr(session, "created", None)
+    if not isinstance(created, (int, float)):
+        return
+    age = timezone.now() - datetime.fromtimestamp(created, tz=dt_timezone.utc)
+    if age > CHECKOUT_PAYMENT_IN_FLIGHT_WINDOW:
+        return
+    try:
+        result = fulfill_checkout_session(
+            session_id=str(session.id), user=user, client=client
+        )
+    except SessionLookupError:
+        return
+    if result.get("has_active_access"):
+        raise SubscriptionAlreadyActiveError()
+    raise CheckoutPaymentPendingError()
+
+
 def _reusable_open_session_url(
-    *, subscription: Subscription, plan: Plan, client: stripe.StripeClient
+    *,
+    user: User,
+    subscription: Subscription,
+    plan: Plan,
+    client: stripe.StripeClient,
 ) -> str | None:
     """
-    Resolves subscription.last_checkout_session_id against Stripe:
+    Resolves subscription.last_checkout_session_id against Stripe (the
+    Retrieve API regenerates the url of an open session, which is what makes
+    a closed tab recoverable):
 
-    - No stored id, or Stripe no longer recognizes it (stale/expired enough
-      to 404): nothing to reuse, return None.
-    - Open and for the *same* plan: this is a legitimate retry of an
-      abandoned checkout -- return its url rather than minting a second
-      session (the double-submit protection the plan calls for instead of
-      an idempotency_key).
-    - Open but for a *different* plan (the user changed their mind on the
-      paywall before finishing checkout): expire it so it can't be
-      completed against stale pricing, then fall through to minting a new
-      one.
-    - Open but created under the other STRIPE_REQUIRE_TOS_CONSENT setting
-      (e.g. before the flag existed): expire it the same way. A reused
-      session would otherwise skip the Terms checkbox, or keep demanding
-      one the operator has switched off. The session's own
-      `consent_collection` is the record of what it was created with, so no
-      extra metadata marker is needed.
-    - Anything else (complete, expired): nothing to reuse.
+    - No stored id, or Stripe no longer recognizes it: nothing to reuse.
+    - Open, same plan/price/ToS setting, with a url: return that url instead
+      of minting a second session (the double-submit protection).
+    - Open but stale (different plan, price or ToS setting -- or no url):
+      expire it so it can't be completed against stale pricing, then fall
+      through to minting a new one. If it completed between the retrieve and
+      the expire, the status is re-read and a recent paid completion is
+      treated as a payment in flight.
+    - Complete: a recent paid one raises (see _refuse_if_payment_in_flight);
+      otherwise it is history.
+    - Expired: nothing to reuse.
+
+    Only InvalidRequestError (unknown id) is swallowed; any other Stripe
+    failure propagates so checkout fails closed rather than minting a second
+    open session while the first may still be live.
     """
     session_id = subscription.last_checkout_session_id
     if not session_id:
@@ -2493,28 +2899,86 @@ def _reusable_open_session_url(
         existing = client.v1.checkout.sessions.retrieve(session_id)
     except stripe.InvalidRequestError:
         return None
+    if existing.status == "complete":
+        _refuse_if_payment_in_flight(user=user, session=existing, client=client)
+        return None
     if existing.status != "open":
         return None
-    # Both the slug *and* the price id must match. The slug alone survives
-    # exactly the change that matters: if a Plan row is replaced on the same
-    # slug with a different Stripe Price (test -> live, or a genuine price
-    # change), a stale open session for "beta-monthly" would otherwise be
-    # handed back and the user would check out against the old Price --
-    # the same "validate the price, not a proxy for it" reasoning the plan
-    # applies everywhere else in this file.
-    metadata = _metadata_dict(existing)
-    consent_collection = getattr(existing, "consent_collection", None)
-    has_tos_consent = (
-        getattr(consent_collection, "terms_of_service", None) == "required"
-    )
-    if (
-        metadata.get("plan_slug") == plan.slug
-        and metadata.get("price_id") == plan.stripe_price_id
-        and has_tos_consent == settings.STRIPE_REQUIRE_TOS_CONSENT
-    ):
+    if _checkout_session_matches_plan(session=existing, plan=plan) and existing.url:
         return existing.url
-    client.v1.checkout.sessions.expire(session_id)
+    try:
+        client.v1.checkout.sessions.expire(session_id)
+    except stripe.InvalidRequestError:
+        refreshed = client.v1.checkout.sessions.retrieve(session_id)
+        if refreshed.status == "complete":
+            _refuse_if_payment_in_flight(user=user, session=refreshed, client=client)
     return None
+
+
+def _settle_checkout_race(
+    *,
+    user: User,
+    subscription_pk: int,
+    plan: Plan,
+    own_session: Any,
+    own_url: str,
+    competing_session_id: str,
+    client: stripe.StripeClient,
+) -> CheckoutStart:
+    """
+    Another request stored its own session while this one was creating
+    `own_session`. Exactly one session may stay tracked and payable:
+
+    - the stored one is open and matches the plan: expire ours, return theirs
+      (both tabs end up on the same Checkout page);
+    - the stored one completed and is a recent payment: expire ours and
+      refuse, as _refuse_if_payment_in_flight does;
+    - the lookup fails: fails closed. Ours is expired and a retryable
+      CheckoutRaceUnresolvedError is raised; keeping ours tracked while the
+      other tab holds a live URL would leave two payable sessions;
+    - otherwise (other plan, expired, unknown): ours becomes the tracked
+      session and the stored one is expired if still open.
+    """
+    competitor: Any = None
+    try:
+        competitor = client.v1.checkout.sessions.retrieve(competing_session_id)
+    except stripe.StripeError as exc:
+        logger.warning(
+            "checkout race for user %s: could not look up competing session %s: %s",
+            user.pk,
+            competing_session_id,
+            sanitize_sdk_error_message(exc=exc),
+        )
+        _expire_checkout_session_quietly(
+            session_id=str(own_session.id), client=client, reason="competing session lookup failed"
+        )
+        raise CheckoutRaceUnresolvedError() from None
+
+    if competitor is not None and competitor.status == "open":
+        if _checkout_session_matches_plan(session=competitor, plan=plan) and competitor.url:
+            _expire_checkout_session_quietly(
+                session_id=str(own_session.id), client=client, reason="lost checkout race"
+            )
+            return CheckoutStart(url=str(competitor.url), resumed=True)
+    elif competitor is not None and competitor.status == "complete":
+        try:
+            _refuse_if_payment_in_flight(user=user, session=competitor, client=client)
+        except CheckoutError:
+            _expire_checkout_session_quietly(
+                session_id=str(own_session.id),
+                client=client,
+                reason="payment already in flight",
+            )
+            raise
+
+    Subscription.objects.filter(pk=subscription_pk).exclude(status="revoked").update(  # ty: ignore[unresolved-attribute]
+        last_checkout_session_id=own_session.id
+    )
+    if competitor is not None and competitor.status == "open":
+        _expire_checkout_session_quietly(
+            session_id=competing_session_id, client=client, reason="superseded by a new plan choice"
+        )
+    return CheckoutStart(url=own_url, resumed=False)
 
 
 def _schedule_plan_change_locked(
