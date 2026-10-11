@@ -11,6 +11,14 @@
         <v-btn color="primary" variant="flat" rounded="lg" to="/billing">Go to billing</v-btn>
       </div>
 
+      <div v-else-if="lockedMessage" key="locked">
+        <v-alert type="warning" variant="tonal" class="mb-6 text-left">
+          <p class="text-h6 font-weight-regular mb-2">Access on this account is paused</p>
+          <p class="text-body-2">{{ lockedMessage }}</p>
+        </v-alert>
+        <v-btn color="primary" variant="flat" rounded="lg" to="/billing">Go to billing</v-btn>
+      </div>
+
       <div v-else-if="resolved" key="resolved">
         <v-icon icon="mdi-check-circle-outline" size="48" color="success" class="mb-4" />
         <p class="text-h6 font-weight-regular mb-2">You're in.</p>
@@ -68,6 +76,8 @@
 </template>
 
 <script setup lang="ts">
+import { isAccountLocked, accountLockedMessage } from '~/composables/useBilling'
+
 definePageMeta({ layout: 'default' })
 
 const POLL_INTERVAL_MS = 5000
@@ -85,12 +95,17 @@ const sessionId = computed(() => {
 
 const status = ref<'none' | 'checkout_started' | 'active' | 'revoked'>('none')
 const plan = ref<{ slug: string; name: string } | null>(null)
+const hasAccess = ref(false)
 const pollCount = ref(0)
 const notFoundError = ref(false)
+// The server's account_locked detail (disputed account). Terminal: polling stops and this is
+// shown instead of the checkout outcome.
+const lockedMessage = ref<string | null>(null)
 const pollTimer = ref<ReturnType<typeof setTimeout> | null>(null)
 
 const sessionNotFound = computed(() => !sessionId.value || notFoundError.value)
-const resolved = computed(() => status.value === 'active')
+// Keyed on the server's access verdict, not status: a lapsed subscriber keeps status 'active'.
+const resolved = computed(() => hasAccess.value)
 const revoked = computed(() => status.value === 'revoked')
 
 // Once fulfilment is confirmed, refresh the shared state so the layout banner is truthful
@@ -101,6 +116,7 @@ watch(resolved, (isResolved) => {
 const confirming = computed(
   () =>
     !sessionNotFound.value &&
+    !lockedMessage.value &&
     !resolved.value &&
     !revoked.value &&
     pollCount.value < STILL_PROCESSING_THRESHOLD
@@ -108,6 +124,7 @@ const confirming = computed(
 const stillProcessing = computed(
   () =>
     !sessionNotFound.value &&
+    !lockedMessage.value &&
     !resolved.value &&
     !revoked.value &&
     pollCount.value >= STILL_PROCESSING_THRESHOLD &&
@@ -121,8 +138,9 @@ function clearTimer(): void {
   }
 }
 
-// Chained setTimeout rather than setInterval: this endpoint makes 2-3
-// synchronous outbound Stripe calls per hit on a 1vCPU droplet, and an
+// Chained setTimeout rather than setInterval: this endpoint makes one
+// synchronous outbound Stripe call (checkout.sessions.retrieve) per hit, and none
+// once access is granted, on a 1vCPU droplet, and an
 // interval would let requests stack up if a single call takes longer than
 // the 5s cadence. Each attempt only schedules the next one after it resolves
 // (or is treated as resolved-but-inconclusive on a transient failure).
@@ -137,7 +155,14 @@ async function poll(): Promise<void> {
     const data = await fetchSession(sessionId.value)
     status.value = data.status
     plan.value = data.plan
+    hasAccess.value = data.has_active_access
   } catch (err: any) {
+    if (isAccountLocked(err)) {
+      // Terminal, not transient and not a missing session: stop polling and say so.
+      lockedMessage.value = accountLockedMessage(err)
+      void refreshSubscription()
+      return
+    }
     if (err?.status === 404 || err?.status === 403) {
       notFoundError.value = true
       return
@@ -155,7 +180,7 @@ async function poll(): Promise<void> {
   // up to the 18-attempt bound with nobody watching.
   if (cancelled) return
 
-  if (status.value === 'active' || status.value === 'revoked') return
+  if (hasAccess.value || status.value === 'revoked') return
   if (pollCount.value >= MAX_POLLS) return
   pollTimer.value = setTimeout(poll, POLL_INTERVAL_MS)
 }
@@ -164,7 +189,9 @@ function restartPolling(): void {
   clearTimer()
   pollCount.value = 0
   status.value = 'none'
+  hasAccess.value = false
   notFoundError.value = false
+  lockedMessage.value = null
   void poll()
 }
 

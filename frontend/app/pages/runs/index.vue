@@ -308,7 +308,7 @@
                 v-if="run.attempt > 1"
                 class="text-caption text-medium-emphasis mb-1"
               >
-                Attempt {{ run.attempt }} of {{ run.max_attempts }}.
+                We're trying again automatically.
               </p>
               <p class="text-body-2 text-medium-emphasis">
                 Curating your picks — this takes about 2 minutes.
@@ -368,7 +368,7 @@
                 v-if="run.attempt > 1"
                 class="text-caption text-medium-emphasis mb-2"
               >
-                Delivered on attempt {{ run.attempt }}.
+                Delivered after an automatic retry.
               </p>
 
               <p
@@ -590,18 +590,13 @@ const noticeTitle = computed(() => {
 const noticeBody = computed(() => {
   const run = newest.value
   if (!run) return ''
-  const { attempt, max_attempts: max } = run
   switch (noticeKind.value) {
-    case 'retrying': {
-      const when = retryWhen(run.retry?.next_retry_at ?? null)
-      return run.retry?.retries_remaining === 1
-        ? `Attempt ${attempt} of ${max} ran into a problem on our side. We'll try once more ${when}, and that will be our last automatic try. There's nothing you need to do. We've emailed you a short note too.`
-        : `Attempt ${attempt} of ${max} ran into a problem on our side. We'll try again ${when} and keep trying automatically, so there's nothing you need to do. We've emailed you a short note too.`
-    }
+    case 'retrying':
+      return "This run ran into a problem on our side. We'll try again automatically, so there's nothing you need to do. We've emailed you a short note too."
     case 'running-again':
-      return `Attempt ${attempt} of ${max} is running. It takes about 2 minutes, and your picks will arrive by email as soon as they're ready.`
+      return "We're trying again now. Your picks will arrive by email as soon as they're ready."
     case 'exhausted':
-      return `We tried ${max} times and weren't able to finish. We've been alerted and are looking into it. If you'd like to hear from us directly, write to ${SUPPORT_EMAIL}.`
+      return `We couldn't complete this run. We've been alerted and are looking into it. If you'd like to hear from us directly, write to ${SUPPORT_EMAIL}.`
     case 'stopped':
       return `We won't try again while your account is read-only. Once your subscription is active again, write to ${SUPPORT_EMAIL} and we'll look at it.`
     default:
@@ -619,9 +614,9 @@ function failedSentence(run: RecommendationRun): string {
   if (isLapsed.value) return "This run didn't finish."
   switch (run.retry?.state) {
     case 'scheduled':
-      return `This run ran into a problem on our side. We'll try again ${retryWhen(run.retry.next_retry_at)}.`
+      return "This run ran into a problem on our side. We'll try again automatically."
     case 'exhausted':
-      return `This run couldn't be completed after ${run.max_attempts} attempts. If you'd like to hear from us, write to ${SUPPORT_EMAIL}.`
+      return `We couldn't complete this run. If you'd like to hear from us, write to ${SUPPORT_EMAIL}.`
     default:
       return "This run didn't finish."
   }

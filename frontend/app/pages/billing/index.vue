@@ -40,14 +40,14 @@
           A payment dispute was opened on this account, so new subscriptions are switched off for now. Your collection and past recommendations are still here to read and export. To sort this out, write to us at support@supermanzer.io and we'll help.
         </p>
         <VAlert
-          v-if="portalError"
+          v-if="lockedDetail ?? portalError"
           type="error"
           variant="tonal"
           rounded="lg"
           class="mb-4 mx-auto text-left"
           style="max-width: 480px"
         >
-          {{ portalError }}
+          {{ lockedDetail ?? portalError }}
         </VAlert>
         <div class="d-flex flex-column flex-sm-row justify-center ga-3">
           <VBtn
@@ -381,7 +381,7 @@
               <v-card-title class="text-h6 pt-6 px-6 pb-2 d-flex align-center ga-2">
                 {{ plan.name }}
                 <v-chip
-                  v-if="plan.billing_interval === 'year'"
+                  v-if="showOneMonthFree(plan)"
                   size="small"
                   variant="tonal"
                   color="primary"
@@ -397,8 +397,11 @@
                 <p v-if="plan.billing_interval === 'year'" class="text-body-2 text-medium-emphasis mb-4">
                   {{ formatMonthlyEquivalent(plan) }} per month
                 </p>
-                <p class="text-body-2 text-medium-emphasis mb-4">
+                <p class="text-body-2 text-medium-emphasis mb-1">
                   One recommendation run every 30 days, delivered by email.
+                </p>
+                <p class="text-body-2 text-medium-emphasis mb-4">
+                  As a founding beta member, your feedback will help guide the product.
                 </p>
                 <v-btn
                   color="primary"
@@ -423,7 +426,7 @@
         </p>
 
         <FixPaymentBlock
-          v-if="showFixPayment && lapseReason !== 'payment_failed'"
+          v-if="showFixPayment && lapseReason === null"
           :prominent="false"
           :loading="portalRedirecting"
           :error="portalError"
@@ -472,8 +475,8 @@
 </template>
 
 <script setup lang="ts">
-import { isAccountLocked, type Plan } from '~/composables/useBilling'
-import { FIX_PAYMENT_STARTED_KEY } from '~/composables/usePortal'
+import { isAccountLocked, isPaymentPending, accountLockedMessage, type Plan } from '~/composables/useBilling'
+import { FIX_PAYMENT_STARTED_KEY, FIX_PAYMENT_SEEN_FAILED_KEY } from '~/composables/usePortal'
 import { isAuthError } from '~/composables/useApi'
 
 definePageMeta({ layout: 'default' })
@@ -487,6 +490,7 @@ const {
   planChange,
   planChangeLoading,
   planChangeError,
+  planChangeLocked,
   fetchPlanChange,
   schedulePlanChange,
   cancelPlanChange,
@@ -506,9 +510,11 @@ const checkoutSubmitting = ref(false)
 const selectedSlug = ref<string | null>(null)
 const checkoutError = ref<string | null>(null)
 const accountLocked = ref(false)
+// The server's account_locked detail, shown in the locked view when a 409 put us there.
+const lockedDetail = ref<string | null>(null)
 const route = useRoute()
 const router = useRouter()
-const { portalRedirecting, portalError, manageBilling } = usePortal()
+const { portalRedirecting, portalError, portalLocked, manageBilling } = usePortal()
 
 const locked = computed(() => lapsedKind.value === 'revoked' || accountLocked.value)
 const lapseReason = computed(() => subscription.value?.lapse_reason ?? null)
@@ -521,12 +527,8 @@ const loadError = computed(
   () => Boolean(plansError.value) && !plansLoading.value && !exempt.value && !showSubscriptionView.value && !locked.value
 )
 
-const alreadyActive = computed(() => {
-  const sub = subscription.value
-  if (!sub || sub.status !== 'active') return false
-  if (sub.access_expires_at === null) return true
-  return new Date(sub.access_expires_at) > new Date()
-})
+// The server's access verdict is the single source of truth; a lapsed subscriber keeps status 'active'.
+const alreadyActive = computed(() => subscription.value?.has_active_access === true && !exempt.value)
 
 const noActivePlans = computed(
   () => !isLoading.value && !exempt.value && !locked.value && !loadError.value && !alreadyActive.value && plans.value.length === 0
@@ -534,6 +536,14 @@ const noActivePlans = computed(
 
 function formatPrice(plan: Plan): string {
   return formatPlanPrice(plan)
+}
+
+// Show the chip only when the annual price really is one monthly price cheaper than twelve months.
+function showOneMonthFree(plan: Plan): boolean {
+  if (plan.billing_interval !== 'year') return false
+  const monthly = plans.value.find((p) => p.billing_interval === 'month' && p.currency === plan.currency)
+  if (!monthly) return false
+  return monthly.amount_cents * 12 - plan.amount_cents === monthly.amount_cents
 }
 
 function formatMonthlyEquivalent(plan: Plan): string {
@@ -546,9 +556,11 @@ async function loadAll(): Promise<void> {
   await Promise.all([fetchPlans(), fetchSubscription()])
 }
 
-const showSubscriptionView = computed(() => alreadyActive.value && !exempt.value)
+const showSubscriptionView = computed(() => alreadyActive.value && !exempt.value && !locked.value)
 const showManageBilling = computed(() => showSubscriptionView.value && canManageBilling.value)
-const pending = computed(() => (showSubscriptionView.value ? planChange.value?.pending ?? null : null))
+// Plan-change data (and its controls) exist only where the server says billing is manageable.
+const canChangePlan = computed(() => showSubscriptionView.value && canManageBilling.value)
+const pending = computed(() => (canChangePlan.value ? planChange.value?.pending ?? null : null))
 
 const currentPlan = computed<Plan | null>(() => {
   const slug = subscription.value?.plan?.slug
@@ -561,7 +573,7 @@ const activeThroughLine = computed(() => {
 })
 
 const showPlanSection = computed(() => {
-  if (!showSubscriptionView.value) return false
+  if (!canChangePlan.value) return false
   if (planChangeLoading.value && !planChange.value) return true
   if (planChangeError.value) return true
   const state = planChange.value
@@ -626,6 +638,18 @@ function focusById(id: string): void {
   nextTick(() => document.getElementById(id)?.focus())
 }
 
+// Any billing call answering account_locked (disputed account) lands here: show the server's
+// own wording in the locked view, drop plan-change data, and refetch so the layout agrees.
+// Never offers to re-subscribe on this account.
+function enterLocked(detail: string): void {
+  dialogOpen.value = false
+  accountLocked.value = true
+  lockedDetail.value = detail
+  planChange.value = null
+  void refreshSubscription()
+  focusById('locked-title')
+}
+
 // Plan change dialog
 const dialogOpen = ref(false)
 const dialogTarget = ref<Plan | null>(null)
@@ -673,6 +697,10 @@ async function confirmSwitch(): Promise<void> {
     }
   } catch (err: unknown) {
     if (isAuthError(err)) return
+    if (isAccountLocked(err)) {
+      enterLocked(accountLockedMessage(err))
+      return
+    }
     const e = err as { status?: number; data?: { code?: string } }
     const code = e?.data?.code
     if (e?.status === 409) {
@@ -712,6 +740,10 @@ async function keepCurrentPlan(): Promise<void> {
     if (first) focusById(`plan-switch-${first.slug}`)
   } catch (err: unknown) {
     if (isAuthError(err)) return
+    if (isAccountLocked(err)) {
+      enterLocked(accountLockedMessage(err))
+      return
+    }
     const e = err as { status?: number; data?: { code?: string } }
     if (e?.status === 404 && e.data?.code === 'no_pending_change') {
       await fetchPlanChange()
@@ -794,6 +826,32 @@ function readMarker(): number | null {
   }
 }
 
+function readSeenFailed(): number | null {
+  try {
+    const n = Number(sessionStorage.getItem(FIX_PAYMENT_SEEN_FAILED_KEY))
+    return Number.isFinite(n) && n > 0 ? n : null
+  } catch {
+    return null
+  }
+}
+
+function rememberSeenFailed(at: number): void {
+  seenFailedAttemptAt = at
+  try {
+    sessionStorage.setItem(FIX_PAYMENT_SEEN_FAILED_KEY, String(at))
+  } catch {
+    // ignore
+  }
+}
+
+function clearSeenFailed(): void {
+  try {
+    sessionStorage.removeItem(FIX_PAYMENT_SEEN_FAILED_KEY)
+  } catch {
+    // ignore
+  }
+}
+
 function clearMarker(): void {
   try {
     sessionStorage.removeItem(FIX_PAYMENT_STARTED_KEY)
@@ -825,6 +883,7 @@ function settleRecovery(phase: RecoveryPhase): void {
 function evaluateRecovery(): boolean {
   const sub = subscription.value
   if (sub?.has_active_access) {
+    clearSeenFailed()
     settleRecovery('restored')
     return true
   }
@@ -834,7 +893,7 @@ function evaluateRecovery(): boolean {
     const attemptedAt = new Date(pr.attempted_at).getTime()
     const isNewAttempt = seenFailedAttemptAt === null || attemptedAt > seenFailedAttemptAt
     if (isNewAttempt && (started === null || attemptedAt >= started - STARTED_AT_TOLERANCE_MS)) {
-      seenFailedAttemptAt = attemptedAt
+      rememberSeenFailed(attemptedAt)
       settleRecovery('declined')
       return true
     }
@@ -868,7 +927,7 @@ function checkAgain(): void {
   const pr = subscription.value?.payment_recovery
   if (pr?.state === 'failed') {
     const seen = new Date(pr.attempted_at).getTime()
-    if (Number.isFinite(seen) && (seenFailedAttemptAt === null || seen > seenFailedAttemptAt)) seenFailedAttemptAt = seen
+    if (Number.isFinite(seen) && (seenFailedAttemptAt === null || seen > seenFailedAttemptAt)) rememberSeenFailed(seen)
   }
   startRecovery()
 }
@@ -887,13 +946,24 @@ function portalReturnMarked(): boolean {
 }
 
 watch(locked, (isLocked) => {
-  if (isLocked) clearPollTimer()
+  if (isLocked) {
+    clearPollTimer()
+    clearPendingTimer()
+  }
 })
 
-// Only fetch plan-change data once the subscription resolves as active and non-exempt.
-watch(showSubscriptionView, (visible) => {
+// Only fetch plan-change data once the subscription resolves as active, non-exempt and manageable.
+watch(canChangePlan, (visible) => {
   if (visible) void fetchPlanChange()
   else planChange.value = null
+})
+
+// A plan-change fetch or the portal answered account_locked.
+watch(planChangeLocked, (detail) => {
+  if (detail) enterLocked(detail)
+})
+watch(portalLocked, (isLocked) => {
+  if (isLocked && portalError.value) enterLocked(portalError.value)
 })
 
 // Back from Stripe restores this page from bfcache with the overlay still on.
@@ -901,14 +971,16 @@ function onPageShow(event: PageTransitionEvent): void {
   if (!event.persisted) return
   portalRedirecting.value = false
   checkoutSubmitting.value = false
+  selectedSlug.value = null
   void refreshSubscription()
-  if (showSubscriptionView.value) void fetchPlanChange()
+  if (canChangePlan.value) void fetchPlanChange()
 }
 
 onMounted(async () => {
   window.addEventListener('pageshow', onPageShow)
-  if (showSubscriptionView.value) void fetchPlanChange()
+  if (canChangePlan.value) void fetchPlanChange()
   const returning = portalReturnMarked()
+  seenFailedAttemptAt = readSeenFailed()
   await loadAll()
   if (!returning) return
   if (locked.value || exempt.value || (showSubscriptionView.value && !subscription.value?.payment_recovery)) {
@@ -923,10 +995,51 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   cancelled = true
   clearPollTimer()
+  clearPendingTimer()
   window.removeEventListener('pageshow', onPageShow)
 })
 
+// 409 payment_pending: a payment is still being confirmed. Poll quietly (no skeleton flash) for
+// about two minutes until access arrives, then the page moves to the active view on its own.
+const PENDING_POLL_MS = 5000
+const PENDING_MAX_POLLS = 24
+let pendingTimer: ReturnType<typeof setTimeout> | null = null
+let pendingPolls = 0
+// Bumped whenever the poll is cancelled or restarted, so an in-flight pollPending that resumes
+// after its await can tell it is stale and must not reschedule.
+let pendingGeneration = 0
+
+function clearPendingTimer(): void {
+  pendingGeneration++
+  if (pendingTimer !== null) {
+    clearTimeout(pendingTimer)
+    pendingTimer = null
+  }
+}
+
+async function pollPending(): Promise<void> {
+  const generation = pendingGeneration
+  pendingPolls++
+  await refreshSubscription(true)
+  if (cancelled || locked.value || generation !== pendingGeneration) return
+  if (subscription.value?.has_active_access) {
+    checkoutError.value = null
+    focusById('subscription-title')
+    return
+  }
+  if (pendingPolls >= PENDING_MAX_POLLS) return
+  pendingTimer = setTimeout(pollPending, PENDING_POLL_MS)
+}
+
+function startPendingPoll(): void {
+  clearPendingTimer()
+  pendingPolls = 0
+  pendingTimer = setTimeout(pollPending, PENDING_POLL_MS)
+}
+
 async function subscribe(slug: string): Promise<void> {
+  if (checkoutSubmitting.value) return
+  clearPendingTimer()
   checkoutError.value = null
   checkoutSubmitting.value = true
   selectedSlug.value = slug
@@ -940,13 +1053,21 @@ async function subscribe(slug: string): Promise<void> {
     checkoutSubmitting.value = false
     selectedSlug.value = null
     if (isAccountLocked(err)) {
-      accountLocked.value = true
-      void refreshSubscription()
-      focusById('locked-title')
+      enterLocked(accountLockedMessage(err))
+      return
+    }
+    if (isPaymentPending(err)) {
+      const detail = err?.data?.detail
+      checkoutError.value =
+        typeof detail === 'string' && detail.trim()
+          ? detail
+          : 'Your payment is still being confirmed. Please check back in a minute; you will not be charged twice.'
+      startPendingPoll()
       return
     }
     if (err?.status === 409) {
       await refreshSubscription()
+      notify('Your subscription status has changed. Here are the latest details.')
       return
     }
     if (err?.status === 429) {

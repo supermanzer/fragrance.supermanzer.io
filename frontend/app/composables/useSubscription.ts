@@ -24,7 +24,7 @@ export interface Subscription {
   exempt: boolean
   // Strictly staff; a non-staff superuser is exempt but not is_staff.
   is_staff: boolean
-  // Currently always null server-side: never claim a reason.
+  // Non-null only while lapsed and not revoked. Null means unknown: never claim a reason.
   lapse_reason: 'payment_failed' | 'cancelled' | null
   payment_recovery: PaymentRecovery | null
   // True whenever a billing account exists, lapsed customers included; gate UI on active state too.
@@ -66,12 +66,19 @@ export function useSubscription() {
   const isExempt = computed(() => subscription.value?.exempt === true)
   // Fail-closed: false while the subscription is unknown.
   const isStaff = computed(() => subscription.value?.is_staff === true)
-  const canManageBilling = computed(() => subscription.value?.can_manage_billing === true && !isExempt.value)
+  // A disputed (revoked) account can never open the portal or change plans, whatever the flag says.
+  const canManageBilling = computed(
+    () =>
+      subscription.value?.can_manage_billing === true &&
+      subscription.value.status !== 'revoked' &&
+      !isExempt.value,
+  )
   const unlimited = computed(() => quota.value !== null && quota.value.runs_allowed === null)
 
-  function startFetch(): Promise<void> {
+  // `silent` skips the loading flag so a background poll does not swap the page for skeletons.
+  function startFetch(silent = false): Promise<void> {
     const startedIn = epoch.value
-    loading.value = true
+    if (!silent) loading.value = true
     error.value = null
     const promise = (async () => {
       try {
@@ -82,7 +89,7 @@ export function useSubscription() {
         error.value = 'Failed to load subscription status.'
       } finally {
         if (inFlight?.promise === promise) inFlight = null
-        if (epoch.value === startedIn) loading.value = false
+        if (!silent && epoch.value === startedIn) loading.value = false
       }
     })()
     inFlight = { epoch: startedIn, promise }
@@ -99,13 +106,13 @@ export function useSubscription() {
   // Forced refetch after something changed server-side (402, 409, checkout, trigger).
   // A request already in flight may pre-date that change, so never join it: wait for it
   // to settle, then fetch once more. Concurrent forced calls share that one follow-up.
-  function refreshSubscription(): Promise<void> {
-    if (!inFlight || inFlight.epoch !== epoch.value) return startFetch()
+  function refreshSubscription(silent = false): Promise<void> {
+    if (!inFlight || inFlight.epoch !== epoch.value) return startFetch(silent)
     if (queued && queued.epoch === epoch.value) return queued.promise
     const startedIn = epoch.value
     const promise: Promise<void> = inFlight.promise.then(() => {
       if (queued?.promise === promise) queued = null
-      return epoch.value === startedIn ? startFetch() : undefined
+      return epoch.value === startedIn ? startFetch(silent) : undefined
     })
     queued = { epoch: startedIn, promise }
     return promise

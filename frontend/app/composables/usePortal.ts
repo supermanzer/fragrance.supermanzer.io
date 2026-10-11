@@ -1,7 +1,10 @@
 import { isAuthError } from '~/composables/useApi'
-import { useBilling } from '~/composables/useBilling'
+import { useBilling, isAccountLocked, accountLockedMessage } from '~/composables/useBilling'
 
 export const FIX_PAYMENT_STARTED_KEY = 'fix-payment-started-at'
+// Newest failed payment_recovery.attempted_at (epoch ms) the user has already been shown, so a
+// stale decline is not shown again as a fresh one after the round trip to Stripe.
+export const FIX_PAYMENT_SEEN_FAILED_KEY = 'fix-payment-seen-failed-at'
 
 // Shared by /billing and the layout banner. The marker is both the fallback portal-return
 // signal and the staleness guard for payment_recovery.attempted_at.
@@ -10,10 +13,14 @@ export function usePortal() {
   const { refreshSubscription } = useSubscription()
   const portalRedirecting = ref(false)
   const portalError = ref<string | null>(null)
+  // True when the last attempt failed with account_locked; portalError then holds the server's
+  // detail. Pages switch to their locked state on it.
+  const portalLocked = ref(false)
 
   async function manageBilling(): Promise<void> {
     if (portalRedirecting.value) return
     portalError.value = null
+    portalLocked.value = false
     portalRedirecting.value = true
     try {
       const { url } = await openBillingPortal()
@@ -28,7 +35,11 @@ export function usePortal() {
       portalRedirecting.value = false
       if (isAuthError(err)) return
       const e = err as { status?: number }
-      if (e?.status === 409) {
+      if (isAccountLocked(err)) {
+        portalLocked.value = true
+        portalError.value = accountLockedMessage(err)
+        await refreshSubscription()
+      } else if (e?.status === 409) {
         portalError.value = "Billing management isn't available for this account."
         await refreshSubscription()
       } else if (e?.status === 429) {
@@ -39,5 +50,5 @@ export function usePortal() {
     }
   }
 
-  return { portalRedirecting, portalError, manageBilling }
+  return { portalRedirecting, portalError, portalLocked, manageBilling }
 }
