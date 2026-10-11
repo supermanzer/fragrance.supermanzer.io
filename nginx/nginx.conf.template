@@ -87,7 +87,7 @@ http {
     # signed token (and any future sensitive query param) into cleartext access logs.
     # Log the path only, never the query string.
     log_format no_query '$remote_addr - [$time_local] "$request_method $uri" '
-                         '$status $body_bytes_sent "$http_referer" "$http_user_agent"';
+                         '$status $body_bytes_sent "$http_referer" "$http_user_agent" rid=$request_id';
 
     # Docker's embedded DNS. A static `upstream { server backend:8000; }` block
     # only resolves once, at worker startup, and never again — if the backend
@@ -128,6 +128,7 @@ http {
             proxy_set_header   X-Real-IP         $remote_addr;
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
             proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_set_header   X-Request-ID      $request_id;
             client_max_body_size 2m;
         }
 
@@ -141,6 +142,7 @@ http {
             proxy_set_header   X-Real-IP         $remote_addr;
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
             proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_set_header   X-Request-ID      $request_id;
         }
 
         location /api/v1/recommendations/confirm/ {
@@ -153,6 +155,7 @@ http {
             proxy_set_header   X-Real-IP         $remote_addr;
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
             proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_set_header   X-Request-ID      $request_id;
         }
 
         # Public beta-waitlist signup. A more specific prefix than /api/, so nginx routes
@@ -173,6 +176,7 @@ http {
             proxy_set_header   X-Real-IP         $remote_addr;
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
             proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_set_header   X-Request-ID      $request_id;
             client_max_body_size 8k;
         }
 
@@ -194,6 +198,7 @@ http {
             proxy_set_header   X-Real-IP         $remote_addr;
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
             proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_set_header   X-Request-ID      $request_id;
             client_max_body_size 8k;
         }
 
@@ -248,6 +253,7 @@ http {
             proxy_set_header   X-Real-IP         $remote_addr;
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
             proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_set_header   X-Request-ID      $request_id;
             client_max_body_size 1m;
         }
 
@@ -270,6 +276,7 @@ http {
             proxy_set_header   X-Real-IP         $remote_addr;
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
             proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_set_header   X-Request-ID      $request_id;
         }
 
         # Nuxt's server-component island endpoint. The app has no server components, and
@@ -286,6 +293,7 @@ http {
             proxy_set_header   X-Real-IP         $remote_addr;
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
             proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_set_header   X-Request-ID      $request_id;
         }
     }
 
