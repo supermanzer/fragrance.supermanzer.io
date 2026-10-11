@@ -212,6 +212,34 @@ class TaskSitesTests(TestCase):
         self.assertNotIn(SECRET, str(raised.exception))
 
 
+class PipelineFinalRaiseTests(TestCase):
+    def setUp(self) -> None:
+        AIModelConfig.objects.all().delete()
+        self.user = User.objects.create_user(username="s3", email="s3@example.test", password="pw12345!")
+        active_subscription_for(self.user)
+        FragranceConfig.objects.create(user=self.user, recipient_email="s3@example.test")
+        AIModelConfig.objects.create(
+            family="anthropic",
+            model_id="claude-haiku-4-5-20251001",
+            is_active=True,
+            supports_enum_enforcement=True,
+        )
+
+    def test_failure_reraises_sanitized_and_still_records_the_run_failure(self) -> None:
+        class _Exploding:
+            def generate_structured(self, **kwargs: object) -> dict:
+                raise ConnectionError(RAW)
+
+        with patch("fragrance.tasks.registry.build_provider", return_value=_Exploding()):
+            with self.assertRaises(ConnectionError) as raised:
+                monthly_fragrance_run(user_id=self.user.id)
+
+        self.assertNotIn(SECRET, str(raised.exception))
+        self.assertNotIn(SECRET, "".join(traceback.format_exception(raised.exception)))
+        run = RecommendationRun.objects.get(user=self.user)
+        self.assertEqual(run.status, "failed")
+
+
 class ScrubFilterTests(SimpleTestCase):
     def _trace_record(self) -> logging.LogRecord:
         try:

@@ -79,6 +79,17 @@ EMAIL_REVERT_SALT = "email-revert"
 # task fails it, which enters it into the retry chain. Comfortably above the
 # task's worst case: 3 attempts x 1500s hard limit + 2 x 300s retry backoff.
 IN_FLIGHT_MAX_AGE = timedelta(hours=2)
+# monthly_fragrance_run's hard limit is 25 minutes; 45 leaves 20 minutes for the
+# email task (and its first retry) before an unsent email is requeued.
+PENDING_EMAIL_REQUEUE_AGE = timedelta(minutes=45)
+# Past this a never-sent picks email is stale ("Picks - <old month>" with live
+# rating links): it is marked failed (visible, resendable) instead of mailed.
+PENDING_EMAIL_REQUEUE_MAX_AGE = timedelta(days=7)
+# Bounds the publishes one reaper tick can make against a sick broker.
+PENDING_EMAIL_REQUEUE_BATCH = 20
+# A legitimate send claim lasts seconds (provider timeout 30 s); one hour is a
+# safe floor for presuming the claimant died or its bookkeeping failed.
+STRANDED_CLAIM_AGE = timedelta(hours=1)
 
 
 # Days 29-31 do not exist in every month, so a crontab on one of them would
@@ -803,6 +814,44 @@ def stale_in_flight_runs(*, now: datetime):
     """Pending/running attempts presumed stranded: the complement of the age test in in_flight_runs."""
     return _annotated_with_attempt_clock().filter(
         status__in=_IN_FLIGHT_STATUSES, attempt_clock__lt=now - IN_FLIGHT_MAX_AGE
+    )
+
+
+def stale_pending_email_runs(*, now: datetime):
+    """
+    Completed runs whose email was never claimed for sending: the pipeline
+    marked them done/pending and the publish of send_recommendation_email was
+    lost. Aged from the attempt's start (there is no completion timestamp), so
+    the age floor must clear the pipeline's own time limit; the task's claim,
+    not this age, is what prevents a duplicate send. Bounded above by
+    PENDING_EMAIL_REQUEUE_MAX_AGE; older rows are expired_pending_email_runs.
+    """
+    return _annotated_with_attempt_clock().filter(
+        status="done",
+        email_status="pending",
+        sent_at__isnull=True,
+        attempt_clock__lt=now - PENDING_EMAIL_REQUEUE_AGE,
+        attempt_clock__gte=now - PENDING_EMAIL_REQUEUE_MAX_AGE,
+    ).order_by("id")
+
+
+def expired_pending_email_runs(*, now: datetime):
+    """The unsent-email shape of stale_pending_email_runs, but too old to be mailed."""
+    return _annotated_with_attempt_clock().filter(
+        status="done",
+        email_status="pending",
+        sent_at__isnull=True,
+        attempt_clock__lt=now - PENDING_EMAIL_REQUEUE_MAX_AGE,
+    )
+
+
+def stranded_email_claims(*, now: datetime):
+    """Claimed (sent_at set) but never finalised: the claimant died or its bookkeeping failed."""
+    return RecommendationRun.objects.filter(
+        status="done",
+        email_status="pending",
+        sent_at__isnull=False,
+        sent_at__lt=now - STRANDED_CLAIM_AGE,
     )
 
 

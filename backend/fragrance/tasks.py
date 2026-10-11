@@ -14,6 +14,7 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import EmailMessage, EmailMultiAlternatives, send_mail
+from django.db import close_old_connections, connection
 from django.db.models import F, Max, Q
 from django.template.loader import render_to_string
 from django.utils import timezone
@@ -45,15 +46,17 @@ from .models import (
     Subscription,
 )
 from .search import run_discovery_searches, verify_candidates
-from .permissions import SubscriptionRequired
+from .permissions import SubscriptionRequired, user_has_active_access
 from .services import (
     MAX_RUN_RETRIES,
+    PENDING_EMAIL_REQUEUE_BATCH,
     RETRY_OVERDUE_GRACE,
     QuotaExceeded,
     RunFailureOutcome,
     RunInProgress,
     claim_run_retry,
     expire_overdue_retry,
+    expired_pending_email_runs,
     format_price,
     generate_beta_invite_token,
     generate_recommendation_token,
@@ -61,6 +64,8 @@ from .services import (
     http_url_or_empty,
     record_run_failure,
     stale_in_flight_runs,
+    stale_pending_email_runs,
+    stranded_email_claims,
     start_recommendation_run,
     unclaim_run_retry,
 )
@@ -148,7 +153,10 @@ def flush_expired_jwt_tokens() -> None:
     call_command('flushexpiredtokens')
 
 
-@shared_task(bind=True, max_retries=2, soft_time_limit=1200, time_limit=1500)
+# max_retries=0: one internal try per chain attempt. Every failure is recorded
+# on the run and re-enters the daily retry chain (retry_failed_runs), so Celery's
+# own retries would only multiply LLM spend (attempts x tries) for the same month.
+@shared_task(bind=True, max_retries=0, soft_time_limit=1200, time_limit=1500)
 def monthly_fragrance_run(
     self: 'monthly_fragrance_run', user_id: int, run_id: int | None = None, attempt: int | None = None
 ) -> None:
@@ -247,32 +255,21 @@ def monthly_fragrance_run(
         logger.exception("run %s for user %s exceeded its soft time limit", run.id, user_id)  # ty: ignore[unresolved-attribute]
         return
     except Exception as exc:
-        # Config errors fail immediately, on any attempt — retrying can't fix
-        # them. Everything else keeps the existing retry-then-fail behavior.
-        # Either way, the message that lands in run.error_message (served to
-        # the frontend via the authenticated /runs/ API) is sanitized: a raw
+        # Every failure is recorded on the run (which schedules the next
+        # chain attempt); the message that lands in run.error_message (served
+        # to the frontend via the authenticated /runs/ API) is sanitized: a raw
         # str(exc) on an OpenAI/Anthropic SDK APIError can otherwise carry a
         # vendor-masked key fragment.
-        is_config_error = isinstance(exc, NON_RETRYABLE_CONFIG_EXCEPTIONS)
-        is_final_attempt = self.request.retries >= self.max_retries
         logger.exception(
             "run %s for user %s failed (%s, run attempt %s, provider=%s/%s, "
             "config_error=%s): %s",
             run.id, user_id, type(exc).__name__,  # ty: ignore[unresolved-attribute]
             run.attempt, run.provider_family or '-', run.provider_model_id or '-',
-            is_config_error, sanitize_sdk_error_message(exc=exc),
+            isinstance(exc, NON_RETRYABLE_CONFIG_EXCEPTIONS), sanitize_sdk_error_message(exc=exc),
             exc_info=sanitized_exc_info(exc=exc),
         )
-        if is_config_error or is_final_attempt:
-            fail_run_and_notify(run_id=run.id, error_message=sanitize_sdk_error_message(exc))  # ty: ignore[unresolved-attribute]
-            _raise_sanitized(exc=exc)
-        # Retry against the run we already own: re-entering the beat path would
-        # be refused by the in-flight guard and strand this run as 'running'.
-        raise self.retry(
-            exc=sanitized_exception(exc=exc),
-            countdown=300,
-            kwargs={'user_id': user_id, 'run_id': run.id, 'attempt': run.attempt},  # ty: ignore[unresolved-attribute]
-        )
+        fail_run_and_notify(run_id=run.id, error_message=sanitize_sdk_error_message(exc))  # ty: ignore[unresolved-attribute]
+        _raise_sanitized(exc=exc)
 
 
 # soft 300 / hard 330: one attempt may be 2-3 background Stripe calls (~84s
@@ -411,6 +408,8 @@ def reap_stale_runs() -> int:
     if reaped:
         logger.warning("reaped %d stale in-flight run(s)", reaped)
     reaped += _expire_overdue_retries(now=now)
+    _fail_stranded_email_claims(now=now)
+    _requeue_unsent_emails(now=now)
     return reaped
 
 
@@ -468,9 +467,23 @@ def render_and_send_email(user_id: int, run_id: int) -> None:
     email.content_subtype = 'html'
     email.send()
 
-    run.sent_at = timezone.now()
-    run.email_status = 'sent'
-    run.save(update_fields=['sent_at', 'email_status'])
+    # The message is out. A bookkeeping failure here must not surface as a
+    # delivery failure: the task would release its claim and retry, mailing the
+    # user twice. The claim (sent_at) stays set, so nothing re-sends it.
+    # One retry on a fresh connection first: a dropped DB connection is the
+    # likeliest reason this write fails, and a still-pending row would show the
+    # user "Sending..." for an email that arrived.
+    try:
+        run.sent_at = timezone.now()
+        run.email_status = 'sent'
+        run.save(update_fields=['sent_at', 'email_status'])
+    except Exception:
+        try:
+            if not connection.in_atomic_block:
+                close_old_connections()
+            run.save(update_fields=['sent_at', 'email_status'])
+        except Exception:
+            logger.exception("email for run %s was sent but could not be marked sent", run_id)
 
 
 @shared_task(bind=True, max_retries=5)
@@ -867,13 +880,28 @@ def send_price_change_notice_email(self: 'send_price_change_notice_email', notic
 
 @shared_task(bind=True, max_retries=5)
 def send_recommendation_email(self: 'send_recommendation_email', user_id: int, run_id: int) -> None:
-    """Sends the recommendation email for a completed run. Retried independently of generation."""
+    """
+    Sends the recommendation email for a completed run. Retried independently
+    of generation. The send is claimed first (sent_at is set by an atomic
+    conditional update on email_status='pending'), so a duplicate delivery, a
+    replay after a Celery retry and the reaper's requeue of a lost publish can
+    never mail the user twice; a failed send releases the claim and retries.
+    """
+    claimed = RecommendationRun.objects.filter(  # ty: ignore[unresolved-attribute]
+        pk=run_id, user_id=user_id, email_status='pending', sent_at__isnull=True
+    ).update(sent_at=timezone.now())
+    if not claimed:
+        logger.info("email for run %s is not pending or is already claimed; skipping", run_id)
+        return
     try:
         render_and_send_email(user_id=user_id, run_id=run_id)
     except Exception as exc:
+        RecommendationRun.objects.filter(  # ty: ignore[unresolved-attribute]
+            pk=run_id, user_id=user_id, email_status='pending'
+        ).update(sent_at=None)
         _log_task_retry(task=self, exc=exc, user_id=user_id, run_id=run_id)
         if self.request.retries >= self.max_retries:
-            RecommendationRun.objects.filter(id=run_id).update(  # ty: ignore[unresolved-attribute]
+            RecommendationRun.objects.filter(id=run_id, email_status='pending').update(  # ty: ignore[unresolved-attribute]
                 email_status='failed',
                 error_message=(
                     f"Email delivery failed after {self.max_retries} retries: "
@@ -1007,6 +1035,92 @@ def _enqueue_failure_notices(*, run_id: int, outcome: RunFailureOutcome) -> None
             send_operator_run_exhausted_alert.delay(run_id=run_id)
     except Exception:
         logger.exception("could not queue failure notices for run %s", run_id)
+
+
+def _fail_stranded_email_claims(*, now: datetime) -> int:
+    """
+    A claim (sent_at set) that was never finalised within STRANDED_CLAIM_AGE
+    belongs to a worker that died, or whose post-send bookkeeping failed. The
+    reaper never mails such a row (that would break at-most-once for automatic
+    sends); it makes it a visible failure the user can resend. The message is
+    neutral because the email may in fact have arrived. Returns how many were
+    marked.
+    """
+    stranded_ids = list(stranded_email_claims(now=now).values_list('id', flat=True))
+    if not stranded_ids:
+        return 0
+    marked = RecommendationRun.objects.filter(  # ty: ignore[unresolved-attribute]
+        pk__in=stranded_ids, email_status='pending', sent_at__isnull=False
+    ).update(
+        email_status='failed',
+        error_message="Delivery could not be confirmed. Use Resend if the email did not arrive.",
+    )
+    if marked:
+        logger.error(
+            "email claim never completed for run(s) %s; marked failed so the user can resend", stranded_ids
+        )
+    return marked
+
+
+def _requeue_unsent_emails(*, now: datetime) -> int:
+    """
+    Re-publishes send_recommendation_email for runs that finished but whose
+    publish was lost (broker blip, or a worker death between the save and the
+    publish). Safe against a duplicate: the task claims the send with an atomic
+    conditional update, so a still-running original and this copy cannot both
+    mail. Bounded: rows older than PENDING_EMAIL_REQUEUE_MAX_AGE are marked
+    failed (visible, resendable) rather than mailed, and one tick queues at
+    most PENDING_EMAIL_REQUEUE_BATCH. Users without access (lapsed, revoked,
+    inactive) are skipped and the row left pending: the send task has no
+    access check of its own, and the normal pipeline only starts runs for
+    users with access. Returns how many were queued.
+    """
+    expired = RecommendationRun.objects.filter(  # ty: ignore[unresolved-attribute]
+        pk__in=list(expired_pending_email_runs(now=now).values_list('id', flat=True)),
+        status='done', email_status='pending', sent_at__isnull=True,
+    ).update(
+        email_status='failed',
+        error_message="Email was not delivered. Use Resend to send it.",
+    )
+    if expired:
+        logger.warning("marked %d unsent email(s) older than the requeue ceiling as failed", expired)
+
+    queued = 0
+    skipped_ids: list[int] = []
+    eligible_by_user: dict[int, bool] = {}
+    candidates = list(stale_pending_email_runs(now=now).values_list('id', 'user_id'))
+    for run_id, user_id in candidates:
+        if user_id not in eligible_by_user:
+            user = User.objects.filter(pk=user_id).first()
+            eligible_by_user[user_id] = bool(
+                user is not None and user.is_active and user_has_active_access(user=user)
+            )
+        if not eligible_by_user[user_id]:
+            skipped_ids.append(run_id)
+            continue
+        if queued >= PENDING_EMAIL_REQUEUE_BATCH:
+            break
+        try:
+            send_recommendation_email.delay(user_id=user_id, run_id=run_id)
+            queued += 1
+        except SoftTimeLimitExceeded:
+            raise
+        except OperationalError:
+            # The remaining publishes would fail the same way; the next tick retries.
+            logger.error(
+                "broker unavailable; requeued %d unsent email(s), the rest left for the next tick", queued
+            )
+            break
+        except Exception:
+            logger.exception("could not requeue the unsent email of run %s", run_id)
+    if skipped_ids:
+        logger.info(
+            "left %d unsent email(s) pending: owner has no active access (run(s) %s)",
+            len(skipped_ids), skipped_ids,
+        )
+    if queued:
+        logger.warning("requeued the unsent email of %d completed run(s)", queued)
+    return queued
 
 
 def _expire_overdue_retries(*, now: datetime) -> int:

@@ -280,18 +280,19 @@ class EmailTaskRetryTests(TestCase):
 
     def test_recommendation_email_failure_schedules_a_300s_retry_and_leaves_email_status_alone(self) -> None:
         user = User.objects.create_user(username="recip", email="r@example.com", password="pw12345!")
-        run = RecommendationRun.objects.create(user=user, status="done")
+        run = RecommendationRun.objects.create(user=user, status="done", email_status="pending")
         with patch("fragrance.tasks.render_and_send_email", side_effect=OSError("smtp down")):
             with patch.object(send_recommendation_email, "retry", side_effect=Retry()) as mock_retry:
                 with self.assertRaises(Retry):
                     self._run(task=send_recommendation_email, retries=0, user_id=user.id, run_id=run.id)
         self.assertEqual(mock_retry.call_args.kwargs["countdown"], 300)
         run.refresh_from_db()
-        self.assertIsNone(run.email_status)
+        self.assertEqual(run.email_status, "pending")
+        self.assertIsNone(run.sent_at)
 
     def test_recommendation_email_marks_the_run_failed_once_retries_are_exhausted(self) -> None:
         user = User.objects.create_user(username="recip2", email="r2@example.com", password="pw12345!")
-        run = RecommendationRun.objects.create(user=user, status="done")
+        run = RecommendationRun.objects.create(user=user, status="done", email_status="pending")
         with patch("fragrance.tasks.render_and_send_email", side_effect=OSError("smtp down")):
             with patch.object(send_recommendation_email, "retry") as mock_retry:
                 with self.assertRaises(OSError):

@@ -409,26 +409,21 @@ class BeatPathQuotaTests(TestCase):
             RecommendationRun.objects.filter(user=self.user).count(), 2
         )
 
-    def test_retry_reuses_the_beat_created_run(self) -> None:
+    def test_failure_is_recorded_on_the_beat_created_run_without_a_celery_retry(self) -> None:
         active_subscription_for(self.user)
         with (
             patch(
                 "fragrance.tasks.registry.get_active_config",
                 side_effect=RuntimeError("boom"),
             ),
-            patch.object(
-                monthly_fragrance_run,
-                "retry",
-                side_effect=RuntimeError("retried"),
-            ) as mock_retry,
+            patch.object(monthly_fragrance_run, "retry") as mock_retry,
+            patch("fragrance.tasks.send_run_failure_notice.delay"),
         ):
             with self.assertRaises(RuntimeError):
                 monthly_fragrance_run(user_id=self.user.id)
+        mock_retry.assert_not_called()
         run = RecommendationRun.objects.get(user=self.user)
-        self.assertEqual(
-            mock_retry.call_args.kwargs["kwargs"],
-            {"user_id": self.user.id, "run_id": run.id, "attempt": 1},
-        )
+        self.assertEqual((run.status, run.retry_state, run.attempt), ("failed", "scheduled", 1))
 
 
 class BeatQuotaToleranceTests(TestCase):

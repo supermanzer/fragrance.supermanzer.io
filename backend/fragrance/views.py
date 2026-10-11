@@ -1007,7 +1007,8 @@ class RecommendationRunViewSet(viewsets.ReadOnlyModelViewSet):
             )
         run.email_status = 'pending'
         run.error_message = ''
-        run.save(update_fields=['email_status', 'error_message'])
+        run.sent_at = None
+        run.save(update_fields=['email_status', 'error_message', 'sent_at'])
         send_recommendation_email.delay(user_id=request.user.id, run_id=run.id)
         return Response({"detail": "Email resend queued."}, status=status.HTTP_202_ACCEPTED)
 

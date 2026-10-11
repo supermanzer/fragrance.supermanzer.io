@@ -4,7 +4,6 @@ from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from celery.exceptions import Retry
 from django.contrib.auth.models import User
 from django.utils import timezone
 from fragrance.ai_providers import registry
@@ -221,19 +220,24 @@ class MonthlyRunChainTests(FrozenClockTestCase):
         run.refresh_from_db()
         self.assertEqual((run.status, run.retry_state), ("failed", "scheduled"))
 
-    def test_the_internal_celery_retry_does_not_touch_the_chain(self) -> None:
+    def test_the_task_has_no_internal_celery_retries(self) -> None:
+        self.assertEqual(monthly_fragrance_run.max_retries, 0)
+
+    def test_a_transient_error_fails_the_run_into_the_chain_without_a_celery_retry(self) -> None:
         run = make_run(user=self.user, status="pending")
         with (
             patch("fragrance.tasks.registry.get_active_config", side_effect=RuntimeError("transient")),
-            patch.object(monthly_fragrance_run, "retry", side_effect=Retry()),
+            patch.object(monthly_fragrance_run, "retry") as retry,
             patch("fragrance.tasks.send_run_failure_notice.delay") as notice,
         ):
-            with self.assertRaises(Retry):
+            with self.assertRaises(RuntimeError):
                 monthly_fragrance_run(user_id=self.user.id, run_id=run.id)
 
+        retry.assert_not_called()
         run.refresh_from_db()
-        self.assertEqual((run.status, run.retry_state), ("running", ""))
-        notice.assert_not_called()
+        self.assertEqual((run.status, run.retry_state), ("failed", "scheduled"))
+        self.assertIsNotNone(run.next_retry_at)
+        notice.assert_called_once_with(run_id=run.id, kind="retrying")
 
     def test_a_late_task_for_a_run_that_left_flight_changes_nothing(self) -> None:
         run = make_scheduled_run(user=self.user)
@@ -273,15 +277,16 @@ class MonthlyRunChainTests(FrozenClockTestCase):
         self.assertEqual(run.status, "failed")
         notice.assert_called_once()
 
-    def test_the_internal_celery_retry_carries_the_attempt(self) -> None:
+    def test_a_transient_error_on_a_later_attempt_is_recorded_once_on_that_attempt(self) -> None:
         run = make_run(user=self.user, status="pending", attempt=2)
         with (
             patch("fragrance.tasks.registry.get_active_config", side_effect=RuntimeError("transient")),
-            patch.object(monthly_fragrance_run, "retry", side_effect=Retry()) as retry,
+            patch.object(monthly_fragrance_run, "retry") as retry,
+            patch("fragrance.tasks.send_run_failure_notice.delay"),
         ):
-            with self.assertRaises(Retry):
+            with self.assertRaises(RuntimeError):
                 monthly_fragrance_run(user_id=self.user.id, run_id=run.id, attempt=2)
 
-        self.assertEqual(
-            retry.call_args.kwargs["kwargs"], {"user_id": self.user.id, "run_id": run.id, "attempt": 2}
-        )
+        retry.assert_not_called()
+        run.refresh_from_db()
+        self.assertEqual((run.status, run.retry_state, run.attempt), ("failed", "scheduled", 2))
