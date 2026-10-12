@@ -3,6 +3,9 @@ Read-only report of repeat groups: fragrances a user has been recommended more
 than once, or recommended while already in their collection, judged by the
 same slug rules the pipeline now enforces (fragrance/slugs.py).
 
+Also lists Fragrance rows of one user that share an identical
+(name_slug, house_slug): the rows the backfill migration will disambiguate.
+
 Output is ids and slugs only (user ids, row ids, name/house slugs, counts) --
 no emails, usernames or free text. Performs no writes. Run it before and after
 deploying the dedup change to compare:
@@ -17,7 +20,13 @@ from typing import Any
 from django.core.management.base import BaseCommand
 
 from fragrance.models import Fragrance, Recommendation
-from fragrance.slugs import core_name, houses_compatible, is_unknown_house, slugify_house
+from fragrance.slugs import (
+    core_name,
+    houses_compatible,
+    is_unknown_house,
+    slugify_house,
+    slugify_name,
+)
 
 
 def _cluster(rows: list[dict]) -> list[list[dict]]:
@@ -85,3 +94,20 @@ class Command(BaseCommand):
                         f"fragrance_ids={frag_ids} count={len(rec_ids) + len(frag_ids)}"
                     )
         self.stdout.write(f"repeat_groups={groups}")
+
+        # Fragrance rows of one user whose (name_slug, house_slug) identity is
+        # equal: rows the 0009 backfill disambiguates (stored "-dup<id>") and
+        # the ones migration 0010's unique constraint would otherwise reject.
+        identities: dict[tuple[int, str, str], list[int]] = defaultdict(list)
+        for frag in frags.order_by("id").values("id", "user_id", "name", "house"):
+            key = (frag["user_id"], slugify_name(frag["name"]), slugify_house(frag["house"]))
+            identities[key].append(frag["id"])
+        collisions = 0
+        for (user_id, name_slug, house_slug), ids in sorted(identities.items()):
+            if len(ids) > 1:
+                collisions += 1
+                self.stdout.write(
+                    f"fragrance_identity_collision user_id={user_id} name_slug={name_slug} "
+                    f"house_slug={house_slug or '-'} fragrance_ids={ids}"
+                )
+        self.stdout.write(f"fragrance_identity_collisions={collisions}")

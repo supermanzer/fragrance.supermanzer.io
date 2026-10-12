@@ -29,6 +29,7 @@ CONCENTRATION_WORDS: frozenset[str] = frozenset(
 )
 UNKNOWN_HOUSE_SLUGS: frozenset[str] = frozenset({"", "unknown"})
 SLUG_MAX_LENGTH = 300
+DUP_SLUG_BASE_MAX = 280
 
 _NON_WORD = re.compile(r"[^\w\s]+", re.UNICODE)
 _APOSTROPHES = re.compile(r"['‘’ʼ`´]")
@@ -112,14 +113,28 @@ def same_fragrance(name_a: str, house_a: str, name_b: str, house_b: str) -> bool
     return bool(core_a) and core_a == core_name(name_b) and houses_compatible(house_a, house_b)
 
 
+def disambiguated_name_slug(name_slug: str, pk: int) -> str:
+    """Stored slug for a row the backfill had to disambiguate (see migration 0009)."""
+    return f"{name_slug[:DUP_SLUG_BASE_MAX]}-dup{pk}"
+
+
 def name_in_text(name: str, text: str) -> bool:
     """
-    Normalized form of the verify_candidates title check: the candidate's core
-    name slug appears (as a substring, like the original `.lower() in`) within
-    the text's slug with concentration words removed.
+    Normalized form of the verify_candidates title check. Matches when either
+
+    - the candidate's full name slug (concentration words kept) is a substring
+      of the title's slug -- the original `.lower() in` check, accent- and
+      punctuation-folded; or
+    - its core name (concentration words dropped) appears in the title's core
+      form on token boundaries -- boundaries so that a short core such as "y"
+      (from "Y Eau de Parfum") cannot match inside unrelated words/titles.
     """
-    needle = core_name(name)
-    if not needle:
+    full_name = slugify_name(name)
+    if not full_name:
         return False
-    haystack = _join(_strip_concentration(_tokens(text)) or _tokens(text))
-    return needle in haystack
+    if full_name in slugify_name(text):
+        return True
+    needle = core_name(name)
+    title_tokens = _tokens(text)
+    haystack = _join(_strip_concentration(title_tokens) or title_tokens)
+    return f"-{needle}-" in f"-{haystack}-"

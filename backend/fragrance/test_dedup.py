@@ -139,6 +139,12 @@ class SlugFunctionTests(TestCase):
         self.assertFalse(name_in_text("Ombre Leather", "Tom Ford Noir Extreme"))
         self.assertFalse(name_in_text("!!!", "anything"))
 
+    def test_name_in_text_short_core_names_do_not_overmatch(self) -> None:
+        self.assertFalse(name_in_text("Y Eau de Parfum", "Tom Ford Noir Extreme"))
+        self.assertFalse(name_in_text("Le Parfum", "Tom Ford Ombre Leather"))
+        self.assertTrue(name_in_text("Y Eau de Parfum", "Yves Saint Laurent Y Eau de Parfum review"))
+        self.assertTrue(name_in_text("Y Eau de Parfum", "YSL Y - Fragrantica"))
+
 
 class IdentitySlugPersistenceTests(TestCase):
     def setUp(self) -> None:
@@ -265,6 +271,28 @@ class BackfillMigrationTests(TestCase):
         self.assertTrue(any(f"id={second.id}" in line for line in logs.output))
         keys = Fragrance.objects.values_list("user_id", "name_slug", "house_slug")
         self.assertEqual(len(set(keys)), 4)
+
+
+    def test_disambiguated_row_stays_editable_through_the_api(self) -> None:
+        from django.apps import apps
+
+        first = self._legacy("Ombre Leather", "Tom Ford")
+        second = self._legacy("Ombré Leather", "Tom Ford")
+        _backfill_migration.backfill_identity_slugs(apps, None)
+        second.refresh_from_db()
+        self.assertEqual(second.name_slug, f"ombre-leather-dup{second.id}")
+
+        client = APIClient()
+        client.force_authenticate(user=self.user)
+        response = client.patch(
+            f"/api/v1/collection/{second.id}/", {"notes": "still mine"}, format="json"
+        )
+        self.assertEqual(response.status_code, 200)
+        second.refresh_from_db()
+        self.assertEqual(second.notes, "still mine")
+        self.assertEqual(second.name_slug, f"ombre-leather-dup{second.id}")
+        first.refresh_from_db()
+        self.assertEqual(first.name_slug, "ombre-leather")
 
 
 class RatingIdentityTests(TestCase):
@@ -619,6 +647,20 @@ class ReportRepeatRecommendationsCommandTests(TestCase):
         self.assertNotIn("vetiver", text)
         self.assertNotIn("dave", text)
         self.assertEqual(before, (Recommendation.objects.count(), Fragrance.objects.count()))
+
+    def test_reports_predicted_fragrance_identity_collisions(self) -> None:
+        user = User.objects.create_user(username="dave", password="x")
+        a = Fragrance.objects.create(user=user, name="Ombre Leather", house="Tom Ford", status="own")
+        b = Fragrance.objects.create(user=user, name="Other", house="Tom Ford", status="own")
+        Fragrance.objects.filter(pk=b.pk).update(name="Ombré Leather", name_slug="legacy")
+        out = StringIO()
+        call_command("report_repeat_recommendations", stdout=out)
+        self.assertIn(
+            f"fragrance_identity_collision user_id={user.id} name_slug=ombre-leather "
+            f"house_slug=tom-ford fragrance_ids=[{a.id}, {b.id}]",
+            out.getvalue(),
+        )
+        self.assertIn("fragrance_identity_collisions=1", out.getvalue())
 
     def test_promoted_fragrance_is_not_counted_as_a_second_occurrence(self) -> None:
         user = User.objects.create_user(username="dave", password="x")

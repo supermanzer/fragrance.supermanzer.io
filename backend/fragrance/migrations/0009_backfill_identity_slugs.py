@@ -21,11 +21,10 @@ import logging
 
 from django.db import migrations
 
-from fragrance.slugs import slugify_house, slugify_name
+from fragrance.slugs import disambiguated_name_slug, slugify_house, slugify_name
 
 logger = logging.getLogger(__name__)
 BATCH_SIZE = 500
-SLUG_BASE_MAX = 280
 
 
 def _flush(model, rows: list) -> None:
@@ -59,7 +58,7 @@ def backfill_identity_slugs(apps, schema_editor) -> None:
         if key in seen:
             collisions += 1
             original = name_slug
-            name_slug = f"{name_slug[:SLUG_BASE_MAX]}-dup{frag.id}"
+            name_slug = disambiguated_name_slug(name_slug=name_slug, pk=frag.id)
             logger.warning(
                 "backfill_identity_slugs: fragrance id=%s user_id=%s slug collision on "
                 "name_slug=%r house_slug=%r; stored name_slug=%r",

@@ -1,7 +1,7 @@
 from django.contrib.auth.models import User
 from django.db import IntegrityError, models, transaction
 
-from .slugs import slugify_house, slugify_name
+from .slugs import disambiguated_name_slug, slugify_house, slugify_name
 
 # Constants
 AI_PROVIDER_FAMILIES = [
@@ -60,7 +60,15 @@ class IdentitySlugMixin(models.Model):
         abstract = True
 
     def save(self, *args: object, **kwargs: object) -> None:
-        self.name_slug = slugify_name(self.name)
+        base_slug = slugify_name(self.name)
+        # Keep the "-dup<pk>" suffix the 0009 backfill gave a colliding legacy
+        # row; recomputing the plain slug would make every later save of that
+        # row (even notes-only) violate the identity constraint.
+        keeps_suffix = self.pk is not None and self.name_slug == disambiguated_name_slug(
+            name_slug=base_slug, pk=self.pk
+        )
+        if not keeps_suffix:
+            self.name_slug = base_slug
         self.house_slug = slugify_house(self.house)
         update_fields = kwargs.get("update_fields")
         if update_fields is not None and {"name", "house"} & set(update_fields):

@@ -20,6 +20,7 @@ from .dedup import (
     batch_known,
     build_known_fragrances,
     describe_rejections,
+    describe_rejections_as_slugs,
     fragrance_label,
     log_rejections,
     partition_candidates,
@@ -356,6 +357,7 @@ def select_candidates(
     ) + COLLECTION_NOTE.format(collection=_known_text(known, {REASON_COLLECTION}) or "none")
 
     rejected_text = ""
+    rejected_slugs = ""
     for attempt in range(1 + MAX_DEDUP_REASKS):
         result = provider.generate_structured(
             prompt=_with_rejections(base_prompt=base_prompt, rejected_text=rejected_text),
@@ -379,10 +381,13 @@ def select_candidates(
         rejected_text = "; ".join(
             filter(None, [rejected_text, describe_rejections(rejections=rejections)])
         )
+        rejected_slugs = "; ".join(
+            filter(None, [rejected_slugs, describe_rejections_as_slugs(rejections=rejections)])
+        )
 
     raise CandidateCountError(
         f"select_candidates could not produce {EXPECTED_CANDIDATE_COUNT} non-repeat "
-        f"candidates after {1 + MAX_DEDUP_REASKS} attempts; last rejections: {rejected_text}"
+        f"candidates after {1 + MAX_DEDUP_REASKS} attempts; rejections: {rejected_slugs}"
     )
 
 
@@ -419,6 +424,7 @@ def select_replacement(
     ) + BATCH_NOTE.format(batch=batch_text or "none")
 
     rejected_text = ""
+    rejected_slugs = ""
     for attempt in range(1 + MAX_DEDUP_REASKS):
         result = provider.generate_structured(
             prompt=_with_rejections(base_prompt=base_prompt, rejected_text=rejected_text),
@@ -440,10 +446,13 @@ def select_replacement(
         rejected_text = "; ".join(
             filter(None, [rejected_text, describe_rejections(rejections=rejections)])
         )
+        rejected_slugs = "; ".join(
+            filter(None, [rejected_slugs, describe_rejections_as_slugs(rejections=rejections)])
+        )
 
     raise CandidateCountError(
         f"select_replacement could not produce a non-repeat replacement after "
-        f"{1 + MAX_DEDUP_REASKS} attempts; last rejections: {rejected_text}"
+        f"{1 + MAX_DEDUP_REASKS} attempts; rejections: {rejected_slugs}"
     )
 
 

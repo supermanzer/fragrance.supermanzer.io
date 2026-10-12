@@ -12,7 +12,7 @@ import logging
 from dataclasses import dataclass
 
 from .models import Fragrance, Recommendation
-from .slugs import core_name, is_unknown_house, same_fragrance, slugify_house
+from .slugs import combined_slug, core_name, is_unknown_house, same_fragrance, slugify_house
 
 logger = logging.getLogger(__name__)
 
@@ -136,5 +136,13 @@ def log_rejections(*, user_id: int, stage: str, attempt: int, rejections: list[R
 def describe_rejections(rejections: list[Rejection]) -> str:
     return "; ".join(
         f"{fragrance_label(r.candidate['name'], r.candidate.get('house', ''))} ({r.reason})"
+        for r in rejections
+    )
+
+
+def describe_rejections_as_slugs(rejections: list[Rejection]) -> str:
+    """Slug-only form for exception text (ends up in run.error_message / tracebacks)."""
+    return "; ".join(
+        f"{combined_slug(name=r.candidate['name'], house=r.candidate.get('house', ''))} ({r.reason})"
         for r in rejections
     )
