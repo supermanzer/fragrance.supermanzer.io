@@ -10,6 +10,7 @@ from django.db import IntegrityError, transaction
 from rest_framework.request import Request
 
 from .models import FRAGRANCE_STATUSES, Fragrance, Recommendation
+from .slugs import slugify_house, slugify_name
 
 REQUIRED_COLUMNS = {"fragrance", "status", "house", "notes"}
 
@@ -62,20 +63,49 @@ def import_collection_from_csv(user: User, file_obj: IO[str]) -> dict:
             skipped += 1
             continue
 
-        _, was_created = Fragrance.objects.update_or_create(
-            user=user,
-            name=name,
-            defaults={"house": house, "status": status, "notes": notes},
-        )
-        if was_created:
+        existing = _find_collection_row(user=user, name=name, house=house)
+        if existing is None:
+            Fragrance.objects.create(
+                user=user, name=name, house=house, status=status, notes=notes
+            )
             created += 1
         else:
+            existing.name = name
+            existing.house = house
+            existing.status = status
+            existing.notes = notes
+            existing.save()
             updated += 1
 
     if created == 0 and updated == 0 and skipped == 0:
         raise ValueError("CSV contains no data rows.")
 
     return {"created": created, "updated": updated, "skipped": skipped}
+
+
+def _find_collection_row(user: User, name: str, house: str) -> Fragrance | None:
+    """
+    The user's Fragrance row for (name, house), or None.
+
+    Identity is (name_slug, house_slug). One compatibility rule is kept from
+    the old name-only key so a re-import can still fill in or correct a
+    house: when no row has this exact identity, a single row of the same name
+    whose house is blank/unknown (or when this row's house is blank) is
+    treated as the same fragrance. If that is ambiguous (several same-named
+    rows), a new row is created rather than guessing.
+    """
+    name_slug = slugify_name(name)
+    house_slug = slugify_house(house)
+    same_name = list(
+        Fragrance.objects.filter(user=user, name_slug=name_slug).order_by("id")
+    )
+    for row in same_name:
+        if slugify_house(row.house) == house_slug:
+            return row
+    wildcard = [
+        row for row in same_name if house_slug == "" or slugify_house(row.house) == ""
+    ]
+    return wildcard[0] if len(wildcard) == 1 and len(same_name) == 1 else None
 
 
 class RatingConflict(Exception):
@@ -96,13 +126,15 @@ def apply_recommendation_rating(recommendation: Recommendation, action: str) -> 
     1. FK check first: look up any Fragrance row already linked to *this*
        recommendation via source_recommendation. This is the authoritative,
        rename-proof answer to "has this recommendation already been rated" —
-       unlike a (user, name) lookup, it can't be defeated by the user renaming
+       unlike a (user, name, house) lookup, it can't be defeated by the user renaming
        the linked Fragrance row after the fact. If found: idempotent resubmission
        if the action matches, RatingConflict otherwise.
-    2. Only if nothing is linked yet, fall back to the (user, name) lookup, rather
+    2. Only if nothing is linked yet, fall back to the (user, name_slug,
+       house_slug) identity lookup -- same name from a different house is a
+       different fragrance and gets its own row -- rather
        than via get_or_create or the recommendation's own promoted_fragrance
        reverse accessor, because the row that needs protecting is keyed on
-       (user, name) and a different recommendation (same name, different run)
+       that identity and a different recommendation (same name, different run)
        can already own it. Branches on that row's source_recommendation:
 
        - No existing row: create one, linked to this recommendation.
@@ -120,7 +152,7 @@ def apply_recommendation_rating(recommendation: Recommendation, action: str) -> 
          un-rates the other one.
 
        This branch runs inside a nested transaction.atomic() savepoint with
-       select_for_update() on the (user, name) read, and catches IntegrityError
+       select_for_update() on the identity read, and catches IntegrityError
        on the create/claim writes. Two races are covered here, and both matter:
        select_for_update() serializes two concurrent requests that both find the
        same *unlinked* row (source_recommendation_id is None) so the second
@@ -132,8 +164,8 @@ def apply_recommendation_rating(recommendation: Recommendation, action: str) -> 
     Returns (fragrance, is_new_rating). is_new_rating is False only for the idempotent
     resubmission case (same recommendation, same action already recorded).
     Raises RatingConflict if a different action was already recorded for this
-    recommendation, or if the (user, name) row is already claimed by a different
-    recommendation — first rating for a given (user, name, recommendation) wins.
+    recommendation, or if the (user, name, house) row is already claimed by a different
+    recommendation — first rating for a given (user, name, house, recommendation) wins.
     """
     linked = Fragrance.objects.filter(source_recommendation_id=recommendation.id).first()
     if linked is not None:
@@ -143,9 +175,16 @@ def apply_recommendation_rating(recommendation: Recommendation, action: str) -> 
 
     try:
         with transaction.atomic():
-            existing = Fragrance.objects.select_for_update().filter(
-                user=recommendation.user, name=recommendation.name
-            ).first()
+            existing = (
+                Fragrance.objects.select_for_update()
+                .filter(
+                    user=recommendation.user,
+                    name_slug=slugify_name(recommendation.name),
+                    house_slug=slugify_house(recommendation.house),
+                )
+                .order_by("id")
+                .first()
+            )
 
             if existing is None:
                 fragrance = Fragrance.objects.create(
@@ -184,9 +223,15 @@ def _resolve_after_race(
             return linked, False
         raise RatingConflict(existing_action=linked.status)
 
-    existing = Fragrance.objects.filter(
-        user=recommendation.user, name=recommendation.name
-    ).first()
+    existing = (
+        Fragrance.objects.filter(
+            user=recommendation.user,
+            name_slug=slugify_name(recommendation.name),
+            house_slug=slugify_house(recommendation.house),
+        )
+        .order_by("id")
+        .first()
+    )
     if existing is not None:
         raise RatingConflict(existing_action=existing.status)
 

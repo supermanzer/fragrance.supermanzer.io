@@ -1,6 +1,8 @@
 from django.contrib.auth.models import User
 from django.db import IntegrityError, models, transaction
 
+from .slugs import slugify_house, slugify_name
+
 # Constants
 AI_PROVIDER_FAMILIES = [
     ("anthropic", "Anthropic"),
@@ -37,6 +39,35 @@ BETA_SIGNUP_STATUSES = [
 ]
 
 
+class IdentitySlugMixin(models.Model):
+    """
+    Maintains `name_slug` / `house_slug` from `name` / `house` on every save.
+
+    Slugs are derived, never user-supplied (editable=False keeps them out of
+    ModelForms and ModelSerializers). When save() is called with
+    update_fields, the slug columns are appended whenever name or house is
+    among them so a partial save cannot leave them stale.
+    """
+
+    name_slug = models.SlugField(
+        max_length=300, allow_unicode=True, blank=True, default="", db_index=True, editable=False
+    )
+    house_slug = models.SlugField(
+        max_length=300, allow_unicode=True, blank=True, default="", db_index=True, editable=False
+    )
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args: object, **kwargs: object) -> None:
+        self.name_slug = slugify_name(self.name)
+        self.house_slug = slugify_house(self.house)
+        update_fields = kwargs.get("update_fields")
+        if update_fields is not None and {"name", "house"} & set(update_fields):
+            kwargs["update_fields"] = {*update_fields, "name_slug", "house_slug"}
+        super().save(*args, **kwargs)
+
+
 # Create your models here.
 class FragranceConfig(models.Model):
     """Per-user configuration.  One config per user"""
@@ -59,7 +90,7 @@ class FragranceConfig(models.Model):
     run_month = models.PositiveBigIntegerField(default=1)
 
 
-class Fragrance(models.Model):
+class Fragrance(IdentitySlugMixin, models.Model):
     """
     The user's fragrane collection, managed directly through the app.
 
@@ -86,7 +117,16 @@ class Fragrance(models.Model):
     )  # if a user records a fragrance from a recommendation, linking the recommendation record it came from
 
     class Meta:
-        unique_together = [["user", "name"]]
+        # Keyed on slugs, not raw name: same name from different houses is a
+        # different fragrance and is allowed; case/accent variants of the same
+        # name and house are the same fragrance and are not. name_slug keeps
+        # concentration words, so EDT and EDP of one scent can coexist.
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "name_slug", "house_slug"],
+                name="unique_fragrance_identity_per_user",
+            ),
+        ]
 
 
 class PreferenceProfile(models.Model):
@@ -136,7 +176,7 @@ class RecommendationRun(models.Model):
     provider_model_id = models.CharField(max_length=255, blank=True)
 
 
-class Recommendation(models.Model):
+class Recommendation(IdentitySlugMixin, models.Model):
     """
     A single frangrance pick from a single run.
     Serves as a permanent degdupilication guard and can be used to generate Fragrance records if the user tries a recommendation and provides feedback.
