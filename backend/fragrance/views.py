@@ -8,6 +8,7 @@ from django.conf import settings
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
+from django.db import IntegrityError, transaction
 from django.db.models import Prefetch
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
@@ -16,7 +17,7 @@ from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode
 from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import NotFound
+from rest_framework.exceptions import APIException, NotFound
 from rest_framework.parsers import MultiPartParser
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -244,6 +245,12 @@ class FragranceConfigView(generics.RetrieveUpdateAPIView):
         return obj
 
 
+class FragranceConflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = 'A fragrance with this name and house is already in your collection.'
+    default_code = 'fragrance_conflict'
+
+
 class FragranceViewSet(viewsets.ModelViewSet):
     serializer_class = FragranceSerializer
 
@@ -255,7 +262,22 @@ class FragranceViewSet(viewsets.ModelViewSet):
         return qs
 
     def perform_create(self, serializer):
-        serializer.save(user=self.request.user)
+        self._save_or_conflict(serializer=serializer, user=self.request.user)
+
+    def perform_update(self, serializer):
+        self._save_or_conflict(serializer=serializer)
+
+    @staticmethod
+    def _save_or_conflict(serializer, **extra) -> None:
+        # Backstop for the race the serializer's identity check cannot close
+        # (two concurrent writes of one identity): the unique constraint wins
+        # and the loser gets a 409, not a 500. The savepoint keeps the
+        # surrounding transaction usable.
+        try:
+            with transaction.atomic():
+                serializer.save(**extra)
+        except IntegrityError:
+            raise FragranceConflict()
 
 
 class PreferenceProfileView(generics.RetrieveAPIView):

@@ -18,11 +18,15 @@ from .dedup import (
     REASON_PREVIOUSLY_RECOMMENDED,
     KnownFragrance,
     batch_known,
+    MAX_PROMPT_NOTES_CHARS,
     build_known_fragrances,
+    delivered_recommendations,
     describe_rejections,
     describe_rejections_as_slugs,
+    format_exclusion_list,
     fragrance_label,
     log_rejections,
+    normalize_label,
     partition_candidates,
 )
 from .models import (
@@ -31,6 +35,7 @@ from .models import (
     Recommendation,
     RecommendationRun,
 )
+from .slugs import slugify_name
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +144,21 @@ class CandidateCountError(ValueError):
     Qwen; never enforced for Anthropic even pre-refactor) — this is an
     explicit app-level check, not schema-level trust.
     """
+
+
+class DedupExhaustedError(CandidateCountError):
+    """
+    Every re-ask of select_candidates / select_replacement was rejected by
+    deterministic dedup (or named an invalid/blank fragrance). Retrying cannot
+    help -- the DB state and the search pool are unchanged and each attempt
+    costs up to 1 + MAX_DEDUP_REASKS calls carrying the full exclusion lists --
+    so monthly_fragrance_run fails the run immediately instead of retrying.
+    The message carries slugs and constant reasons only (it reaches
+    run.error_message).
+    """
+
+
+MAX_EXHAUSTED_DETAIL_CHARS = 500
 
 
 def build_email_content_tool_schema(confirmed_names: list[str]) -> dict:
@@ -283,15 +303,19 @@ def generate_preference_profile(
     user_id: int, run_id: int, provider: StructuredLLMProvider
 ) -> PreferenceProfile:
     """LLM call #1. Reads the fragrance collection and writes a PreferenceProfile row."""
-    fragrances = Fragrance.objects.filter(user_id=user_id)
+    fragrances = Fragrance.objects.filter(user_id=user_id).order_by("id")
     collection_text = "\n".join(
-        f"{f.name} by {f.house} [{f.status}]"
-        + (f" - {f.notes}" if f.notes else "")
+        f"{normalize_label(f.name)} by {normalize_label(f.house)} [{f.status}]"
+        + (
+            f" - {normalize_label(f.notes, max_chars=MAX_PROMPT_NOTES_CHARS)}"
+            if f.notes.strip()
+            else ""
+        )
         for f in fragrances
     )
     past_recommendations = [
         fragrance_label(name=name, house=house)
-        for name, house in Recommendation.objects.filter(user_id=user_id)
+        for name, house in delivered_recommendations(user_id=user_id)
         .order_by("id")
         .values_list("name", "house")
     ]
@@ -299,7 +323,7 @@ def generate_preference_profile(
     profile_data = provider.generate_structured(
         prompt=PROFILE_PROMPT.format(
             collection=collection_text,
-            past_recommendations=", ".join(past_recommendations),
+            past_recommendations=format_exclusion_list(labels=past_recommendations),
         ),
         tool_name=PROFILE_TOOL_NAME,
         description=PROFILE_TOOL_DESCRIPTION,
@@ -327,8 +351,10 @@ def _with_rejections(base_prompt: str, rejected_text: str) -> str:
 
 
 def _known_text(known: list[KnownFragrance], reasons: set[str]) -> str:
-    return ", ".join(
-        fragrance_label(name=k.name, house=k.house) for k in known if k.reason in reasons
+    return format_exclusion_list(
+        labels=[
+            fragrance_label(name=k.name, house=k.house) for k in known if k.reason in reasons
+        ]
     )
 
 
@@ -385,9 +411,10 @@ def select_candidates(
             filter(None, [rejected_slugs, describe_rejections_as_slugs(rejections=rejections)])
         )
 
-    raise CandidateCountError(
+    raise DedupExhaustedError(
         f"select_candidates could not produce {EXPECTED_CANDIDATE_COUNT} non-repeat "
-        f"candidates after {1 + MAX_DEDUP_REASKS} attempts; rejections: {rejected_slugs}"
+        f"candidates after {1 + MAX_DEDUP_REASKS} attempts; "
+        f"rejections: {rejected_slugs[:MAX_EXHAUSTED_DETAIL_CHARS]}"
     )
 
 
@@ -412,9 +439,9 @@ def select_replacement(
     )
     batch_text = ", ".join(
         fragrance_label(name=c["name"], house=c.get("house", "")) for c in batch_candidates or []
-    )
+    )  # at most 5 candidates + replacements, each label capped
     base_prompt = REPLACEMENT_PROMPT.format(
-        failed_name=failed_candidate["name"],
+        failed_name=normalize_label(failed_candidate["name"]),
         loved_notes=profile.loved_notes,
         liked_notes=profile.liked_notes,
         disliked_notes=profile.disliked_notes,
@@ -435,7 +462,7 @@ def select_replacement(
         )
         if "name" not in result or "house" not in result:
             raise CandidateCountError(
-                f"select_replacement response missing required field(s): {result!r}"
+                "select_replacement response missing required field(s) 'name'/'house'."
             )
         _, rejections = partition_candidates(candidates=[result], known=known)
         if not rejections:
@@ -450,9 +477,10 @@ def select_replacement(
             filter(None, [rejected_slugs, describe_rejections_as_slugs(rejections=rejections)])
         )
 
-    raise CandidateCountError(
+    raise DedupExhaustedError(
         f"select_replacement could not produce a non-repeat replacement after "
-        f"{1 + MAX_DEDUP_REASKS} attempts; rejections: {rejected_slugs}"
+        f"{1 + MAX_DEDUP_REASKS} attempts; "
+        f"rejections: {rejected_slugs[:MAX_EXHAUSTED_DETAIL_CHARS]}"
     )
 
 
@@ -476,7 +504,9 @@ def generate_email_content(
     confirmed_names = [rec.name for rec in recs]
 
     confirmed = [p for p in verified_picks if p["status"] == "confirmed"]
-    picks_text = "\n".join(f"- {p['name']} by {p['house']}" for p in confirmed)
+    picks_text = "\n".join(
+        f"- {normalize_label(p['name'])} by {normalize_label(p['house'])}" for p in confirmed
+    )
 
     result = provider.generate_structured(
         prompt=EMAIL_CONTENT_PROMPT.format(
@@ -500,7 +530,7 @@ def generate_email_content(
         logger.warning(
             "generate_email_content: run_id=%s missing rationale for pick(s): %s",
             run_id,
-            ", ".join(missing_names),
+            ", ".join(slugify_name(name) or "-" for name in missing_names),
         )
 
     run.intro = result["intro"]

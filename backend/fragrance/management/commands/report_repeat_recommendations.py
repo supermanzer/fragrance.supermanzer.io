@@ -5,6 +5,11 @@ same slug rules the pipeline now enforces (fragrance/slugs.py).
 
 Also lists Fragrance rows of one user that share an identical
 (name_slug, house_slug): the rows the backfill migration will disambiguate.
+It then runs the backfill's own planning step (slugs.assign_identity_slugs)
+and reports rows whose first "-dup<id>" slug was itself taken (the "Foo",
+"Foo Dup3", "foo" case, resolved with a counter) and any identity that would
+STILL collide after disambiguation (`post_disambiguation_clashes`, expected 0;
+non-zero means 0009/0010 would abort).
 
 Output is ids and slugs only (user ids, row ids, name/house slugs, counts) --
 no emails, usernames or free text. Performs no writes. Run it before and after
@@ -12,6 +17,10 @@ deploying the dedup change to compare:
 
     docker compose exec backend uv run python manage.py report_repeat_recommendations
     docker compose exec backend uv run python manage.py report_repeat_recommendations --user-id 3
+
+Production images have no uv: use /app/.venv/bin/python manage.py ... . It
+selects only id/user/name/house/status columns, so it also runs with the NEW
+image before the slug migrations are applied.
 """
 
 from collections import defaultdict
@@ -21,6 +30,7 @@ from django.core.management.base import BaseCommand
 
 from fragrance.models import Fragrance, Recommendation
 from fragrance.slugs import (
+    assign_identity_slugs,
     core_name,
     houses_compatible,
     is_unknown_house,
@@ -99,9 +109,11 @@ class Command(BaseCommand):
         # equal: rows the 0009 backfill disambiguates (stored "-dup<id>") and
         # the ones migration 0010's unique constraint would otherwise reject.
         identities: dict[tuple[int, str, str], list[int]] = defaultdict(list)
-        for frag in frags.order_by("id").values("id", "user_id", "name", "house"):
+        plan_rows: list[tuple[int, int, str, str]] = []
+        for frag in frags.order_by("id").values("id", "user_id", "name", "house").iterator():
             key = (frag["user_id"], slugify_name(frag["name"]), slugify_house(frag["house"]))
             identities[key].append(frag["id"])
+            plan_rows.append((frag["id"], frag["user_id"], frag["name"], frag["house"]))
         collisions = 0
         for (user_id, name_slug, house_slug), ids in sorted(identities.items()):
             if len(ids) > 1:
@@ -111,3 +123,17 @@ class Command(BaseCommand):
                     f"house_slug={house_slug or '-'} fragrance_ids={ids}"
                 )
         self.stdout.write(f"fragrance_identity_collisions={collisions}")
+
+        assigned, disambiguated = assign_identity_slugs(rows=plan_rows)
+        for row_id, user_id, natural, stored, needed_counter in disambiguated:
+            if needed_counter:
+                self.stdout.write(
+                    f"dup_slug_taken user_id={user_id} fragrance_id={row_id} "
+                    f"name_slug={natural} stored_name_slug={stored}"
+                )
+        owners = {row_id: user_id for row_id, user_id, _, _ in plan_rows}
+        final_keys: dict[tuple[int, str, str], int] = defaultdict(int)
+        for row_id, (name_slug, house_slug) in assigned.items():
+            final_keys[(owners[row_id], name_slug, house_slug)] += 1
+        clashes = sum(1 for count in final_keys.values() if count > 1)
+        self.stdout.write(f"post_disambiguation_clashes={clashes}")

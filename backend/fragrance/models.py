@@ -1,9 +1,12 @@
 from django.contrib.auth.models import User
 from django.db import IntegrityError, models, transaction
 
-from .slugs import disambiguated_name_slug, slugify_house, slugify_name
+from .slugs import is_disambiguated_slug, slugify_house, slugify_name
 
 # Constants
+# Per-user cap on Fragrance rows (API create + CSV import). Every pipeline
+# prompt scales with the collection, so this bounds per-run LLM cost.
+MAX_COLLECTION_SIZE = 500
 AI_PROVIDER_FAMILIES = [
     ("anthropic", "Anthropic"),
     ("openai", "OpenAI"),
@@ -49,11 +52,18 @@ class IdentitySlugMixin(models.Model):
     among them so a partial save cannot leave them stale.
     """
 
+    # db_default: INSERTs from code that predates these columns (old
+    # containers between `migrate` and recreate) must not hit NOT NULL.
+    # db_index=False: nothing filters on a slug without `user`, and the
+    # Fragrance (user, name_slug, house_slug) unique index serves those
+    # lookups; Recommendation slugs are never queried at all.
     name_slug = models.SlugField(
-        max_length=300, allow_unicode=True, blank=True, default="", db_index=True, editable=False
+        max_length=300, allow_unicode=True, blank=True, default="", db_default="",
+        db_index=False, editable=False,
     )
     house_slug = models.SlugField(
-        max_length=300, allow_unicode=True, blank=True, default="", db_index=True, editable=False
+        max_length=300, allow_unicode=True, blank=True, default="", db_default="",
+        db_index=False, editable=False,
     )
 
     class Meta:
@@ -64,8 +74,8 @@ class IdentitySlugMixin(models.Model):
         # Keep the "-dup<pk>" suffix the 0009 backfill gave a colliding legacy
         # row; recomputing the plain slug would make every later save of that
         # row (even notes-only) violate the identity constraint.
-        keeps_suffix = self.pk is not None and self.name_slug == disambiguated_name_slug(
-            name_slug=base_slug, pk=self.pk
+        keeps_suffix = self.pk is not None and is_disambiguated_slug(
+            stored_slug=self.name_slug, name_slug=base_slug, pk=self.pk
         )
         if not keeps_suffix:
             self.name_slug = base_slug

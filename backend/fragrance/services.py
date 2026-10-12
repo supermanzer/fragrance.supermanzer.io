@@ -9,8 +9,8 @@ from django.core import signing
 from django.db import IntegrityError, transaction
 from rest_framework.request import Request
 
-from .models import FRAGRANCE_STATUSES, Fragrance, Recommendation
-from .slugs import slugify_house, slugify_name
+from .models import FRAGRANCE_STATUSES, MAX_COLLECTION_SIZE, Fragrance, Recommendation
+from .slugs import has_identity, slugify_house, slugify_name
 
 REQUIRED_COLUMNS = {"fragrance", "status", "house", "notes"}
 
@@ -35,7 +35,10 @@ def import_collection_from_csv(user: User, file_obj: IO[str]) -> dict:
 
     Returns {'created': int, 'updated': int, 'skipped': int}.
     Raises ValueError for structural problems (missing columns, empty file).
-    Row-level problems (empty name, invalid status) increment skipped silently.
+    Row-level problems (empty or symbol-only name, invalid status) increment
+    skipped silently. Raises ValueError (the whole import rolls back, the view
+    answers 400) if the import would take the collection over
+    MAX_COLLECTION_SIZE; updates to existing rows never count toward the cap.
     """
     reader = csv.DictReader(file_obj)
 
@@ -51,6 +54,7 @@ def import_collection_from_csv(user: User, file_obj: IO[str]) -> dict:
         )
 
     created = updated = skipped = 0
+    existing_count = Fragrance.objects.filter(user=user).count()
 
     for row in reader:
         row = {k.lower(): v for k, v in row.items()}
@@ -59,12 +63,17 @@ def import_collection_from_csv(user: User, file_obj: IO[str]) -> dict:
         house = row.get("house", "").strip().removeprefix("'")
         notes = row.get("notes", "").strip().removeprefix("'")
 
-        if not name or status is None:
+        if not name or status is None or not has_identity(name):
             skipped += 1
             continue
 
         existing = _find_collection_row(user=user, name=name, house=house)
         if existing is None:
+            if existing_count + created >= MAX_COLLECTION_SIZE:
+                raise ValueError(
+                    f"Import would take your collection over the {MAX_COLLECTION_SIZE} "
+                    f"fragrance limit (you have {existing_count}). Nothing was imported."
+                )
             Fragrance.objects.create(
                 user=user, name=name, house=house, status=status, notes=notes
             )

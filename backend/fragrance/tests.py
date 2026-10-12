@@ -746,7 +746,11 @@ class GenerateEmailContentTests(TestCase):
 
         rec1.refresh_from_db()
         self.assertEqual(rec1.rationale, "")
+        # Slugs, not raw pick names, are what gets logged.
         self.assertTrue(
+            any("aventus" in message for message in logs.output)
+        )
+        self.assertFalse(
             any("Aventus" in message for message in logs.output)
         )
 

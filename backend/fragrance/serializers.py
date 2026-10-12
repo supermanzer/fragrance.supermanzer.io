@@ -6,7 +6,16 @@ from django.utils.encoding import force_str
 from django.utils.http import urlsafe_base64_decode
 from rest_framework import serializers
 
-from .models import FRAGRANCE_STATUSES, FragranceConfig, Fragrance, PreferenceProfile, Recommendation, RecommendationRun
+from .models import (
+    FRAGRANCE_STATUSES,
+    MAX_COLLECTION_SIZE,
+    Fragrance,
+    FragranceConfig,
+    PreferenceProfile,
+    Recommendation,
+    RecommendationRun,
+)
+from .slugs import has_identity, slugify_house, slugify_name
 
 
 class BetaSignupSerializer(serializers.Serializer):
@@ -28,6 +37,47 @@ class FragranceSerializer(serializers.ModelSerializer):
         model = Fragrance
         exclude = ['user']
         read_only_fields = ['added_at']
+
+    def validate(self, attrs: dict) -> dict:
+        """
+        DRF cannot derive a validator from the (user, name_slug, house_slug)
+        constraint (user is excluded, slugs are not editable), so identity
+        uniqueness is checked here against the same slug rules the model and
+        the constraint use. The view still maps a racing IntegrityError to 409.
+        """
+        user = self.context['request'].user
+        instance = self.instance
+        name = attrs.get('name', instance.name if instance else '')
+        house = attrs.get('house', instance.house if instance else '')
+
+        if instance is None and Fragrance.objects.filter(user=user).count() >= MAX_COLLECTION_SIZE:
+            raise serializers.ValidationError(
+                f'Your collection is limited to {MAX_COLLECTION_SIZE} fragrances. '
+                'Remove some before adding more.'
+            )
+        name_changed = instance is None or ('name' in attrs and attrs['name'] != instance.name)
+        if name_changed and not has_identity(name):
+            raise serializers.ValidationError(
+                {'name': 'The fragrance name must contain letters or numbers.'}
+            )
+
+        name_slug = slugify_name(name)
+        house_slug = slugify_house(house)
+        if instance is not None and (name_slug, house_slug) == (
+            slugify_name(instance.name),
+            slugify_house(instance.house),
+        ):
+            # Unchanged identity (notes-only PATCH, case-only rename, or a
+            # disambiguated '-dup<id>' row): nothing new to collide with.
+            return attrs
+        clash = Fragrance.objects.filter(user=user, name_slug=name_slug, house_slug=house_slug)
+        if instance is not None:
+            clash = clash.exclude(pk=instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError(
+                {'name': 'A fragrance with this name and house is already in your collection.'}
+            )
+        return attrs
 
 
 class PreferenceProfileSerializer(serializers.ModelSerializer):
