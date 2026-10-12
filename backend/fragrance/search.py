@@ -12,6 +12,7 @@ from django.conf import settings
 
 from .ai_providers.base import StructuredLLMProvider
 from .models import PreferenceProfile, Recommendation
+from .slugs import name_in_text
 
 
 def searxng_search(query: str, num_results: int = 5) -> list[dict]:
@@ -76,6 +77,12 @@ def verify_candidates(
     - Unconfirmed: create a Recommendation with status='replaced' for the original,
       then call LLM #3 (select_replacement) to pick an alternative from the same
       search results and create a second Recommendation with status='confirmed'.
+      The replacement is dedup-checked inside select_replacement against the DB
+      history/collection and every other pick in this run.
+
+    The title check compares the candidate's normalized core name (accents,
+    punctuation and concentration words folded) with the normalized title; it
+    does not check the house.
 
     Returns the flat list of all picks (both confirmed and replaced) so
     generate_email_content knows which picks to write rationale for.
@@ -84,18 +91,21 @@ def verify_candidates(
     # search.py imports llm.py; llm.py imports models.py (not search.py).
     from .llm import select_replacement
 
+    # Keyed by position, not name: two same-named candidates from different
+    # houses are legitimate and must not share (or overwrite) one future.
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {
-            c["name"]: executor.submit(
+        futures = [
+            executor.submit(
                 searxng_search,
                 query=f"{c['name']} fragrance review site:fragrantica.com OR site:basenotes.net",
             )
             for c in candidates
-        }
+        ]
 
     all_picks = []
-    for candidate in candidates:
-        results = futures[candidate["name"]].result()
+    replacements: list[dict] = []
+    for index, candidate in enumerate(candidates):
+        results = futures[index].result()
         results_text = "\n".join(
             f"- {r['title']}: {r['content']} ({r['url']})" for r in results
         )
@@ -103,7 +113,7 @@ def verify_candidates(
             (
                 r
                 for r in results
-                if candidate["name"].lower() in r["title"].lower()
+                if name_in_text(name=candidate["name"], text=r["title"])
             ),
             None,
         )
@@ -145,7 +155,9 @@ def verify_candidates(
                 search_results=results_text,
                 profile=profile,
                 provider=provider,
+                batch_candidates=[*candidates, *replacements],
             )
+            replacements.append(replacement)
             Recommendation.objects.create(
                 user_id=user_id,
                 run_id=run_id,

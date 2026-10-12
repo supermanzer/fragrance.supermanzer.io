@@ -18,7 +18,12 @@ from .ai_providers.registry import (
     MissingCredentialError,
     NoActiveAIModelConfigError,
 )
-from .llm import generate_email_content, generate_preference_profile, select_candidates
+from .llm import (
+    DedupExhaustedError,
+    generate_email_content,
+    generate_preference_profile,
+    select_candidates,
+)
 from .models import Fragrance, FragranceConfig, PreferenceProfile, RecommendationRun
 from .search import run_discovery_searches, verify_candidates
 from .services import generate_recommendation_token
@@ -35,6 +40,10 @@ NON_RETRYABLE_CONFIG_EXCEPTIONS = (
     MissingCredentialError,
     EnumEnforcementUnsupportedError,
 )
+# Beyond config errors: dedup exhaustion is deterministic for an unchanged DB
+# and search pool, and each attempt costs up to 4 calls carrying the full
+# exclusion lists, so the 2 x 300 s retries would only repeat the spend.
+NON_RETRYABLE_EXCEPTIONS = (*NON_RETRYABLE_CONFIG_EXCEPTIONS, DedupExhaustedError)
 
 
 def render_and_send_email(user_id: int, run_id: int) -> None:
@@ -180,13 +189,14 @@ def monthly_fragrance_run(self: 'monthly_fragrance_run', user_id: int, run_id: i
         run.save(update_fields=['status', 'email_status'])
         send_recommendation_email.delay(user_id=user_id, run_id=run.id)
     except Exception as exc:
-        # Config errors fail immediately, on any attempt — retrying can't fix
-        # them. Everything else keeps the existing retry-then-fail behavior.
+        # Config errors and dedup exhaustion fail immediately, on any attempt —
+        # retrying can't fix them. Everything else keeps the existing
+        # retry-then-fail behavior.
         # Either way, the message that lands in run.error_message (served to
         # the frontend via the authenticated /runs/ API) is sanitized: a raw
         # str(exc) on an OpenAI/Anthropic SDK APIError can otherwise carry a
         # vendor-masked key fragment.
-        is_config_error = isinstance(exc, NON_RETRYABLE_CONFIG_EXCEPTIONS)
+        is_config_error = isinstance(exc, NON_RETRYABLE_EXCEPTIONS)
         is_final_attempt = self.request.retries >= self.max_retries
         if is_config_error or is_final_attempt:
             run.status = 'failed'

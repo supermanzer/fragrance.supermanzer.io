@@ -12,12 +12,30 @@ providers.
 import logging
 
 from .ai_providers.base import StructuredLLMProvider
+from .dedup import (
+    REASON_COLLECTION,
+    REASON_OWNED,
+    REASON_PREVIOUSLY_RECOMMENDED,
+    KnownFragrance,
+    batch_known,
+    MAX_PROMPT_NOTES_CHARS,
+    build_known_fragrances,
+    delivered_recommendations,
+    describe_rejections,
+    describe_rejections_as_slugs,
+    format_exclusion_list,
+    fragrance_label,
+    log_rejections,
+    normalize_label,
+    partition_candidates,
+)
 from .models import (
     Fragrance,
     PreferenceProfile,
     Recommendation,
     RecommendationRun,
 )
+from .slugs import slugify_name
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +130,11 @@ EMAIL_CONTENT_TOOL_DESCRIPTION = (
 )
 
 
+# How many times select_candidates / select_replacement re-ask the model when
+# deterministic dedup rejects part of its answer, before failing the run.
+MAX_DEDUP_REASKS = 2
+
+
 class CandidateCountError(ValueError):
     """
     Raised when an LLM response's candidate list doesn't have the exact
@@ -121,6 +144,21 @@ class CandidateCountError(ValueError):
     Qwen; never enforced for Anthropic even pre-refactor) — this is an
     explicit app-level check, not schema-level trust.
     """
+
+
+class DedupExhaustedError(CandidateCountError):
+    """
+    Every re-ask of select_candidates / select_replacement was rejected by
+    deterministic dedup (or named an invalid/blank fragrance). Retrying cannot
+    help -- the DB state and the search pool are unchanged and each attempt
+    costs up to 1 + MAX_DEDUP_REASKS calls carrying the full exclusion lists --
+    so monthly_fragrance_run fails the run immediately instead of retrying.
+    The message carries slugs and constant reasons only (it reaches
+    run.error_message).
+    """
+
+
+MAX_EXHAUSTED_DETAIL_CHARS = 500
 
 
 def build_email_content_tool_schema(confirmed_names: list[str]) -> dict:
@@ -206,6 +244,22 @@ Select exactly 5 specific, purchasable fragrances from the search results. Requi
 
 Use the select_candidates tool to return your selections."""
 
+# Appended (not placeholders in the templates above): verification.py formats
+# those templates with a fixed argument set it must keep working with.
+COLLECTION_NOTE = """
+
+Rest of the user's collection, liked or disliked (do not select): {collection}"""
+
+BATCH_NOTE = """
+
+Already chosen for this run (do not select, in any house): {batch}"""
+
+REJECTED_NOTE = """
+
+Your previous answer was rejected because these picks are not allowed: {rejected}. \
+Do not select them or any other edition or concentration of them. \
+Choose different fragrances."""
+
 REPLACEMENT_PROMPT = """\
 A fragrance candidate could not be verified in search results and must be replaced.
 
@@ -249,22 +303,27 @@ def generate_preference_profile(
     user_id: int, run_id: int, provider: StructuredLLMProvider
 ) -> PreferenceProfile:
     """LLM call #1. Reads the fragrance collection and writes a PreferenceProfile row."""
-    fragrances = Fragrance.objects.filter(user_id=user_id)
+    fragrances = Fragrance.objects.filter(user_id=user_id).order_by("id")
     collection_text = "\n".join(
-        f"{f.name} by {f.house} [{f.status}]"
-        + (f" - {f.notes}" if f.notes else "")
+        f"{normalize_label(f.name)} by {normalize_label(f.house)} [{f.status}]"
+        + (
+            f" - {normalize_label(f.notes, max_chars=MAX_PROMPT_NOTES_CHARS)}"
+            if f.notes.strip()
+            else ""
+        )
         for f in fragrances
     )
-    past_recommendations = list(
-        Recommendation.objects.filter(user_id=user_id).values_list(
-            "name", flat=True
-        )
-    )
+    past_recommendations = [
+        fragrance_label(name=name, house=house)
+        for name, house in delivered_recommendations(user_id=user_id)
+        .order_by("id")
+        .values_list("name", "house")
+    ]
 
     profile_data = provider.generate_structured(
         prompt=PROFILE_PROMPT.format(
             collection=collection_text,
-            past_recommendations=", ".join(past_recommendations),
+            past_recommendations=format_exclusion_list(labels=past_recommendations),
         ),
         tool_name=PROFILE_TOOL_NAME,
         description=PROFILE_TOOL_DESCRIPTION,
@@ -285,41 +344,78 @@ def generate_preference_profile(
     return profile
 
 
+def _with_rejections(base_prompt: str, rejected_text: str) -> str:
+    if not rejected_text:
+        return base_prompt
+    return base_prompt + REJECTED_NOTE.format(rejected=rejected_text)
+
+
+def _known_text(known: list[KnownFragrance], reasons: set[str]) -> str:
+    return format_exclusion_list(
+        labels=[
+            fragrance_label(name=k.name, house=k.house) for k in known if k.reason in reasons
+        ]
+    )
+
+
 def select_candidates(
     user_id: int,
     profile_id: int,
     search_results: str,
     provider: StructuredLLMProvider,
 ) -> list[dict]:
-    """LLM call #2. Picks 5 fragrances from discovery search results."""
-    profile = PreferenceProfile.objects.get(id=profile_id)
-    past_recommendations = list(
-        Recommendation.objects.filter(user_id=user_id).values_list(
-            "name", flat=True
-        )
-    )
+    """
+    LLM call #2. Picks 5 fragrances from discovery search results.
 
-    result = provider.generate_structured(
-        prompt=CANDIDATES_PROMPT.format(
-            loved_notes=profile.loved_notes,
-            liked_notes=profile.liked_notes,
-            disliked_notes=profile.disliked_notes,
-            owns_list=", ".join(profile.owns_list),
-            past_recommendations=", ".join(past_recommendations),
-            search_results=search_results,
-        ),
-        tool_name=CANDIDATES_TOOL_NAME,
-        description=CANDIDATES_TOOL_DESCRIPTION,
-        schema=CANDIDATES_SCHEMA,
-        max_tokens=1024,
-    )
-    candidates = result["candidates"]
-    if len(candidates) != EXPECTED_CANDIDATE_COUNT:
-        raise CandidateCountError(
-            f"select_candidates expected exactly {EXPECTED_CANDIDATE_COUNT} "
-            f"candidates, got {len(candidates)}."
+    The answer is checked deterministically against the user's DB history and
+    collection (see dedup.py); rejected picks are called out and the model is
+    re-asked up to MAX_DEDUP_REASKS times before CandidateCountError is raised.
+    """
+    profile = PreferenceProfile.objects.get(id=profile_id)
+    known = build_known_fragrances(user_id=user_id)
+    base_prompt = CANDIDATES_PROMPT.format(
+        loved_notes=profile.loved_notes,
+        liked_notes=profile.liked_notes,
+        disliked_notes=profile.disliked_notes,
+        owns_list=_known_text(known, {REASON_OWNED}) or "none",
+        past_recommendations=_known_text(known, {REASON_PREVIOUSLY_RECOMMENDED}) or "none",
+        search_results=search_results,
+    ) + COLLECTION_NOTE.format(collection=_known_text(known, {REASON_COLLECTION}) or "none")
+
+    rejected_text = ""
+    rejected_slugs = ""
+    for attempt in range(1 + MAX_DEDUP_REASKS):
+        result = provider.generate_structured(
+            prompt=_with_rejections(base_prompt=base_prompt, rejected_text=rejected_text),
+            tool_name=CANDIDATES_TOOL_NAME,
+            description=CANDIDATES_TOOL_DESCRIPTION,
+            schema=CANDIDATES_SCHEMA,
+            max_tokens=1024,
         )
-    return candidates
+        candidates = result["candidates"]
+        if len(candidates) != EXPECTED_CANDIDATE_COUNT:
+            raise CandidateCountError(
+                f"select_candidates expected exactly {EXPECTED_CANDIDATE_COUNT} "
+                f"candidates, got {len(candidates)}."
+            )
+        _, rejections = partition_candidates(candidates=candidates, known=known)
+        if not rejections:
+            return candidates
+        log_rejections(
+            user_id=user_id, stage="select_candidates", attempt=attempt + 1, rejections=rejections
+        )
+        rejected_text = "; ".join(
+            filter(None, [rejected_text, describe_rejections(rejections=rejections)])
+        )
+        rejected_slugs = "; ".join(
+            filter(None, [rejected_slugs, describe_rejections_as_slugs(rejections=rejections)])
+        )
+
+    raise DedupExhaustedError(
+        f"select_candidates could not produce {EXPECTED_CANDIDATE_COUNT} non-repeat "
+        f"candidates after {1 + MAX_DEDUP_REASKS} attempts; "
+        f"rejections: {rejected_slugs[:MAX_EXHAUSTED_DETAIL_CHARS]}"
+    )
 
 
 def select_replacement(
@@ -328,33 +424,64 @@ def select_replacement(
     search_results: str,
     profile: PreferenceProfile,
     provider: StructuredLLMProvider,
+    batch_candidates: list[dict] | None = None,
 ) -> dict:
-    """LLM call #3. Called by verify_candidates in search.py when a candidate fails title-match."""
-    past_recommendations = list(
-        Recommendation.objects.filter(user_id=user_id).values_list(
-            "name", flat=True
-        )
-    )
+    """
+    LLM call #3. Called by verify_candidates in search.py when a candidate fails title-match.
 
-    result = provider.generate_structured(
-        prompt=REPLACEMENT_PROMPT.format(
-            failed_name=failed_candidate["name"],
-            loved_notes=profile.loved_notes,
-            liked_notes=profile.liked_notes,
-            disliked_notes=profile.disliked_notes,
-            past_recommendations=", ".join(past_recommendations),
-            search_results=search_results,
-        ),
-        tool_name=REPLACEMENT_TOOL_NAME,
-        description=REPLACEMENT_TOOL_DESCRIPTION,
-        schema=REPLACEMENT_SCHEMA,
-        max_tokens=512,
+    The replacement must not match the user's DB history/collection (which by
+    now includes this run's already-written picks and the failed candidate's
+    own 'replaced' row) nor any of `batch_candidates` (the run's other,
+    possibly not-yet-written, picks), in any house.
+    """
+    known = build_known_fragrances(user_id=user_id) + batch_known(
+        candidates=batch_candidates or []
     )
-    if "name" not in result or "house" not in result:
-        raise CandidateCountError(
-            f"select_replacement response missing required field(s): {result!r}"
+    batch_text = ", ".join(
+        fragrance_label(name=c["name"], house=c.get("house", "")) for c in batch_candidates or []
+    )  # at most 5 candidates + replacements, each label capped
+    base_prompt = REPLACEMENT_PROMPT.format(
+        failed_name=normalize_label(failed_candidate["name"]),
+        loved_notes=profile.loved_notes,
+        liked_notes=profile.liked_notes,
+        disliked_notes=profile.disliked_notes,
+        past_recommendations=_known_text(known, {REASON_PREVIOUSLY_RECOMMENDED, REASON_COLLECTION, REASON_OWNED})
+        or "none",
+        search_results=search_results,
+    ) + BATCH_NOTE.format(batch=batch_text or "none")
+
+    rejected_text = ""
+    rejected_slugs = ""
+    for attempt in range(1 + MAX_DEDUP_REASKS):
+        result = provider.generate_structured(
+            prompt=_with_rejections(base_prompt=base_prompt, rejected_text=rejected_text),
+            tool_name=REPLACEMENT_TOOL_NAME,
+            description=REPLACEMENT_TOOL_DESCRIPTION,
+            schema=REPLACEMENT_SCHEMA,
+            max_tokens=512,
         )
-    return result
+        if "name" not in result or "house" not in result:
+            raise CandidateCountError(
+                "select_replacement response missing required field(s) 'name'/'house'."
+            )
+        _, rejections = partition_candidates(candidates=[result], known=known)
+        if not rejections:
+            return result
+        log_rejections(
+            user_id=user_id, stage="select_replacement", attempt=attempt + 1, rejections=rejections
+        )
+        rejected_text = "; ".join(
+            filter(None, [rejected_text, describe_rejections(rejections=rejections)])
+        )
+        rejected_slugs = "; ".join(
+            filter(None, [rejected_slugs, describe_rejections_as_slugs(rejections=rejections)])
+        )
+
+    raise DedupExhaustedError(
+        f"select_replacement could not produce a non-repeat replacement after "
+        f"{1 + MAX_DEDUP_REASKS} attempts; "
+        f"rejections: {rejected_slugs[:MAX_EXHAUSTED_DETAIL_CHARS]}"
+    )
 
 
 def generate_email_content(
@@ -377,7 +504,9 @@ def generate_email_content(
     confirmed_names = [rec.name for rec in recs]
 
     confirmed = [p for p in verified_picks if p["status"] == "confirmed"]
-    picks_text = "\n".join(f"- {p['name']} by {p['house']}" for p in confirmed)
+    picks_text = "\n".join(
+        f"- {normalize_label(p['name'])} by {normalize_label(p['house'])}" for p in confirmed
+    )
 
     result = provider.generate_structured(
         prompt=EMAIL_CONTENT_PROMPT.format(
@@ -401,7 +530,7 @@ def generate_email_content(
         logger.warning(
             "generate_email_content: run_id=%s missing rationale for pick(s): %s",
             run_id,
-            ", ".join(missing_names),
+            ", ".join(slugify_name(name) or "-" for name in missing_names),
         )
 
     run.intro = result["intro"]

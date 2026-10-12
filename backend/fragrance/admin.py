@@ -121,7 +121,7 @@ class FragranceConfigAdmin(admin.ModelAdmin):
 
 @admin.register(Fragrance)
 class FragraneAdmin(admin.ModelAdmin):
-    pass
+    readonly_fields = ("name_slug", "house_slug")
 
 
 @admin.register(PreferenceProfile)
@@ -131,7 +131,7 @@ class PreferenceProfileAdmin(admin.ModelAdmin):
 
 @admin.register(Recommendation)
 class RecommendationAdmin(admin.ModelAdmin):
-    pass
+    readonly_fields = ("name_slug", "house_slug")
 
 
 @admin.register(RecommendationRun)

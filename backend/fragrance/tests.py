@@ -746,7 +746,11 @@ class GenerateEmailContentTests(TestCase):
 
         rec1.refresh_from_db()
         self.assertEqual(rec1.rationale, "")
+        # Slugs, not raw pick names, are what gets logged.
         self.assertTrue(
+            any("aventus" in message for message in logs.output)
+        )
+        self.assertFalse(
             any("Aventus" in message for message in logs.output)
         )
 
@@ -895,17 +899,34 @@ class RecommendationRateViewTests(TestCase):
         response = self.client.post(self._rate_url(rec.id), {"action": "meh"}, format="json")
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
-    def test_name_collision_with_existing_collection_entry_succeeds(self) -> None:
+    def test_same_name_in_collection_from_different_house_is_a_separate_fragrance(self) -> None:
+        # Previously (user, name) was the identity, so this pick claimed the
+        # existing row and overwrote its house. Identity is now
+        # (name, house): same name from a different house is a different
+        # fragrance and must not clobber the user's existing entry.
         Fragrance.objects.create(user=self.user, name="Aventus", house="Old House", status="dislike")
         rec = _make_run_with_pick(self.user)
 
         response = self.client.post(self._rate_url(rec.id), {"action": "own"}, format="json")
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
-        self.assertEqual(Fragrance.objects.filter(user=self.user, name="Aventus").count(), 1)
+        self.assertEqual(Fragrance.objects.filter(user=self.user, name="Aventus").count(), 2)
+
+        untouched = Fragrance.objects.get(user=self.user, name="Aventus", house="Old House")
+        self.assertEqual(untouched.status, "dislike")
+        self.assertIsNone(untouched.source_recommendation_id)
+        fragrance = Fragrance.objects.get(user=self.user, name="Aventus", house="Creed")
+        self.assertEqual(fragrance.status, "own")
+        self.assertEqual(fragrance.source_recommendation_id, rec.id)
+
+    def test_same_name_same_house_collection_entry_is_claimed(self) -> None:
+        Fragrance.objects.create(user=self.user, name="Aventus", house="Creed", status="dislike")
+        rec = _make_run_with_pick(self.user)
+
+        response = self.client.post(self._rate_url(rec.id), {"action": "own"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
 
         fragrance = Fragrance.objects.get(user=self.user, name="Aventus")
         self.assertEqual(fragrance.status, "own")
-        self.assertEqual(fragrance.house, "Creed")
         self.assertEqual(fragrance.source_recommendation_id, rec.id)
 
     def test_second_recommendation_with_same_name_does_not_hijack_first(self) -> None:
