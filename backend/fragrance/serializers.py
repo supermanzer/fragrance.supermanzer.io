@@ -27,7 +27,7 @@ class FragranceSerializer(serializers.ModelSerializer):
     class Meta:
         model = Fragrance
         exclude = ['user']
-        read_only_fields = ['added_at']
+        read_only_fields = ['added_at', 'source_recommendation']
 
 
 class PreferenceProfileSerializer(serializers.ModelSerializer):

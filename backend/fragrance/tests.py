@@ -965,6 +965,72 @@ class RecommendationRateViewTests(TestCase):
         self.assertEqual(fragrance.name, "Aventus Renamed")
 
 
+class CollectionSourceRecommendationScopeTests(TestCase):
+    """A client must not be able to link its collection row to another tenant's pick."""
+
+    def setUp(self) -> None:
+        self.user_a = User.objects.create_user(username="dave", password="hal-9000")
+        self.user_b = User.objects.create_user(username="frank", password="hal-9000")
+        self.client_a = APIClient()
+        self.client_a.force_authenticate(user=self.user_a)
+        self.client_b = APIClient()
+        self.client_b.force_authenticate(user=self.user_b)
+
+    def _rate_url(self, pick_id: int) -> str:
+        return f"/api/v1/recommendations/{pick_id}/rate/"
+
+    def test_other_users_source_recommendation_is_ignored_on_create(self) -> None:
+        rec_a = _make_run_with_pick(self.user_a)
+        response = self.client_b.post(
+            "/api/v1/collection/",
+            {"name": "Bobs Frag", "house": "BobHouse", "status": "own", "source_recommendation": rec_a.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertIsNone(response.data["source_recommendation"])
+        row = Fragrance.objects.get(user=self.user_b, name="Bobs Frag")
+        self.assertIsNone(row.source_recommendation_id)
+        self.assertFalse(Fragrance.objects.filter(source_recommendation_id=rec_a.id).exists())
+
+    def test_source_recommendation_is_ignored_on_patch(self) -> None:
+        rec_a = _make_run_with_pick(self.user_a)
+        row = Fragrance.objects.create(user=self.user_b, name="Bobs Frag", house="BobHouse", status="own")
+        response = self.client_b.patch(
+            f"/api/v1/collection/{row.id}/", {"source_recommendation": rec_a.id}, format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        row.refresh_from_db()
+        self.assertIsNone(row.source_recommendation_id)
+
+    def test_victim_rating_unaffected_after_attempted_link(self) -> None:
+        rec_a = _make_run_with_pick(self.user_a)
+        self.client_b.post(
+            "/api/v1/collection/",
+            {"name": "Bobs Frag", "house": "BobHouse", "status": "dislike", "source_recommendation": rec_a.id},
+            format="json",
+        )
+        response = self.client_a.post(self._rate_url(rec_a.id), {"action": "like"}, format="json")
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["name"], "Aventus")
+        self.assertEqual(response.data["action"], "like")
+        row = Fragrance.objects.get(user=self.user_a, source_recommendation_id=rec_a.id)
+        self.assertEqual(row.name, "Aventus")
+
+    def test_same_user_rating_flow_unchanged(self) -> None:
+        rec = _make_run_with_pick(self.user_a)
+        first = self.client_a.post(self._rate_url(rec.id), {"action": "own"}, format="json")
+        self.assertEqual(first.status_code, status.HTTP_201_CREATED)
+        again = self.client_a.post(self._rate_url(rec.id), {"action": "own"}, format="json")
+        self.assertEqual(again.status_code, status.HTTP_200_OK)
+        self.assertTrue(again.data["already_rated"])
+        conflict = self.client_a.post(self._rate_url(rec.id), {"action": "dislike"}, format="json")
+        self.assertEqual(conflict.status_code, status.HTTP_409_CONFLICT)
+        self.assertEqual(conflict.data["existing_action"], "own")
+        listed = self.client_a.get("/api/v1/collection/")
+        self.assertEqual(listed.status_code, status.HTTP_200_OK)
+        self.assertEqual(Fragrance.objects.filter(user=self.user_a, source_recommendation_id=rec.id).count(), 1)
+
+
 class RecommendationConfirmViewTests(TestCase):
     def setUp(self) -> None:
         self.user = User.objects.create_user(username="dave", password="hal-9000")
