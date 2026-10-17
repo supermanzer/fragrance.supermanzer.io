@@ -81,20 +81,60 @@ logger = logging.getLogger(__name__)
 # value per socket read, not as a total deadline, so the per-call worst case is
 # roughly connect + read = ~13s (0 retries, so exactly one attempt). Per
 # request-path endpoint, worst case: BillingSessionView ~13s (1 call);
-# BillingCheckoutView ~92s (7 calls: reusable-session retrieve, expire a
+# BillingCheckoutView ~105s if every call is naively summed (8 calls: the
+# stored-subscription liveness retrieve, reusable-session retrieve, expire a
 # stale session, create-customer, create-session, then on the two-tab race
 # path retrieve + expire the loser -- create-customer alone is given ONE
 # network retry, see _CUSTOMER_CREATE_MAX_NETWORK_RETRIES, so it is ~13s x 2
-# attempts plus <=0.5s backoff, ~27s; the others ~13s each. The call list is
-# not additive: a stored session id implies the Customer already exists, so
-# customer-create and the stored-session lookups never share a request, and
-# the "payment already in flight" path (retrieve + one fulfill_checkout_session
-# retrieve) is shorter still);
+# attempts plus <=0.5s backoff, ~27s; the others ~13s each: 13 + 13 + 13 + 27
+# + 13 + 13 + 13 = 105s). The real worst case is lower because the list is not
+# additive: the liveness retrieve only runs when stripe_subscription_id is
+# set, and a stored subscription or session id implies the Customer already
+# exists, so customer-create never shares a request with them. Path A (existing
+# customer, stored subscription): 13 (subscription) + 13 (session retrieve)
+# + 13 (expire stale) + 13 (create) + 13 + 13 (race retrieve + expire) = 78s.
+# Path B (first checkout, no stored ids): 27 (customer) + 13 (create) + 13 +
+# 13 (race) = 66s. Even the naive 105s sits under nginx's 110s and gunicorn's
+# 120s, and the "payment already in flight" path (retrieve + one
+# fulfill_checkout_session retrieve) is shorter still;
 # BillingPortalView and
 # BillingChangePlanView up to ~91s (7 calls on the rare path where an existing
 # schedule must be released before a new one is built) -- all comfortably
 # under gunicorn's 120s (and nginx's 110s billing proxy_read_timeout).
 _INTERACTIVE_TIMEOUT_SECONDS: tuple[float, float] = (3.05, 10)
+
+
+# Stripe subscription statuses in which the stored subscription is still a
+# live, billable one: a second Checkout would create a second concurrent
+# subscription (and a possible double charge). `incomplete` is deliberately
+# absent (an unpaid first attempt that expires by itself, and a dead card there
+# must not lock the customer out), as are canceled / incomplete_expired.
+CHECKOUT_BLOCKING_SUBSCRIPTION_STATUSES = frozenset(
+    {"active", "trialing", "past_due", "unpaid"}
+)
+
+
+SUBSCRIPTION_STILL_ACTIVE_DETAIL = (
+    "Your existing subscription is still in effect, so a new one can't be started. "
+    "If your payment is overdue, use Manage billing to update your payment method. "
+    "If you have just paid, please check back in a few minutes."
+)
+
+
+_ACCOUNT_LOCKED_DETAIL = (
+    "This account has been locked. Please reach out to {support_email} "
+    "if you wish to restart your subscription."
+)
+
+
+def account_locked_detail() -> str:
+    """
+    The single user-facing sentence for a locked (revoked) account, used by
+    every locked 409 (checkout, portal, change-plan, session). Built per call
+    from settings.SUPPORT_EMAIL, never frozen at import, so a changed
+    mailbox needs no code edit and tests can override the setting.
+    """
+    return _ACCOUNT_LOCKED_DETAIL.format(support_email=settings.SUPPORT_EMAIL or "support")
 
 
 DISPUTE_LIVE_SUBSCRIPTION_STATUSES = frozenset(
@@ -422,6 +462,14 @@ class SubscriptionAlreadyActiveError(CheckoutError):
     """Raised when the requesting user already has active access -- checkout is a 409."""
 
 
+class SubscriptionStillLiveError(CheckoutError):
+    """
+    The stored Stripe subscription is still active/trialing/past_due/unpaid in
+    Stripe although the local row does not grant access (lapsed, or the
+    webhook is late). Checkout is a 409 so a second subscription is never minted.
+    """
+
+
 class TermsUrlNotConfiguredError(CheckoutError):
     """STRIPE_REQUIRE_TOS_CONSENT is on but the Stripe account has no Terms URL."""
 
@@ -519,8 +567,14 @@ def start_checkout_session(
       expires its own and returns the stored one (see _settle_checkout_race),
       so at most one open session stays tracked.
 
-    A transient Stripe failure while looking the stored session up propagates
-    (a 502): failing closed beats minting a second open session blind.
+    - A stored Stripe subscription that is still active/trialing/past_due/unpaid
+      in Stripe refuses with SubscriptionStillLiveError (409
+      `subscription_still_active`) before anything else is looked up, so a
+      lapsed customer cannot stack a second subscription on the first.
+
+    A transient Stripe failure while looking the stored subscription or
+    session up propagates (a 502): failing closed beats minting a second open
+    session blind.
     """
     try:
         plan = Plan.objects.get(slug=plan_slug, is_active=True)  # ty: ignore[unresolved-attribute]
@@ -538,6 +592,9 @@ def start_checkout_session(
         raise AccountLockedError()
     if subscription.has_active_access:
         raise SubscriptionAlreadyActiveError()
+    _refuse_if_stored_subscription_live(
+        user=user, subscription=subscription, client=client
+    )
 
     seen_session_id = str(subscription.last_checkout_session_id or "")
     reusable_url = _reusable_open_session_url(
@@ -674,6 +731,56 @@ def start_checkout_session(
             client=client,
         )
     return CheckoutStart(url=url, resumed=False)
+
+
+def _refuse_if_stored_subscription_live(
+    *, user: User, subscription: Subscription, client: stripe.StripeClient
+) -> None:
+    """
+    One retrieve of the stored Stripe subscription on the interactive client
+    (0 retries, bounded timeout). Raises SubscriptionStillLiveError when it is
+    still billable. A canceled / incomplete / incomplete_expired subscription,
+    or one Stripe no longer knows (resource_missing) while the same account
+    still knows its customer, does not block re-checkout. Stripe returns
+    canceled subscriptions and deleted customers as 200, so a 404 for the
+    subscription AND its customer means the key belongs to another account or
+    mode: that is reported at CRITICAL and fails closed like any other Stripe
+    failure (502), as does any other lookup error, rather than minting a
+    second subscription blind. A stored subscription with no stored customer
+    id cannot be told apart and keeps the "not live" reading.
+    """
+    stored_id = str(subscription.stripe_subscription_id or "")
+    if not stored_id:
+        return
+    try:
+        current = client.v1.subscriptions.retrieve(stored_id)
+    except stripe.InvalidRequestError as exc:
+        if exc.code != "resource_missing":
+            raise
+        customer_id = str(subscription.stripe_customer_id or "")
+        if customer_id and not customer_known_to_stripe(customer_id=customer_id, client=client):
+            # The key's account knows neither the subscription nor its
+            # customer: a test/live mix-up, not a deleted subscription. Fail
+            # closed rather than let every user re-checkout past the guard.
+            report_key_mode_anomaly(
+                user_id=user.pk, resource="subscription", stripe_id=stored_id
+            )
+            raise
+        logger.info(
+            "checkout for user %s: stored subscription %s is unknown to Stripe; not blocking",
+            user.pk,
+            stored_id,
+        )
+        return
+    stripe_status = str(getattr(current, "status", "") or "")
+    if stripe_status in CHECKOUT_BLOCKING_SUBSCRIPTION_STATUSES:
+        logger.info(
+            "checkout refused for user %s: subscription %s is still %s in Stripe",
+            user.pk,
+            stored_id,
+            stripe_status,
+        )
+        raise SubscriptionStillLiveError()
 
 
 def create_portal_session(
@@ -1524,27 +1631,113 @@ def record_subscription_lapse_signal(
     return reason or "cleared"
 
 
+def retrieve_customer_email(
+    *, customer_id: str, client: stripe.StripeClient | None = None
+) -> str:
+    """
+    The Stripe Customer's current email, "" if it has none or the Customer
+    was deleted. One interactive-client retrieve (no retries); callers decide
+    what a StripeError means. Used only to fill Subscription.receipt_email.
+    """
+    if client is None:
+        client = get_interactive_stripe_client()
+    customer = client.v1.customers.retrieve(customer_id)
+    if getattr(customer, "deleted", False):
+        return ""
+    return str(getattr(customer, "email", None) or "").strip()
+
+
+def customer_known_to_stripe(
+    *, customer_id: str, client: stripe.StripeClient | None = None
+) -> bool:
+    """
+    True when the configured key's account has the Customer (a deleted one
+    still answers 200 with `deleted`), False on resource_missing. Any other
+    StripeError propagates: the caller must not guess.
+    """
+    if client is None:
+        client = get_interactive_stripe_client()
+    try:
+        client.v1.customers.retrieve(customer_id)
+    except stripe.InvalidRequestError as exc:
+        if exc.code == "resource_missing":
+            return False
+        raise
+    return True
+
+
+def report_key_mode_anomaly(*, user_id: int, resource: str, stripe_id: str) -> None:
+    """
+    CRITICAL, ids only. One template and call site, so the alert handler's
+    per-template rate limit sends one mail per window however many users hit it.
+    """
+    logger.critical(
+        "probable Stripe test/live key mismatch: stored %s id %s (user %s) is unknown to the "
+        "configured %s-mode key and the account does not know the customer either; "
+        "check STRIPE_SECRET_KEY against the mode the stored ids came from",
+        resource,
+        stripe_id,
+        user_id,
+        "live" if _key_is_live() else "test",
+    )
+
+
+def update_customer_receipt_email(
+    *,
+    customer_id: str,
+    email: str,
+    nonce: str,
+    attempt: int = 0,
+    client: stripe.StripeClient | None = None,
+) -> None:
+    """
+    Pushes a confirmed receipt address to the Stripe Customer, on the
+    interactive client (a user is waiting on the confirm link). The
+    idempotency key is the pending change's nonce plus the attempt counter.
+    Stripe (API v1) saves the first result for a key for 24 h and replays it,
+    5xx included, so a failed attempt must not be retried under the same key:
+    the caller bumps `attempt` after a failure. Setting the same address twice
+    is idempotent in itself, so a fresh key costs at most a duplicate
+    customer.updated. A fresh request has a fresh nonce. Raises
+    stripe.StripeError / ImproperlyConfigured; recipient.confirm_change owns
+    the classification.
+    """
+    if client is None:
+        client = get_interactive_stripe_client()
+    client.v1.customers.update(
+        customer_id,
+        params={"email": email},
+        options={"idempotency_key": f"receipt-email-{nonce}-{attempt}"},
+    )
+
+
 def revert_customer_email(*, token: object) -> bool:
     """
-    Consumes the "this wasn't me" token from the old-address notice. Returns
-    False for every rejection reason alike (the view maps that to one 400 body)
-    and True once the token was honoured.
+    Consumes the "this wasn't me" token from a legacy old-address notice. The
+    Stripe -> account email sync that minted these tokens is retired
+    (record_customer_updated_event is now log-only), so only links already in
+    flight can match. Returns False for every rejection reason alike (the view
+    maps that to one 400 body) and True once the token was honoured.
 
     Single-use without a table: valid only while User.email still equals the
-    token's new address, so a revert (email is now the old address) or any
-    later change kills it. Staff/superusers are never touched, mirroring
-    sync_customer_email. The password is deliberately not modified.
+    token's new address. With the sync retired nothing sets User.email to
+    that address any more, so for every link that was not already applied this
+    is a no-op (False, nothing written). A revert (email is now the old
+    address) or any later change kills it too. Staff/superusers are never
+    touched.
 
-    In one transaction, under the user row lock: restore User.email and
-    blacklist every refresh token. If another account has taken the old
-    address in the meantime the email is left alone (User.email is not
-    unique, and a duplicate would let one owner receive the other's reset
-    links) but the sessions are still killed; that path pushes nothing to
-    Stripe and mails nobody, since the old address now belongs to someone
-    else. After commit, best-effort: queue tasks.restore_stripe_customer_email
-    (pushes the old address back to the Stripe Customer, with retries; the
-    resulting customer.updated is a no-op in sync_customer_email) and the
-    confirmation notice. A queueing failure cannot fail the request. Log lines
+    In one transaction, under the user row lock: restore User.email, make the
+    password unusable (whoever changed the email may also have reset the
+    password through the new mailbox; the owner sets a fresh one via
+    forgot-password) and blacklist every refresh token. If another account
+    has taken the old address in the meantime the email is left alone
+    (User.email is not unique, and a duplicate would let one owner receive
+    the other's reset links) but the password is still invalidated and the
+    sessions are still killed; that path pushes nothing to Stripe and mails
+    nobody, since the old address now belongs to someone else. After commit,
+    best-effort: queue tasks.restore_stripe_customer_email (pushes the old
+    address back to the Stripe Customer, with retries) and the confirmation
+    notice. A queueing failure cannot fail the request. Log lines
     carry ids only.
     """
     from .services import verify_email_revert_token
@@ -1574,9 +1767,12 @@ def revert_customer_email(*, token: object) -> bool:
             .exclude(pk=user.pk)
             .exists()
         )
+        user.set_unusable_password()
         if not conflict:
             user.email = old_email
-            user.save(update_fields=["email"])
+            user.save(update_fields=["email", "password"])
+        else:
+            user.save(update_fields=["password"])
         revoked = blacklist_all_refresh_tokens(user=user)
         customer_id = (
             Subscription.objects.filter(user_id=user.pk)  # ty: ignore[unresolved-attribute]
@@ -1588,13 +1784,13 @@ def revert_customer_email(*, token: object) -> bool:
     if conflict:
         logger.warning(
             "email revert for user %s: old address now belongs to another account; "
-            "email left unchanged, %s refresh token(s) revoked",
+            "email left unchanged, password invalidated, %s refresh token(s) revoked",
             user.pk,
             revoked,
         )
         return True
     logger.info(
-        "reverted email for user %s; %s refresh token(s) revoked",
+        "reverted email for user %s; password invalidated, %s refresh token(s) revoked",
         user.pk,
         revoked,
     )
@@ -1817,135 +2013,52 @@ def subscription_status_payload(*, subscription: Subscription) -> dict:
     }
 
 
-def sync_customer_email(
+def record_customer_updated_event(
     *, customer: dict, previous_attributes: dict | None
-) -> bool:
+) -> None:
     """
-    customer.updated handler, invoked from tasks.process_stripe_event with the
-    stored `data.object` (a plain dict) and `data.previous_attributes`. Mirrors
-    an email edited in the Stripe Customer Portal onto User.email, since
-    PasswordResetRequestView keys on it. Returns True only when User.email
-    was actually changed.
-
-    Acts only on an event whose `previous_attributes` is a non-empty mapping
-    containing `email`, i.e. one that really changed the email. Absent, empty,
-    or email-less previous_attributes is a no-op with no value comparison:
-    otherwise, if restoring the old address on the Stripe customer after a
-    revert failed, any later customer.updated would re-sync the attacker's
-    address onto the user.
-
-    Resolves the account by Subscription.stripe_customer_id and nothing else
-    (never by email). Idempotent: once User.email equals the Stripe value a
-    replay is a no-op, so the notices go out exactly once. Never pushes
-    anything back to Stripe. Log lines carry ids only, never addresses.
-
-    The notices are queued inside the transaction on purpose: if the broker
-    is down the exception rolls the email change back and process_stripe_event
-    retries the whole thing, instead of committing a change nobody is told
-    about. The tasks are handed the addresses, not a DB read, so a worker
-    that runs before commit still sends the right thing.
+    customer.updated handler, invoked from tasks.process_stripe_event. A Stripe
+    Customer's email is a billing/receipt address that may legitimately differ
+    from the account (login) email, so Stripe is never an authority for
+    User.email: no account write, no notice, no Stripe call. The one local
+    write is mirroring a changed email onto Subscription.receipt_email (the
+    display/previous-address cache), scoped to this customer's subscription;
+    replays write the same value. Log lines carry ids and the names of the
+    changed attributes only, never addresses.
     """
     customer_id = customer.get("id") or ""
-    if not customer_id:
-        logger.warning("customer.updated had no customer id; nothing to sync")
+    changed = (
+        sorted(str(key) for key in previous_attributes)
+        if isinstance(previous_attributes, Mapping)
+        else []
+    )
+    mirrored = False
+    if customer_id and "email" in changed:
+        address = str(customer.get("email") or "").strip().lower()
+        if _is_cacheable_receipt_address(address=address):
+            Subscription.objects.filter(  # ty: ignore[unresolved-attribute]
+                stripe_customer_id=customer_id
+            ).update(receipt_email=address)
+            mirrored = True
+    logger.info(
+        "customer.updated for customer %s (changed attributes: %s); "
+        "receipt cache %s; no account changes",
+        customer_id or "unknown",
+        ",".join(changed) or "none",
+        "updated" if mirrored else "unchanged",
+    )
+
+
+def _is_cacheable_receipt_address(*, address: str) -> bool:
+    """Blank (email removed) or a syntactically valid address that fits the column."""
+    if not address:
+        return True
+    if len(address) > 254:
         return False
-    if (
-        not isinstance(previous_attributes, Mapping)
-        or "email" not in previous_attributes
-    ):
-        logger.info(
-            "customer.updated for %s did not change the email; nothing to sync",
-            customer_id,
-        )
+    try:
+        validate_email(address)
+    except ValidationError:
         return False
-
-    new_email = (customer.get("email") or "").strip()
-
-    from .services import generate_email_revert_token
-    from .tasks import send_account_email_change_notice
-
-    with transaction.atomic():
-        subscription = Subscription.objects.filter(  # ty: ignore[unresolved-attribute]
-            stripe_customer_id=customer_id
-        ).first()
-        if subscription is None:
-            logger.info(
-                "customer.updated for %s has no local Subscription; ignoring",
-                customer_id,
-            )
-            return False
-        user = User.objects.select_for_update().get(pk=subscription.user_id)
-        if is_exempt(user=user):
-            logger.info(
-                "customer.updated for exempt user %s; email not synced", user.pk
-            )
-            return False
-        if _normalized_email(email=new_email) == _normalized_email(
-            email=user.email
-        ):
-            return False
-        if not new_email:
-            logger.warning(
-                "customer.updated for user %s carried an empty email; skipping",
-                user.pk,
-            )
-            return False
-        try:
-            validate_email(new_email)
-        except ValidationError:
-            logger.warning(
-                "customer.updated for user %s carried an invalid email; skipping",
-                user.pk,
-            )
-            return False
-        if len(new_email) > User._meta.get_field("email").max_length:  # ty: ignore[unresolved-attribute]
-            logger.warning(
-                "customer.updated for user %s carried an over-long email; skipping",
-                user.pk,
-            )
-            return False
-        # User.email is not unique. Creating a second holder would make password
-        # reset mail every holder and let one account's owner receive another's link.
-        if (
-            User.objects.filter(email__iexact=new_email)
-            .exclude(pk=user.pk)
-            .exists()
-        ):
-            logger.warning(
-                "customer.updated for user %s wanted an email another account already uses; skipping",
-                user.pk,
-            )
-            return False
-
-        old_email = user.email
-        user.email = new_email
-        user.save(update_fields=["email"])
-        logger.info(
-            "synced email for user %s from stripe customer %s",
-            user.pk,
-            customer_id,
-        )
-
-        if old_email:
-            # Minted here, in the same transaction as the change it undoes, and
-            # handed to the old-address notice only -- never the new address's.
-            send_account_email_change_notice.delay(
-                user_id=user.pk,
-                recipient=old_email,
-                old_email=old_email,
-                new_email=new_email,
-                is_new_address=False,
-                revert_token=generate_email_revert_token(
-                    user_id=user.pk, old_email=old_email, new_email=new_email
-                ),
-            )
-        send_account_email_change_notice.delay(
-            user_id=user.pk,
-            recipient=new_email,
-            old_email=old_email,
-            new_email=new_email,
-            is_new_address=True,
-        )
     return True
 
 
@@ -2266,7 +2379,10 @@ def _get_or_create_customer(
         options={"max_network_retries": _CUSTOMER_CREATE_MAX_NETWORK_RETRIES},
     )
     subscription.stripe_customer_id = customer.id  # ty: ignore[invalid-assignment]
-    subscription.save(update_fields=["stripe_customer_id"])
+    # The Customer was just created with the account email, so that is where
+    # receipts go until a confirmed receipt-address change.
+    subscription.receipt_email = str(user.email or "").strip()  # ty: ignore[invalid-assignment]
+    subscription.save(update_fields=["stripe_customer_id", "receipt_email"])
     return str(customer.id)
 
 

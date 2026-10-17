@@ -22,6 +22,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView, TokenVerifyView
 from fragrance.auth import AtomicTokenRefreshView
 from fragrance.views import (
     ChangePasswordView,
+    ConfirmRecipientView,
     PasswordResetConfirmView,
     PasswordResetRequestView,
     RevertEmailView,
@@ -35,6 +36,7 @@ urlpatterns = [
     path('api/v1/auth/password/change/', ChangePasswordView.as_view(), name='password_change'),
     path('api/v1/auth/password/reset/', PasswordResetRequestView.as_view(), name='password_reset'),
     path('api/v1/auth/password/reset/confirm/', PasswordResetConfirmView.as_view(), name='password_reset_confirm'),
+    path('api/v1/auth/confirm-recipient/', ConfirmRecipientView.as_view(), name='confirm_recipient'),
     path('api/v1/auth/revert-email/', RevertEmailView.as_view(), name='revert_email'),
     path('api/v1/', include('fragrance.urls')),
 ]

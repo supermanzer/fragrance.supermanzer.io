@@ -70,6 +70,12 @@ RUN_RETRY_STATES = [
 ]
 
 
+RECIPIENT_PURPOSES = [
+    ("delivery", "Delivery"),
+    ("receipt", "Receipt"),
+]
+
+
 RUN_STATUSES = [
     ("pending", "Pending"),
     ("running", "Running"),
@@ -303,6 +309,17 @@ class Subscription(models.Model):
         max_length=20, choices=LAPSE_REASONS, blank=True, default="", db_default=""
     )
     lapse_signal_at = models.DateTimeField(null=True, blank=True)
+    # Cached copy of the Stripe Customer's email: the address receipts and
+    # invoices go to. Blank = not known locally yet (filled lazily by the
+    # first receipt-email read, or at customer creation). Changed only by a
+    # confirmed receipt-address change (recipient.confirm_change), never by a
+    # webhook and never from or to User.email. db_default keeps code from
+    # before this column inserting during a migrate-first deploy.
+    receipt_email = models.EmailField(blank=True, default="", db_default="")
+    # Last time the lazy fill asked Stripe for the email (whatever the
+    # outcome): while the cache is blank, Stripe is not asked again within
+    # recipient.RECEIPT_EMAIL_RECHECK_INTERVAL.
+    receipt_email_checked_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self) -> str:
         return f"{self.user} ({self.status})"
@@ -469,6 +486,73 @@ class FragranceConfig(models.Model):
     )  # Only weekly (0=Sun, 1=Mon, etc)
     run_day_of_month = models.PositiveIntegerField(default=1)
     run_month = models.PositiveBigIntegerField(default=1)
+
+
+class PendingEmailChange(models.Model):
+    """
+    A requested, not-yet-confirmed change of one of a user's two outbound
+    addresses: `delivery` (FragranceConfig.recipient_email, the picks and
+    failure notices) or `receipt` (the Stripe Customer's email). At most one
+    row per (user, purpose); a new request replaces it in place with a fresh
+    `nonce`, which is what retires the previous link. The verified address
+    lives on the target model and this row never feeds delivery. `address` is
+    stored lower-cased and trimmed. Deleting the row (confirm or cancel) is
+    what makes a link single-use.
+    """
+
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name="pending_email_changes"
+    )
+    purpose = models.CharField(max_length=10, choices=RECIPIENT_PURPOSES)
+    address = models.EmailField()
+    nonce = models.CharField(max_length=64)
+    expires_at = models.DateTimeField()
+    # When a link was last queued; blank means the last queue attempt failed,
+    # so the resend gap does not apply.
+    last_sent_at = models.DateTimeField(null=True, blank=True)
+    # Stripe replays a first-attempt failure for a reused idempotency key, so
+    # each confirm attempt of one request uses its own key suffix. Reset by a
+    # new request (new nonce).
+    confirm_attempts = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "purpose"], name="unique_pending_email_change_per_purpose"
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.purpose} change for user {self.user_id}"
+
+
+class RecipientChangeAttempt(models.Model):
+    """
+    One accepted request to change (`change`, wrong password included) or
+    re-send (`resend`) a recipient-address confirmation. The DB-backed hourly
+    cap in recipient.consume_attempt counts these, so the limit holds with
+    Redis down. Refused requests are not recorded (retrying never extends a
+    lockout); rows older than the window are pruned on write.
+    """
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="recipient_change_attempts",
+        db_index=False,
+    )
+    purpose = models.CharField(max_length=10, choices=RECIPIENT_PURPOSES)
+    action = models.CharField(max_length=10)
+    created_at = models.DateTimeField()
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=["user", "purpose", "action", "created_at"],
+                name="recipient_attempt_window_idx",
+            ),
+            models.Index(fields=["created_at"], name="recipient_attempt_created_idx"),
+        ]
 
 
 class ProcessedPayment(models.Model):

@@ -129,11 +129,28 @@ class RevertEndpointTests(_RevertBase):
         response = self._post(HTTP_AUTHORIZATION="Bearer garbage.token.value")
         self.assertEqual(response.status_code, 200)
 
-    def test_password_is_not_touched(self) -> None:
-        before = User.objects.get(pk=self.user.pk).password
+    def test_password_is_made_unusable_so_an_attacker_set_password_dies(self) -> None:
         self._post()
-        self.assertEqual(User.objects.get(pk=self.user.pk).password, before)
-        self.assertTrue(User.objects.get(pk=self.user.pk).check_password("pw12345!"))
+        user = User.objects.get(pk=self.user.pk)
+        self.assertFalse(user.has_usable_password())
+        self.assertFalse(user.check_password("pw12345!"))
+
+    def test_nothing_pending_is_a_safe_noop_for_email_password_and_sessions(self) -> None:
+        # Stripe-sourced sync is retired, so User.email is the old address and the link matches nothing.
+        self.user.email = OLD
+        self.user.save()
+        before = User.objects.get(pk=self.user.pk).password
+        token = RefreshToken.for_user(self.user)
+
+        self._assert_invalid(self._post())
+
+        after = User.objects.get(pk=self.user.pk)
+        self.assertEqual(after.email, OLD)
+        self.assertEqual(after.password, before)
+        self.assertTrue(after.has_usable_password())
+        self.assertFalse(BlacklistedToken.objects.filter(token__jti=token["jti"]).exists())
+        self.mock_restore.assert_not_called()
+        self.mock_notice.assert_not_called()
 
     def test_throttled_after_the_scope_limit(self) -> None:
         with patch.object(FailOpenScopedRateThrottle, "cache", LocMemCache("revert-throttle", {})), patch.object(
@@ -197,6 +214,7 @@ class DuplicateAddressTests(_RevertBase):
         self.assertEqual(self._email(), NEW)
         self.assertEqual(User.objects.filter(email__iexact=OLD).count(), 1)
         self.assertTrue(BlacklistedToken.objects.filter(token__jti=refresh["jti"]).exists())
+        self.assertFalse(User.objects.get(pk=self.user.pk).has_usable_password())
         self.mock_restore.assert_not_called()
         self.mock_notice.assert_not_called()
         joined = "\n".join(logs.output).lower()
@@ -335,7 +353,7 @@ class NoticeLinkTests(TestCase):
         send_email_reverted_notice(user_id=999999, recipient=OLD)
         self.assertEqual(mail.outbox, [])
 
-    def test_sync_mints_a_valid_token_for_the_old_address_notice_only(self) -> None:
+    def test_customer_updated_no_longer_mints_revert_tokens_or_sends_notices(self) -> None:
         user = User.objects.create_user(username="dave", email="dave@old.example", password="pw12345!")
         Subscription.objects.create(user=user, stripe_customer_id="cus_dave")
         StripeEvent.objects.create(
@@ -353,10 +371,9 @@ class NoticeLinkTests(TestCase):
         )
         with patch("fragrance.tasks.send_account_email_change_notice.delay") as delay:
             process_stripe_event(stripe_event_id="evt_mint")
-        by_recipient = {c.kwargs["recipient"]: c.kwargs for c in delay.call_args_list}
-        self.assertNotIn("revert_token", by_recipient["dave@new.example"])
-        payload = verify_email_revert_token(token=by_recipient["dave@old.example"]["revert_token"])
-        self.assertEqual(payload, {"uid": user.pk, "old": "dave@old.example", "new": "dave@new.example"})
+        delay.assert_not_called()
+        user.refresh_from_db()
+        self.assertEqual(user.email, "dave@old.example")
 
 
 class RestoreStripeCustomerEmailTaskTests(_RevertBase):

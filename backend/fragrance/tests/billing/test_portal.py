@@ -43,6 +43,7 @@ class BillingPortalViewTests(StripeClientTestCase):
     def test_get_is_not_allowed(self) -> None:
         self.assertEqual(self.client.get(self.url).status_code, 405)
 
+    @override_settings(SUPPORT_EMAIL="help@example.test")
     def test_revoked_account_is_409_account_locked_and_makes_no_stripe_call(self) -> None:
         Subscription.objects.filter(user=self.user).update(
             status="revoked", access_expires_at=timezone.now()
@@ -55,8 +56,8 @@ class BillingPortalViewTests(StripeClientTestCase):
         self.assertEqual(body["code"], "account_locked")
         self.assertEqual(
             body["detail"],
-            "This account can no longer be managed here. "
-            "You're welcome to sign up again with a new account.",
+            "This account has been locked. Please reach out to help@example.test "
+            "if you wish to restart your subscription.",
         )
         self.stripe.v1.billing_portal.sessions.create.assert_not_called()
         self.stripe.v1.subscriptions.retrieve.assert_not_called()
@@ -222,7 +223,7 @@ class ConfigureStripePortalCommandTests(StripeClientTestCase):
         features = params["features"]
         self.assertTrue(features["payment_method_update"]["enabled"])
         self.assertTrue(features["invoice_history"]["enabled"])
-        self.assertEqual(features["customer_update"], {"enabled": True, "allowed_updates": ["email"]})
+        self.assertEqual(features["customer_update"], {"enabled": False})
         cancel = features["subscription_cancel"]
         self.assertEqual((cancel["enabled"], cancel["mode"], cancel["proration_behavior"]), (True, "at_period_end", "none"))
         self.assertFalse(features["subscription_update"]["enabled"])

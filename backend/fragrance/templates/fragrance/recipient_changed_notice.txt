@@ -1,0 +1,9 @@
+{% autoescape off %}Hi {{ username }},
+
+{% if purpose == "receipt" %}Receipts and invoices for your subscription now go to {{ new_email }} instead of this address.{% elif account_copy %}Your monthly picks and notices for this account now go to {{ new_email }}.{% else %}Your monthly picks and notices now go to {{ new_email }} instead of this address.{% endif %} The new address confirmed the change.
+
+If you made this change, no action is needed.
+
+If this wasn't you, contact us right away at {{ support_email }} and reset your password.
+
+— Fragrance Journey{% endautoescape %}

@@ -20,7 +20,6 @@ from fragrance.tests.support.stripe_fakes import (
     _sdk_payment_intent,
 )
 from rest_framework.test import APIClient
-from rest_framework_simplejwt.exceptions import TokenError
 
 
 @override_settings(**_STRIPE_TEST_SETTINGS)
@@ -146,19 +145,16 @@ class PasswordChangeBlacklistTests(StripeClientTestCase):
             "refresh": "opaque-refresh-token-value",
         }
 
-    def test_token_error_is_swallowed_silently(self) -> None:
-        with patch("fragrance.views.RefreshToken", side_effect=TokenError("Token is invalid")):
-            with self.assertNoLogs("fragrance.views", level="WARNING"):
-                response = self.client.post(reverse("password_change"), self.payload, format="json")
-
-        self.assertEqual(response.status_code, 200)
-
-    def test_other_failures_are_logged_with_user_id_but_never_the_token(self) -> None:
-        with patch("fragrance.views.RefreshToken", side_effect=RuntimeError("db is on fire")):
+    def test_blacklist_failure_is_logged_with_user_id_but_never_the_token_or_password(self) -> None:
+        with patch(
+            "fragrance.views.billing.blacklist_all_refresh_tokens", side_effect=RuntimeError("db is on fire")
+        ):
             with self.assertLogs("fragrance.views", level="ERROR") as logs:
                 response = self.client.post(reverse("password_change"), self.payload, format="json")
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 503)
         self.assertIn(f"user {self.user.pk}", logs.output[0])
-        self.assertNotIn("opaque-refresh-token-value", logs.output[0])
+        joined = "\n".join(logs.output)
+        self.assertNotIn("opaque-refresh-token-value", joined)
+        self.assertNotIn("new-Pass-98765-xyz", joined)
         self.assertEqual(logging.getLevelName(logs.records[0].levelno), "ERROR")

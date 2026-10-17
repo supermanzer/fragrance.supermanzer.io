@@ -27,7 +27,11 @@ from fragrance.tests.support.factories import (
     active_subscription_for,
 )
 from fragrance.tests.support.stripe_fakes import _BILLING_CHANGES_SETTINGS as _SETTINGS
-from fragrance.tests.support.stripe_fakes import _STRIPE_TEST_SETTINGS, patch_stripe_clients
+from fragrance.tests.support.stripe_fakes import (
+    _STRIPE_TEST_SETTINGS,
+    _stripe_subscription,
+    patch_stripe_clients,
+)
 from fragrance.views import FailOpenScopedRateThrottle
 from rest_framework.test import APIClient
 
@@ -152,7 +156,11 @@ class BillingCheckoutViewTests(StripeClientTestCase):
         self.assertEqual(response.status_code, 409)
         body = response.json()
         self.assertEqual(body["code"], "account_locked")
-        self.assertIn("help@example.test", body["detail"])
+        self.assertEqual(
+            body["detail"],
+            "This account has been locked. Please reach out to help@example.test "
+            "if you wish to restart your subscription.",
+        )
         self.stripe.v1.checkout.sessions.retrieve.assert_not_called()
         self.stripe.v1.checkout.sessions.expire.assert_not_called()
         self.stripe.v1.checkout.sessions.create.assert_not_called()
@@ -915,3 +923,182 @@ class BillingThrottleFailOpenTests(StripeClientTestCase):
             response = self.client.get("/api/v1/billing/session/cs_x/")
         self.assertEqual(response.status_code, 404)
         self.assertTrue(any("throttle cache unavailable" in m for m in logs.output))
+
+
+@override_settings(**_STRIPE_TEST_SETTINGS, SUPPORT_EMAIL="help@example.test")
+class StoredSubscriptionStillLiveGuardTests(StripeClientTestCase):
+    """The server refuses a second Checkout while the stored Stripe subscription is still billable."""
+
+    url = "/api/v1/billing/checkout/"
+
+    def setUp(self) -> None:
+        super().setUp()
+        Plan.objects.create(
+            name="Beta Monthly", slug="beta-monthly", stripe_price_id="price_mo",
+            amount_cents=400, currency="usd", billing_interval="month",
+        )
+        self.user = User.objects.create_user(
+            username="lapsed", email="lapsed@example.com", password="pw12345!"
+        )
+        # Lapsed locally: status "active" but the paid period has ended.
+        Subscription.objects.create(
+            user=self.user, status="active", stripe_customer_id="cus_lapsed",
+            stripe_subscription_id="sub_old", access_expires_at=timezone.now() - timedelta(days=2),
+        )
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    def _post(self):
+        return self.client.post(self.url, {"slug": "beta-monthly"})
+
+    def _assert_no_session_minted(self) -> None:
+        self.stripe.v1.checkout.sessions.create.assert_not_called()
+        self.stripe.v1.customers.create.assert_not_called()
+        self.stripe.v1.checkout.sessions.retrieve.assert_not_called()
+
+    def test_unauthenticated_is_401(self) -> None:
+        self.assertEqual(APIClient().post(self.url, {"slug": "beta-monthly"}).status_code, 401)
+
+    def test_live_statuses_are_refused_with_409_and_mint_nothing(self) -> None:
+        for stripe_status in ("active", "trialing", "past_due", "unpaid"):
+            with self.subTest(stripe_status=stripe_status):
+                self.stripe.v1.subscriptions.retrieve.reset_mock()
+                self.stripe.v1.subscriptions.retrieve.return_value = _stripe_subscription(
+                    status=stripe_status, sub_id="sub_old"
+                )
+
+                response = self._post()
+
+                self.assertEqual(response.status_code, 409)
+                body = response.json()
+                self.assertEqual(body["code"], "subscription_still_active")
+                self.assertIn("Manage billing", body["detail"])
+                self.stripe.v1.subscriptions.retrieve.assert_called_once_with("sub_old")
+                self._assert_no_session_minted()
+
+    def test_the_lookup_uses_the_interactive_client_only(self) -> None:
+        self.stripe.v1.subscriptions.retrieve.return_value = _stripe_subscription(status="past_due")
+        self._post()
+        self.mock_get_interactive_stripe_client.assert_called()
+        self.mock_get_stripe_client.assert_not_called()
+
+    def test_dead_statuses_do_not_block_re_checkout(self) -> None:
+        for stripe_status in ("canceled", "incomplete_expired", "incomplete"):
+            with self.subTest(stripe_status=stripe_status):
+                self.stripe.v1.subscriptions.retrieve.return_value = _stripe_subscription(
+                    status=stripe_status, sub_id="sub_old"
+                )
+                self.stripe.v1.checkout.sessions.create.reset_mock()
+                self.stripe.v1.checkout.sessions.create.return_value = _session(
+                    session_id=f"cs_{stripe_status}", url=f"https://checkout.stripe.com/cs_{stripe_status}"
+                )
+
+                response = self._post()
+
+                self.assertEqual(response.status_code, 200, response.content)
+                self.stripe.v1.checkout.sessions.create.assert_called_once()
+                Subscription.objects.filter(user=self.user).update(last_checkout_session_id="")
+
+    def test_a_subscription_stripe_no_longer_knows_does_not_block(self) -> None:
+        # The account still knows the customer, so the key's mode is right and
+        # the subscription really is gone.
+        self.stripe.v1.subscriptions.retrieve.side_effect = stripe.InvalidRequestError(
+            "No such subscription: 'sub_old'", param="id", code="resource_missing"
+        )
+        self.stripe.v1.customers.retrieve.return_value = stripe.Customer.construct_from(
+            {"id": "cus_lapsed", "object": "customer", "deleted": True}, "sk_test_x"
+        )
+        self.stripe.v1.checkout.sessions.create.return_value = _session(
+            session_id="cs_fresh", url="https://checkout.stripe.com/cs_fresh"
+        )
+
+        response = self._post()
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.stripe.v1.customers.retrieve.assert_called_once_with("cus_lapsed")
+
+    def test_subscription_and_customer_both_unknown_is_a_key_mode_anomaly_and_fails_closed(self) -> None:
+        missing = stripe.InvalidRequestError("No such", param="id", code="resource_missing")
+        self.stripe.v1.subscriptions.retrieve.side_effect = missing
+        self.stripe.v1.customers.retrieve.side_effect = missing
+
+        with self.assertLogs("fragrance.billing", level="CRITICAL") as logs:
+            response = self._post()
+
+        self.assertEqual(response.status_code, 502)
+        self._assert_no_session_minted()
+        message = "\n".join(logs.output)
+        self.assertIn("key mismatch", message)
+        self.assertIn("sub_old", message)
+        self.assertNotIn("lapsed@example.com", message)
+
+    def test_customer_probe_failure_fails_closed(self) -> None:
+        self.stripe.v1.subscriptions.retrieve.side_effect = stripe.InvalidRequestError(
+            "No such", param="id", code="resource_missing"
+        )
+        self.stripe.v1.customers.retrieve.side_effect = stripe.APIConnectionError("down")
+
+        response = self._post()
+
+        self.assertEqual(response.status_code, 502)
+        self._assert_no_session_minted()
+
+    def test_lookup_failure_fails_closed_with_502(self) -> None:
+        failures = (
+            stripe.APIConnectionError("timeout"),
+            stripe.RateLimitError("slow down"),
+            stripe.InvalidRequestError("bad request", param="id", code="parameter_invalid_empty"),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                self.stripe.v1.subscriptions.retrieve.side_effect = failure
+
+                response = self._post()
+
+                self.assertEqual(response.status_code, 502)
+                self.assertEqual(
+                    response.json(), {"detail": "Could not start checkout. Please try again shortly."}
+                )
+                self._assert_no_session_minted()
+
+    def test_no_stored_subscription_makes_no_extra_stripe_call(self) -> None:
+        Subscription.objects.filter(user=self.user).update(stripe_subscription_id="")
+        self.stripe.v1.checkout.sessions.create.return_value = _session(
+            session_id="cs_first", url="https://checkout.stripe.com/cs_first"
+        )
+
+        response = self._post()
+
+        self.assertEqual(response.status_code, 200)
+        self.stripe.v1.subscriptions.retrieve.assert_not_called()
+
+    def test_locally_active_user_keeps_the_existing_409_with_no_stripe_call(self) -> None:
+        Subscription.objects.filter(user=self.user).update(
+            access_expires_at=timezone.now() + timedelta(days=10)
+        )
+
+        response = self._post()
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json(), {"detail": "You already have an active subscription."})
+        self.stripe.v1.subscriptions.retrieve.assert_not_called()
+
+    def test_revoked_account_is_locked_before_any_stripe_call(self) -> None:
+        Subscription.objects.filter(user=self.user).update(status="revoked")
+
+        response = self._post()
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["code"], "account_locked")
+        self.stripe.v1.subscriptions.retrieve.assert_not_called()
+
+    def test_another_users_stored_subscription_is_never_consulted(self) -> None:
+        other = User.objects.create_user(username="other", email="o@example.com", password="pw12345!")
+        Subscription.objects.create(user=other, status="active", stripe_subscription_id="sub_other")
+        Subscription.objects.filter(user=self.user).update(stripe_subscription_id="")
+        self.stripe.v1.checkout.sessions.create.return_value = _session(
+            session_id="cs_mine", url="https://checkout.stripe.com/cs_mine"
+        )
+
+        self.assertEqual(self._post().status_code, 200)
+        self.stripe.v1.subscriptions.retrieve.assert_not_called()

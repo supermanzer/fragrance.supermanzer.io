@@ -1,0 +1,13 @@
+{% autoescape off %}Hello,
+
+{% if purpose == "receipt" %}A request was made to send payment receipts and invoices for a Fragrance Journey subscription to this email address.{% else %}A request was made to send the monthly fragrance picks and notices from a Fragrance Journey account to this email address.{% endif %}
+
+To confirm that this address is yours, open this link:
+
+{{ confirm_url }}
+
+The link works once and expires in 24 hours. Nothing changes until you confirm.
+
+If you didn't expect this, ignore this email. {% if purpose == "receipt" %}No receipts will be sent here{% else %}No picks will be sent here{% endif %} and nothing about the account changes. If you'd like to tell us, write to {{ support_email }}.
+
+— Fragrance Journey{% endautoescape %}

@@ -239,8 +239,9 @@ class FragranceConfigScheduleValidationTests(TestCase):
         )
 
     def test_existing_default_config_still_saves(self) -> None:
+        # recipient_email is read-only now (verified-address flow); a schedule
+        # save never carries it. See tests/recipient/ for the 400 contract.
         response = self._put(
-            recipient_email="ok@example.com",
             run_hour=9,
             run_day_of_week=1,
             run_day_of_month=1,

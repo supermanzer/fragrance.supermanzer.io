@@ -7,6 +7,7 @@ from django.utils.http import urlsafe_base64_decode
 from rest_framework import serializers
 
 from .models import FRAGRANCE_STATUSES, FragranceConfig, Fragrance, Plan, PreferenceProfile, Recommendation, RecommendationRun
+from .recipient import delivery_fields
 from .services import MAX_RUN_DAY_OF_MONTH, MAX_RUN_RETRIES, http_url_or_empty, resolve_beta_invite_signup
 
 
@@ -116,9 +117,16 @@ class CheckoutCreateSerializer(serializers.Serializer):
 
 
 class FragranceConfigSerializer(serializers.ModelSerializer):
+    """
+    `recipient_email` is read-only here and always the verified address; a
+    change goes through POST /config/recipient/ (see fragrance/recipient.py).
+    The pending block is computed server-side so clients never compare clocks.
+    """
+
     class Meta:
         model = FragranceConfig
         exclude = ['user']
+        read_only_fields = ['recipient_email']
         # An out-of-range value would save and then yield an invalid crontab;
         # django-celery-beat swallows that error, silently losing the run.
         # Day of month stops at 28: 29-31 would skip short months.
@@ -129,12 +137,36 @@ class FragranceConfigSerializer(serializers.ModelSerializer):
             'run_month': {'min_value': 1, 'max_value': 12},
         }
 
+    def update(self, instance: FragranceConfig, validated_data: dict) -> FragranceConfig:
+        """
+        Writes only the submitted columns. A full save() would write back the
+        recipient_email loaded at the start of the request and undo a
+        delivery-address confirmation committed in between.
+        """
+        for name, value in validated_data.items():
+            setattr(instance, name, value)
+        if validated_data:
+            instance.save(update_fields=list(validated_data))
+        instance.refresh_from_db(fields=['recipient_email'])
+        return instance
+
+    def to_representation(self, instance: FragranceConfig) -> dict:
+        data = super().to_representation(instance)
+        # The address deliveries actually use: a blank column falls back to the account email.
+        data['recipient_email'] = str(instance.recipient_email or instance.user.email or '')
+        fields = delivery_fields(user=instance.user)
+        for key in ('pending_expires_at', 'resend_available_at'):
+            value = fields[key]
+            fields[key] = serializers.DateTimeField().to_representation(value=value) if value else None
+        data.update(fields)
+        return data
+
 
 class FragranceSerializer(serializers.ModelSerializer):
     class Meta:
         model = Fragrance
         exclude = ['user']
-        read_only_fields = ['added_at']
+        read_only_fields = ['added_at', 'source_recommendation']
 
 
 class PasswordResetConfirmSerializer(serializers.Serializer):

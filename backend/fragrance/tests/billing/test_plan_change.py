@@ -56,6 +56,7 @@ class BillingChangePlanViewTests(StripeClientTestCase):
         self.assertEqual(anon.post(self.url, {"plan": "beta-annual"}, format="json").status_code, 401)
         self.assertEqual(anon.delete(self.url).status_code, 401)
 
+    @override_settings(SUPPORT_EMAIL="help@example.test")
     def test_revoked_account_is_409_account_locked_on_every_method(self) -> None:
         Subscription.objects.filter(user=self.user).update(
             status="revoked", access_expires_at=timezone.now()
@@ -70,6 +71,11 @@ class BillingChangePlanViewTests(StripeClientTestCase):
         for response in responses:
             self.assertEqual(response.status_code, 409)
             self.assertEqual(response.json()["code"], "account_locked")
+            self.assertEqual(
+                response.json()["detail"],
+                "This account has been locked. Please reach out to help@example.test "
+                "if you wish to restart your subscription.",
+            )
         self.stripe.v1.subscriptions.retrieve.assert_not_called()
         self.stripe.v1.subscription_schedules.create.assert_not_called()
         self.stripe.v1.subscription_schedules.release.assert_not_called()

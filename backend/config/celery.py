@@ -41,6 +41,10 @@ app.conf.beat_schedule = {
         "task": "fragrance.tasks.purge_rejected_beta_signups",
         "schedule": crontab(minute=53, hour=4),
     },
+    "system-purge-expired-pending-email-changes": {
+        "task": "fragrance.tasks.purge_expired_pending_email_changes",
+        "schedule": crontab(minute=11, hour=5),
+    },
     "system-reconcile-stripe": {
         "task": "fragrance.tasks.reconcile_stripe_subscriptions",
         "schedule": crontab(minute=17, hour=3),

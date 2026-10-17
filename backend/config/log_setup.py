@@ -243,6 +243,14 @@ _EMAIL_PATTERN = re.compile(
 )
 
 
+# An address cut by a truncating logger (Celery caps the unknown-task body at
+# 1024 chars and appends "...") has no TLD left for _EMAIL_PATTERN: scrub
+# local@partial-domain when it runs into that marker.
+_TRUNCATED_EMAIL_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]++@[A-Za-z0-9-]*+(?:\.[A-Za-z0-9-]++)*+(?=\.\.\.)"
+)
+
+
 def redact(*, text: str) -> str:
     if len(text) > MAX_REDACT_CHARS:
         text = f"{text[:MAX_REDACT_CHARS]}...[truncated {len(text) - MAX_REDACT_CHARS} chars]"
@@ -250,6 +258,7 @@ def redact(*, text: str) -> str:
         text = pattern.sub(replacement, text)
     if "@" in text:
         text = _EMAIL_PATTERN.sub("[email]", text)
+        text = _TRUNCATED_EMAIL_PATTERN.sub("[email]", text)
     return text
 
 
@@ -294,6 +303,15 @@ class ExceptionScrubFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
+            data = getattr(record, "data", None)
+            if isinstance(data, dict):
+                # Celery's context carries the task's args/kwargs reprs
+                # (recipient addresses for the notice task).
+                scrubbed = {
+                    key: redact(text=value) if key in ("args", "kwargs") and isinstance(value, str) else value
+                    for key, value in data.items()
+                }
+                record.data = scrubbed
             info = record.exc_info
             if not (isinstance(info, tuple) and len(info) == 3 and isinstance(info[1], Exception)):
                 return True

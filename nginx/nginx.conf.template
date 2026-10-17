@@ -36,6 +36,10 @@ http {
     # outbound Stripe calls, and the DRF throttle fails open if Redis is down, so this is the
     # backstop. 60r/m leaves room for the success page's bounded polling.
     limit_req_zone $binary_remote_addr zone=billing:10m rate=60r/m;
+    # Delivery-address change/resend (POST /api/v1/config/recipient/...): the DRF throttle fails
+    # open when Redis is down, so this is the Redis-independent edge backstop (password check
+    # and confirmation mail are behind these endpoints).
+    limit_req_zone $binary_remote_addr zone=recipient:10m rate=10r/m;
 
     # nginx answers a tripped limit_req with 503 by default, which a client cannot
     # distinguish from a genuinely broken upstream. 429 is the correct semantics — "you are
@@ -87,7 +91,7 @@ http {
     # signed token (and any future sensitive query param) into cleartext access logs.
     # Log the path only, never the query string.
     log_format no_query '$remote_addr - [$time_local] "$request_method $uri" '
-                         '$status $body_bytes_sent "$http_referer" "$http_user_agent" rid=$request_id';
+                         '$status $body_bytes_sent "$http_user_agent" rid=$request_id';
 
     # Docker's embedded DNS. A static `upstream { server backend:8000; }` block
     # only resolves once, at worker startup, and never again — if the backend
@@ -168,6 +172,22 @@ http {
         # `return` (rewrite phase, bypasses the access phase).
         location /api/v1/beta/ {
             limit_req zone=beta burst=3 nodelay;
+            proxy_hide_header  X-Content-Type-Options;
+            proxy_hide_header  Referrer-Policy;
+            set $backend_upstream http://backend:8000;
+            proxy_pass         $backend_upstream;
+            proxy_set_header   Host              $host;
+            proxy_set_header   X-Real-IP         $remote_addr;
+            proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_set_header   X-Request-ID      $request_id;
+            client_max_body_size 8k;
+        }
+
+        # Delivery-address change/resend/cancel. Longer prefix than /api/, so it wins. Same
+        # invariants as the other API locations; no long timeout (no Stripe call on this path).
+        location /api/v1/config/recipient/ {
+            limit_req zone=recipient burst=5 nodelay;
             proxy_hide_header  X-Content-Type-Options;
             proxy_hide_header  Referrer-Policy;
             set $backend_upstream http://backend:8000;

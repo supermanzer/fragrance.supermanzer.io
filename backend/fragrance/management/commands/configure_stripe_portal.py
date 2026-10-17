@@ -14,8 +14,10 @@ Only *active* configurations are considered (Configuration.list supports an
 `active` filter), so deactivating a duplicate in the Dashboard clears the
 "more than one tagged" guard, and a deactivated configuration is never reused.
 
-What customers may do: update their payment method, view invoices, update their
-email, and cancel at period end with no proration. Everything else is off:
+What customers may do: update their payment method, view invoices, and cancel
+at period end with no proration. Everything else is off, including editing the
+Customer's email (a portal email edit used to be a step-up bypass of the app's
+password; the account email is never taken from Stripe) and
 plan switching (our own change-plan endpoint defers it to period end without
 prorations; the portal's own switching cannot control the billing anchor and
 can create a free period), promotion codes and the hosted login page.
@@ -137,7 +139,7 @@ def desired_configuration() -> ConfigurationUpdateParams:
         "features": {
             "payment_method_update": {"enabled": True},
             "invoice_history": {"enabled": True},
-            "customer_update": {"enabled": True, "allowed_updates": ["email"]},
+            "customer_update": {"enabled": False},
             "subscription_cancel": {
                 "enabled": True,
                 "mode": "at_period_end",

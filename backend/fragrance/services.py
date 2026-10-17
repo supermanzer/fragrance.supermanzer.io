@@ -270,7 +270,9 @@ def apply_recommendation_rating(recommendation: Recommendation, action: str) -> 
     recommendation, or if the (user, name) row is already claimed by a different
     recommendation — first rating for a given (user, name, recommendation) wins.
     """
-    linked = Fragrance.objects.filter(source_recommendation_id=recommendation.id).first()
+    linked = Fragrance.objects.filter(
+        user_id=recommendation.user_id, source_recommendation_id=recommendation.id
+    ).first()
     if linked is not None:
         if linked.status == action:
             return linked, False
@@ -1162,7 +1164,9 @@ def _resolve_after_race(
     recommendation: Recommendation, action: str, original: IntegrityError
 ) -> tuple[Fragrance, bool]:
     """Re-resolves from committed state after apply_recommendation_rating loses a create/claim race."""
-    linked = Fragrance.objects.filter(source_recommendation_id=recommendation.id).first()
+    linked = Fragrance.objects.filter(
+        user_id=recommendation.user_id, source_recommendation_id=recommendation.id
+    ).first()
     if linked is not None:
         if linked.status == action:
             return linked, False

@@ -1,4 +1,7 @@
-"""Reply-To on end-user mail (replies reach SUPPORT_EMAIL); operator mail to ADMIN_EMAIL carries none."""
+"""
+Reply-To on picks and failure notices (replies reach SUPPORT_EMAIL); credential-bearing mail
+(password reset, beta invite) and operator mail to ADMIN_EMAIL carry none.
+"""
 
 from django.contrib.auth.models import User
 from django.core import mail
@@ -46,12 +49,13 @@ class ReplyToTests(TestCase):
 
         self.assertEqual(mail.outbox[0].reply_to, ["support@example.test"])
 
-    def test_password_reset_replies_go_to_support(self) -> None:
+    def test_password_reset_mail_carries_no_reply_to(self) -> None:
         send_password_reset_email(user_id=self.user.id)
 
-        self.assertEqual(mail.outbox[0].reply_to, ["support@example.test"])
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].reply_to, [])
 
-    def test_beta_invite_replies_go_to_support(self) -> None:
+    def test_beta_invite_carries_no_reply_to(self) -> None:
         signup = BetaSignup.objects.create(
             email="dave@example.test", normalized_email="dave@example.test", invited_user=self.user
         )
@@ -59,7 +63,7 @@ class ReplyToTests(TestCase):
         send_beta_invite_email(signup_id=signup.id)
 
         self.assertEqual(mail.outbox[0].to, ["dave@example.test"])
-        self.assertEqual(mail.outbox[0].reply_to, ["support@example.test"])
+        self.assertEqual(mail.outbox[0].reply_to, [])
 
     def test_operator_mail_to_admin_has_no_reply_to(self) -> None:
         RecommendationRun.objects.filter(pk=self.run.pk).update(
@@ -78,7 +82,8 @@ class ReplyToTests(TestCase):
     @override_settings(SUPPORT_EMAIL="")
     def test_blank_support_email_yields_no_reply_to(self) -> None:
         render_and_send_email(user_id=self.user.id, run_id=self.run.id)
-        send_password_reset_email(user_id=self.user.id)
+        RecommendationRun.objects.filter(pk=self.run.pk).update(status="failed", last_failed_at=timezone.now())
+        send_run_failure_notice(run_id=self.run.id, kind="retrying")
 
         self.assertEqual(len(mail.outbox), 2)
         for message in mail.outbox:

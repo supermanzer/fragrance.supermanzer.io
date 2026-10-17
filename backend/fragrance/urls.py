@@ -15,6 +15,12 @@ from .views import (
     ImportCollectionView,
     PreferenceProfileHistoryView,
     PreferenceProfileView,
+    ReceiptEmailPendingView,
+    ReceiptEmailResendView,
+    ReceiptEmailView,
+    RecipientChangeView,
+    RecipientPendingView,
+    RecipientResendView,
     RecommendationConfirmView,
     RecommendationListView,
     RecommendationRateView,
@@ -32,6 +38,9 @@ urlpatterns = router.urls + [
     path('export/', ExportCollectionView.as_view(), name='export-collection'),
     path('import/', ImportCollectionView.as_view(), name='import-collection'),
     path('config/', FragranceConfigView.as_view(), name='fragrance-config'),
+    path('config/recipient/', RecipientChangeView.as_view(), name='recipient-change'),
+    path('config/recipient/resend/', RecipientResendView.as_view(), name='recipient-resend'),
+    path('config/recipient/pending/', RecipientPendingView.as_view(), name='recipient-pending'),
     path('profile/', PreferenceProfileView.as_view(), name='preference-profile'),
     path('profile/history/', PreferenceProfileHistoryView.as_view(), name='preference-profile-history'),
     path('recommendations/', RecommendationListView.as_view(), name='recommendations'),
@@ -45,6 +54,9 @@ urlpatterns = router.urls + [
     # Both spellings route to the same view: CommonMiddleware + APPEND_SLASH
     # would otherwise 301 a slashless POST, and Stripe treats a redirect
     # response to a webhook delivery as a failure.
+    path('billing/receipt-email/', ReceiptEmailView.as_view(), name='receipt-email'),
+    path('billing/receipt-email/resend/', ReceiptEmailResendView.as_view(), name='receipt-email-resend'),
+    path('billing/receipt-email/pending/', ReceiptEmailPendingView.as_view(), name='receipt-email-pending'),
     path('billing/webhook/stripe/', stripe_webhook, name='stripe-webhook'),
     path('billing/webhook/stripe', stripe_webhook, name='stripe-webhook-noslash'),
 ]

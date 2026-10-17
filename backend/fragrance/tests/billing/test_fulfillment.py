@@ -646,6 +646,7 @@ class BillingSessionViewTests(StripeClientTestCase):
         self.assertTrue(body["has_active_access"])
         self.assertFalse(body["granted"])
 
+    @override_settings(SUPPORT_EMAIL="help@example.test")
     def test_revoked_account_returns_409_account_locked_without_calling_stripe(self) -> None:
         self.subscription.status = "revoked"
         self.subscription.access_expires_at = timezone.now()
@@ -655,6 +656,11 @@ class BillingSessionViewTests(StripeClientTestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["code"], "account_locked")
+        self.assertEqual(
+            response.json()["detail"],
+            "This account has been locked. Please reach out to help@example.test "
+            "if you wish to restart your subscription.",
+        )
         self.stripe.v1.checkout.sessions.retrieve.assert_not_called()
 
     def test_lapsed_row_with_an_unpaid_session_stays_active_status_without_access(self) -> None:

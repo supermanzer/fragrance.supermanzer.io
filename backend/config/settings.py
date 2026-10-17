@@ -366,6 +366,17 @@ REST_FRAMEWORK = {
         # subscription, price, optional release, create, modify, cleanup
         # release), each capped at 10s with no retries (see billing.py).
         "billing-change-plan": "20/min",
+        # Recipient-address verification (fragrance/recipient.py). Every
+        # request mails an arbitrary address, hence per-user hourly caps;
+        # the 60 s resend gap is enforced separately, per pending change.
+        # A rejected request (wrong password, bad address) counts, so the
+        # receipt form is not a password oracle.
+        "recipient-change": "5/hour",
+        "recipient-resend": "5/hour",
+        "receipt-change": "5/hour",
+        "receipt-resend": "5/hour",
+        # Public, unauthenticated, keyed on client IP; same class as revert-email.
+        "confirm-recipient": "10/min",
     },
     # DRF's default SimpleMetadata answers OPTIONS for any caller, including
     # AllowAny views, by cloning the request per unsafe method and including

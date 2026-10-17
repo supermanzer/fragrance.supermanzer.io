@@ -4,7 +4,7 @@ from django.contrib.auth.models import User
 from django.test import TestCase
 from fragrance.models import Fragrance, Recommendation
 from fragrance.services import generate_recommendation_token
-from fragrance.tests.support.factories import _make_run_with_pick
+from fragrance.tests.support.factories import _make_run_with_pick, active_subscription_for
 from rest_framework import status
 from rest_framework.test import APIClient
 
@@ -233,3 +233,80 @@ class RecommendationConfirmViewTests(TestCase):
         response = self._post(self._token(rec, action="dislike"))
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
         self.assertEqual(response.data["rated_as"], "like")
+
+
+class SourceRecommendationOwnershipTests(TestCase):
+    """A user can never link their own Fragrance to another tenant's pick."""
+
+    def setUp(self) -> None:
+        self.alice = User.objects.create_user(username="alice", password="hal-9000")
+        self.bob = User.objects.create_user(username="bob", password="hal-9000")
+        for user in (self.alice, self.bob):
+            active_subscription_for(user)
+        self.alice_client = APIClient(raise_request_exception=False)
+        self.alice_client.force_authenticate(user=self.alice)
+        self.bob_client = APIClient(raise_request_exception=False)
+        self.bob_client.force_authenticate(user=self.bob)
+
+    def test_collection_create_ignores_source_recommendation(self) -> None:
+        pick = _make_run_with_pick(self.alice)
+
+        response = self.bob_client.post(
+            "/api/v1/collection/",
+            {"name": "Bob frag", "house": "BobHouse", "status": "own", "source_recommendation": pick.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertIsNone(response.data["source_recommendation"])
+        self.assertIsNone(Fragrance.objects.get(user=self.bob, name="Bob frag").source_recommendation_id)
+
+    def test_collection_update_ignores_source_recommendation(self) -> None:
+        pick = _make_run_with_pick(self.alice)
+        mine = Fragrance.objects.create(user=self.bob, name="Bob frag", house="BobHouse", status="own")
+
+        response = self.bob_client.patch(
+            f"/api/v1/collection/{mine.id}/", {"source_recommendation": pick.id}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        mine.refresh_from_db()
+        self.assertIsNone(mine.source_recommendation_id)
+
+    def test_owner_rating_is_unaffected_by_other_users_collection(self) -> None:
+        pick = _make_run_with_pick(self.alice)
+        self.bob_client.post(
+            "/api/v1/collection/",
+            {"name": "Bob frag", "house": "BobHouse", "status": "dislike", "source_recommendation": pick.id},
+            format="json",
+        )
+
+        response = self.alice_client.post(
+            f"/api/v1/recommendations/{pick.id}/rate/", {"action": "own"}, format="json"
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.data["name"], "Aventus")
+        self.assertEqual(response.data["house"], "Creed")
+        mine = Fragrance.objects.get(user=self.alice, source_recommendation=pick)
+        self.assertEqual((mine.status, mine.name), ("own", "Aventus"))
+
+    def test_preexisting_cross_tenant_link_never_returns_the_other_users_data(self) -> None:
+        # State left behind by the old writable field: bob's row points at alice's pick.
+        pick = _make_run_with_pick(self.alice)
+        Fragrance.objects.create(
+            user=self.bob, name="Bob frag", house="BobHouse", status="dislike", source_recommendation=pick
+        )
+
+        with self.assertLogs("django.request", level="ERROR"):
+            response = self.alice_client.post(
+                f"/api/v1/recommendations/{pick.id}/rate/", {"action": "own"}, format="json"
+            )
+
+        # bob's row still owns the unique link, so alice's create collides: an
+        # honest 500 until the cleanup query removes the poisoned row. What
+        # must hold is that bob's data is never handed to alice.
+        self.assertEqual(response.status_code, status.HTTP_500_INTERNAL_SERVER_ERROR)
+        self.assertNotIn(b"Bob frag", response.content)
+        self.assertNotIn(b"BobHouse", response.content)
+        self.assertNotIn(b"existing_action", response.content)

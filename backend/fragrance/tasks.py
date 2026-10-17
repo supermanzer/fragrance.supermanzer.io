@@ -297,7 +297,7 @@ def process_stripe_event(self: 'process_stripe_event', stripe_event_id: str) -> 
         record_subscription_lapse_signal,
         recover_past_due_invoice,
         revoke_for_dispute,
-        sync_customer_email,
+        record_customer_updated_event,
     )
 
     try:
@@ -313,7 +313,7 @@ def process_stripe_event(self: 'process_stripe_event', stripe_event_id: str) -> 
         elif event_row.event_type == 'charge.dispute.created':
             revoke_for_dispute(dispute=data_object)
         elif event_row.event_type == 'customer.updated':
-            sync_customer_email(
+            record_customer_updated_event(
                 customer=data_object,
                 previous_attributes=event_row.payload.get('data', {}).get('previous_attributes'),
             )
@@ -383,6 +383,26 @@ def purge_rejected_beta_signups() -> int:
     ).delete()
     purged = deleted_by_model.get('fragrance.BetaSignup', 0)
     logger.info('purged %d rejected BetaSignup rows older than %d days', purged, BETA_SIGNUP_REJECTED_RETENTION_DAYS)
+    return purged
+
+
+@shared_task
+def purge_expired_pending_email_changes() -> int:
+    """
+    Daily: deletes PendingEmailChange rows whose confirmation link expired at
+    least recipient.PENDING_CHANGE_PURGE_AFTER ago, so unverified third-party
+    addresses do not linger. Verified addresses live on their own models and
+    are never touched. Returns the number of rows deleted.
+    """
+    from .models import PendingEmailChange
+    from .recipient import PENDING_CHANGE_PURGE_AFTER
+
+    cutoff = timezone.now() - PENDING_CHANGE_PURGE_AFTER
+    _, deleted_by_model = PendingEmailChange.objects.filter(  # ty: ignore[unresolved-attribute]
+        expires_at__lt=cutoff
+    ).delete()
+    purged = deleted_by_model.get('fragrance.PendingEmailChange', 0)
+    logger.info('purged %d PendingEmailChange rows expired more than %s ago', purged, PENDING_CHANGE_PURGE_AFTER)
     return purged
 
 
@@ -591,7 +611,7 @@ def send_account_email_change_notice(
     revert_token: str = '',
 ) -> None:
     """
-    One half of the notice sent after billing.sync_customer_email changes
+    One half of the notice sent after the (retired) Stripe email sync changed
     User.email: queued once for the old address (a warning) and once for the
     new (a confirmation), so a failed delivery to one retries without
     re-sending the other. Addresses are passed in rather than re-read: the
@@ -657,7 +677,6 @@ def send_beta_invite_email(self: 'send_beta_invite_email', signup_id: int) -> No
             ),
             from_email=settings.DEFAULT_FROM_EMAIL,
             to=[signup.email],
-            reply_to=_support_reply_to(),
         ).send(fail_silently=False)
     except Exception as exc:
         _log_task_retry(task=self, exc=exc, signup_id=signup_id)
@@ -819,7 +838,6 @@ def send_password_reset_email(self: 'send_password_reset_email', user_id: int) -
             ),
             from_email=settings.DEFAULT_FROM_EMAIL,
             to=[user.email],
-            reply_to=_support_reply_to(),
         ).send(fail_silently=False)
     except Exception as exc:
         _log_task_retry(task=self, exc=exc, user_id=user_id)
@@ -873,6 +891,115 @@ def send_price_change_notice_email(self: 'send_price_change_notice_email', notic
         message.send(fail_silently=False)
     except Exception as exc:
         _log_task_retry(task=self, exc=exc, notice_id=notice_id, user_id=user_id)
+        if self.request.retries >= self.max_retries:
+            _raise_sanitized(exc=exc)
+        _retry_sanitized(task=self, exc=exc, countdown=300)
+
+
+@shared_task(bind=True, max_retries=5)
+def send_recipient_changed_notice(
+    self: 'send_recipient_changed_notice',
+    user_id: int,
+    purpose: str,
+    recipient: str,
+    new_address: str,
+    account_copy: bool = False,
+) -> None:
+    """
+    Sent to the PREVIOUS address after a delivery/receipt address change was
+    confirmed, so a hijacked-session redirect is never silent. `account_copy`
+    marks the extra mail to the login address of a delivery change whose
+    previous delivery address was somewhere else (the wording differs).
+    Addresses are
+    arguments because the change has already happened and the old one is no
+    longer stored; they are never logged. No Reply-To and no revert link:
+    support and a password reset are the recovery path.
+    """
+    username = User.objects.filter(pk=user_id).values_list('username', flat=True).first()
+    if username is None:
+        return
+    is_receipt = purpose == 'receipt'
+    context = {
+        'username': username,
+        'new_email': new_address,
+        'purpose': 'receipt' if is_receipt else 'delivery',
+        'account_copy': account_copy,
+        'support_email': settings.SUPPORT_EMAIL,
+    }
+    subject = (
+        'Your Fragrance Journey receipt address was changed'
+        if is_receipt
+        else 'Your Fragrance Journey delivery address was changed'
+    )
+    try:
+        message = EmailMultiAlternatives(
+            subject=subject,
+            body=render_to_string(template_name='fragrance/recipient_changed_notice.txt', context=context),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[recipient],
+        )
+        message.attach_alternative(
+            render_to_string(template_name='fragrance/recipient_changed_notice.html', context=context),
+            'text/html',
+        )
+        message.send(fail_silently=False)
+    except Exception as exc:
+        _log_task_retry(task=self, exc=exc, user_id=user_id, purpose=purpose)
+        if self.request.retries >= self.max_retries:
+            _raise_sanitized(exc=exc)
+        _retry_sanitized(task=self, exc=exc, countdown=300)
+
+
+@shared_task(bind=True, max_retries=5)
+def send_recipient_confirmation_email(
+    self: 'send_recipient_confirmation_email', user_id: int, purpose: str, nonce: str
+) -> None:
+    """
+    Mails the confirmation link for a pending delivery/receipt address change
+    to the PENDING address. Takes ids and the nonce only: the address is read
+    from the row and the signed token is minted here, so no credential is
+    serialized into the broker (the nonce alone confirms nothing without the
+    signature). Skips silently when the change was cancelled or replaced since
+    it was queued. No Reply-To: the message carries a link, and a reply would
+    land in a human mailbox. A retry mints a fresh signature, as resend does.
+    """
+    from .recipient import make_token
+    from .models import PendingEmailChange
+
+    pending = PendingEmailChange.objects.filter(  # ty: ignore[unresolved-attribute]
+        user_id=user_id, purpose=purpose, nonce=nonce
+    ).first()
+    if pending is None:
+        logger.info('skipping %s confirmation email for user %s: change cancelled or replaced', purpose, user_id)
+        return
+    is_receipt = pending.purpose == 'receipt'
+    confirm_url = f"{settings.FRONTEND_URL}/auth/confirm-recipient?token={make_token(pending=pending)}"
+    if is_receipt:
+        confirm_url += '&purpose=receipt'
+    context = {
+        'confirm_url': confirm_url,
+        'purpose': 'receipt' if is_receipt else 'delivery',
+        'support_email': settings.SUPPORT_EMAIL,
+    }
+    subject = (
+        'Confirm your receipt address for Fragrance Journey'
+        if is_receipt
+        else 'Confirm your delivery address for Fragrance Journey'
+    )
+    try:
+        message = EmailMultiAlternatives(
+            subject=subject,
+            body=render_to_string(template_name='fragrance/recipient_confirm_email.txt', context=context),
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[pending.address],
+        )
+        message.attach_alternative(
+            render_to_string(template_name='fragrance/recipient_confirm_email.html', context=context),
+            'text/html',
+        )
+        message.send(fail_silently=False)
+    except Exception as exc:
+        _log_task_retry(task=self, exc=exc, user_id=user_id, purpose=purpose)
         if self.request.retries >= self.max_retries:
             _raise_sanitized(exc=exc)
         _retry_sanitized(task=self, exc=exc, countdown=300)

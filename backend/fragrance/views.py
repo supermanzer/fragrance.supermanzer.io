@@ -3,6 +3,7 @@ import codecs
 import csv
 import io
 import logging
+import math
 import re
 from datetime import datetime
 from datetime import timezone as dt_timezone
@@ -22,16 +23,16 @@ from django.views.decorators.http import require_POST
 from kombu.exceptions import OperationalError
 from rest_framework import generics, permissions, status, viewsets
 from rest_framework.decorators import action
-from rest_framework.exceptions import NotFound, ParseError
+from rest_framework.fields import DateTimeField as DRFDateTimeField
+from rest_framework.exceptions import NotFound, ParseError, Throttled
 from rest_framework.parsers import MultiPartParser
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
-from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from . import billing
+from . import billing, recipient
 from .ai_providers.base import sanitize_sdk_error_message, sanitized_exc_info
 from .models import (
     BetaSignup,
@@ -102,12 +103,8 @@ _EXEMPT_RESPONSE_BODY = {
 }
 
 
-_ACCOUNT_LOCKED_MANAGE_BODY = {
-    "code": "account_locked",
-    "detail": (
-        "This account can no longer be managed here. "
-        "You're welcome to sign up again with a new account."
-    ),
+_PASSWORD_SESSIONS_UNAVAILABLE_RESPONSE = {
+    "detail": "Could not update the password right now. Nothing was changed; please try again shortly."
 }
 
 
@@ -119,6 +116,70 @@ _RESET_RESPONSE = {'detail': 'If an account with that email exists, a reset link
 
 
 _REVERT_EMAIL_INVALID_RESPONSE = {"detail": "This link is invalid or has expired."}
+
+
+def _account_locked_response() -> Response:
+    """The one 409 every locked-account surface answers with (checkout, portal, change-plan, session)."""
+    return Response(
+        {"code": "account_locked", "detail": billing.account_locked_detail()},
+        status=status.HTTP_409_CONFLICT,
+    )
+
+
+_RECIPIENT_DETAILS = {
+    "invalid_email": "That doesn't look like an email address.",
+    "invalid_password": "That password isn't right.",
+    "same_as_current": "That's already where this is sent.",
+    "no_pending": "There is no pending change to resend.",
+    "resend_too_soon": "A link was just sent. Please wait a moment before sending another.",
+    "no_stripe_customer": "There is no billing account yet, so a receipt address can't be set.",
+    "send_unavailable": "We couldn't send the link just now. Please try again in a moment.",
+    "recipient_email_read_only": "The delivery address can only be changed through the confirmation flow.",
+    "invalid": "This link isn't valid.",
+    "superseded": "This link is no longer active.",
+    "expired": "This link has expired.",
+    "stripe_unavailable": "We couldn't update your receipt address just now. Your link is still valid; please try again in a minute.",
+}
+
+
+def _recipient_response(*, code: str, http_status: int, **extra: object) -> Response:
+    return Response({"code": code, "detail": _RECIPIENT_DETAILS[code], **extra}, status=http_status)
+
+
+def _iso(*, value: datetime) -> str:
+    return DRFDateTimeField().to_representation(value=value)
+
+
+def _body_value(*, request: Request, name: str) -> object:
+    data = request.data
+    return data.get(name) if hasattr(data, "get") else None
+
+
+class RateLimited(Throttled):
+    """429 with `{code: "rate_limited", detail, retry_after}`; DRF still adds Retry-After."""
+
+    def __init__(self, wait: float | None = None) -> None:
+        super().__init__(wait=wait)
+        self.detail = {  # type: ignore[assignment]
+            "code": "rate_limited",
+            "detail": "Too many requests. Please try again later.",
+            "retry_after": max(1, math.ceil(wait)) if wait else 60,
+        }
+
+
+def _spend_attempt(*, user: User, purpose: recipient.Purpose, action: recipient.AttemptAction) -> None:
+    """The DB-backed hourly cap (does not need Redis); a refusal is the recipient-flow 429."""
+    try:
+        recipient.consume_attempt(user=user, purpose=purpose, action=action)
+    except recipient.RateLimitedError as exc:
+        raise RateLimited(wait=exc.retry_after) from exc
+
+
+class RateLimitedBodyMixin:
+    """Swaps DRF's `{detail}` 429 for the recipient-flow body (see RateLimited)."""
+
+    def throttled(self, request: Request, wait: float | None) -> None:
+        raise RateLimited(wait=wait)
 
 
 class FailOpenScopedRateThrottle(ScopedRateThrottle):
@@ -347,7 +408,7 @@ class BillingChangePlanView(generics.GenericAPIView):
         except billing.ExemptAccountError:
             return Response(_EXEMPT_RESPONSE_BODY, status=status.HTTP_409_CONFLICT)
         except billing.AccountLockedError:
-            return Response(_ACCOUNT_LOCKED_MANAGE_BODY, status=status.HTTP_409_CONFLICT)
+            return _account_locked_response()
         except billing.PlanChangeError as exc:
             return self._plan_change_conflict(exc=exc)
         except (ImproperlyConfigured, stripe.StripeError) as exc:
@@ -376,7 +437,7 @@ class BillingChangePlanView(generics.GenericAPIView):
         except billing.ExemptAccountError:
             return Response(_EXEMPT_RESPONSE_BODY, status=status.HTTP_409_CONFLICT)
         except billing.AccountLockedError:
-            return Response(_ACCOUNT_LOCKED_MANAGE_BODY, status=status.HTTP_409_CONFLICT)
+            return _account_locked_response()
         except billing.UnknownPlanError:
             return Response({"detail": "Unknown plan."}, status=status.HTTP_400_BAD_REQUEST)
         except billing.PlanChangeError as exc:
@@ -401,7 +462,7 @@ class BillingChangePlanView(generics.GenericAPIView):
         except billing.ExemptAccountError:
             return Response(_EXEMPT_RESPONSE_BODY, status=status.HTTP_409_CONFLICT)
         except billing.AccountLockedError:
-            return Response(_ACCOUNT_LOCKED_MANAGE_BODY, status=status.HTTP_409_CONFLICT)
+            return _account_locked_response()
         except billing.PlanChangeError as exc:
             return self._plan_change_conflict(exc=exc)
         except (ImproperlyConfigured, stripe.StripeError) as exc:
@@ -451,19 +512,18 @@ class BillingCheckoutView(generics.GenericAPIView):
                 user=request.user, plan_slug=serializer.validated_data["slug"]
             )
         except billing.AccountLockedError:
-            return Response(
-                {
-                    "code": "account_locked",
-                    "detail": (
-                        "This account is locked following a payment dispute, so checkout is "
-                        f"unavailable. Please contact {settings.SUPPORT_EMAIL} to resolve it."
-                    ),
-                },
-                status=status.HTTP_409_CONFLICT,
-            )
+            return _account_locked_response()
         except billing.SubscriptionAlreadyActiveError:
             return Response(
                 {"detail": "You already have an active subscription."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        except billing.SubscriptionStillLiveError:
+            return Response(
+                {
+                    "code": "subscription_still_active",
+                    "detail": billing.SUBSCRIPTION_STILL_ACTIVE_DETAIL,
+                },
                 status=status.HTTP_409_CONFLICT,
             )
         except billing.CheckoutPaymentPendingError:
@@ -536,7 +596,7 @@ class BillingPortalView(generics.GenericAPIView):
         except billing.ExemptAccountError:
             return Response(_EXEMPT_RESPONSE_BODY, status=status.HTTP_409_CONFLICT)
         except billing.AccountLockedError:
-            return Response(_ACCOUNT_LOCKED_MANAGE_BODY, status=status.HTTP_409_CONFLICT)
+            return _account_locked_response()
         except billing.NoBillingAccountError:
             return Response(
                 {
@@ -581,7 +641,7 @@ class BillingSessionView(generics.GenericAPIView):
             .first()
         )
         if subscription is not None and subscription.status == "revoked":
-            return Response(_ACCOUNT_LOCKED_MANAGE_BODY, status=status.HTTP_409_CONFLICT)
+            return _account_locked_response()
         if subscription is not None and subscription.has_active_access:
             return Response(
                 {
@@ -655,28 +715,46 @@ class BillingSubscriptionView(generics.GenericAPIView):
 
 
 class ChangePasswordView(generics.GenericAPIView):
+    """
+    Changes the password and ends every session of the account, atomically:
+    the new hash and the blacklisting of every outstanding refresh token
+    commit together or not at all (a blacklist failure rolls the password
+    back and answers 503, never a silent 200). The caller's own device stays
+    signed in through the fresh access/refresh pair returned in the body.
+    The legacy `refresh` request field is accepted and ignored: all of the
+    user's refresh tokens, that one included, are blacklisted.
+    """
+
     serializer_class = ChangePasswordSerializer
 
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = request.user
-        user.set_password(serializer.validated_data['new_password'])
-        user.save()
-        refresh_token = serializer.validated_data.get('refresh', '')
-        if refresh_token:
-            try:
-                RefreshToken(token=refresh_token).blacklist()
-            except TokenError:
-                # Already expired, blacklisted or malformed: nothing to revoke.
-                pass
-            except Exception as exc:
-                logger.error(
-                    "could not blacklist the refresh token on password change for user %s",
-                    user.pk,
-                    exc_info=sanitized_exc_info(exc=exc, drop_message=True),
-                )
-        return Response({'detail': 'Password changed successfully.'})
+        try:
+            with transaction.atomic():
+                user.set_password(serializer.validated_data['new_password'])
+                user.save(update_fields=['password'])
+                billing.blacklist_all_refresh_tokens(user=user)
+                # Minted after the blacklist pass so the new token is not swept up by it.
+                fresh = RefreshToken.for_user(user)
+        except Exception as exc:
+            logger.error(
+                "password change for user %s failed ending sessions; rolled back",
+                user.pk,
+                exc_info=sanitized_exc_info(exc=exc, drop_message=True),
+            )
+            return Response(
+                _PASSWORD_SESSIONS_UNAVAILABLE_RESPONSE,
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        return Response(
+            {
+                'detail': 'Password changed successfully.',
+                'access': str(fresh.access_token),
+                'refresh': str(fresh),
+            }
+        )
 
 
 class ExportCollectionView(generics.GenericAPIView):
@@ -701,11 +779,28 @@ class ExportCollectionView(generics.GenericAPIView):
 
 
 class FragranceConfigView(generics.RetrieveUpdateAPIView):
+    """
+    `recipient_email` is read-only: a value that differs from the verified
+    address is refused here (an equal value is tolerated for stale clients).
+    Changing it goes through POST /config/recipient/.
+    """
+
     serializer_class = FragranceConfigSerializer
     permission_classes = [HasActiveSubscriptionOrReadOnly]
 
     def get_object(self):
         return get_or_create_fragrance_config(user=self.request.user)
+
+    def update(self, request: Request, *args, **kwargs) -> Response:
+        submitted = _body_value(request=request, name="recipient_email")
+        if submitted is not None:
+            config = self.get_object()
+            verified = recipient.normalized(address=config.recipient_email or request.user.email)
+            if not isinstance(submitted, str) or recipient.normalized(address=submitted) != verified:
+                return _recipient_response(
+                    code="recipient_email_read_only", http_status=status.HTTP_400_BAD_REQUEST
+                )
+        return super().update(request, *args, **kwargs)
 
 
 class FragranceViewSet(viewsets.ModelViewSet):
@@ -769,8 +864,21 @@ class PasswordResetConfirmView(generics.GenericAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.validated_data['user']
-        user.set_password(serializer.validated_data['new_password'])
-        user.save()
+        try:
+            with transaction.atomic():
+                user.set_password(serializer.validated_data['new_password'])
+                user.save(update_fields=['password'])
+                billing.blacklist_all_refresh_tokens(user=user)
+        except Exception as exc:
+            logger.error(
+                "password reset for user %s failed ending sessions; rolled back",
+                user.pk,
+                exc_info=sanitized_exc_info(exc=exc, drop_message=True),
+            )
+            return Response(
+                _PASSWORD_SESSIONS_UNAVAILABLE_RESPONSE,
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         return Response({'detail': 'Password has been reset successfully.'})
 
 
@@ -843,6 +951,267 @@ class PreferenceProfileView(generics.RetrieveAPIView):
             ).latest("generated_at")
         except PreferenceProfile.DoesNotExist:  # ty: ignore[unresolved-attribute]
             raise NotFound("No preference profile found.")
+
+
+class ConfirmRecipientView(APIView):
+    """
+    POST {"token"} from the link mailed to a pending delivery or receipt
+    address. Anonymous on purpose: the link is opened on whichever device has
+    the mailbox, and possession of the mailbox is the proof. POST-only so mail
+    scanners that prefetch links with GET cannot confirm anything (GET is
+    405). The signature is verified before any lookup and an unknown user is
+    indistinguishable from a bad signature (`invalid`); no response ever
+    carries account identity, only the address the caller's own link names.
+    The distinct 400 codes are deliberate (see recipient.confirm_change).
+    """
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes: list = []
+    throttle_classes = [BetaSignupThrottle]
+    throttle_scope = "confirm-recipient"
+
+    def post(self, request: Request) -> Response:
+        try:
+            data = request.data
+        except ParseError:
+            data = None
+        token = data.get("token") if isinstance(data, dict) else None
+        result = recipient.confirm_change(token=token)
+        if result.outcome == "invalid":
+            return _recipient_response(code="invalid", http_status=status.HTTP_400_BAD_REQUEST)
+        if result.outcome in ("superseded", "expired"):
+            return _recipient_response(
+                code=result.outcome,
+                http_status=status.HTTP_400_BAD_REQUEST,
+                purpose=result.purpose,
+            )
+        if result.outcome == "stripe_unavailable":
+            return _recipient_response(
+                code="stripe_unavailable",
+                http_status=status.HTTP_502_BAD_GATEWAY,
+                purpose="receipt",
+            )
+        address_key = "receipt_email" if result.purpose == "receipt" else "recipient_email"
+        return Response(
+            {"status": result.outcome, "purpose": result.purpose, address_key: result.address}
+        )
+
+
+def _receipt_gate_response(*, user: User) -> Response | None:
+    """The exempt / locked 409s shared by every receipt-email endpoint that is gated."""
+    if billing.is_exempt(user=user):
+        return Response(_EXEMPT_RESPONSE_BODY, status=status.HTTP_409_CONFLICT)
+    if Subscription.objects.filter(user=user, status="revoked").exists():  # ty: ignore[unresolved-attribute]
+        return _account_locked_response()
+    return None
+
+
+def _receipt_response(
+    *, user: User, subscription: Subscription | None, http_status: int = status.HTTP_200_OK, **extra: object
+) -> Response:
+    body = recipient.receipt_fields(user=user, subscription=subscription)
+    for key in ("pending_expires_at", "resend_available_at"):
+        if body[key] is not None:
+            body[key] = _iso(value=body[key])
+    return Response({**extra, **body}, status=http_status)
+
+
+class ReceiptEmailView(RateLimitedBodyMixin, APIView):
+    """
+    GET: the verified receipt address (cached copy of the Stripe Customer's
+    email; one lazy retrieve fills a blank cache) and any pending change.
+    POST: request a change; needs the current password and an existing Stripe
+    customer. Not subscription-gated: a lapsed customer's failed-payment mail
+    goes here. GET and POST spend different throttle budgets, so loading the
+    billing page can never use up the five changes per hour.
+    """
+
+    throttle_classes = [FailOpenScopedRateThrottle]
+
+    @property
+    def throttle_scope(self) -> str:
+        return "receipt-change" if self.request.method == "POST" else "billing-status"
+
+    def get(self, request: Request) -> Response:
+        gated = _receipt_gate_response(user=request.user)
+        if gated is not None:
+            return gated
+        subscription = Subscription.objects.filter(user=request.user).first()  # ty: ignore[unresolved-attribute]
+        if subscription is not None and subscription.stripe_customer_id:
+            recipient.ensure_receipt_email_cached(subscription=subscription)
+        return _receipt_response(user=request.user, subscription=subscription)
+
+    def post(self, request: Request) -> Response:
+        gated = _receipt_gate_response(user=request.user)
+        if gated is not None:
+            return gated
+        try:
+            subscription = recipient.require_stripe_customer(
+                subscription=Subscription.objects.filter(user=request.user).first()  # ty: ignore[unresolved-attribute]
+            )
+        except recipient.NoStripeCustomerError:
+            return _recipient_response(code="no_stripe_customer", http_status=status.HTTP_409_CONFLICT)
+        _spend_attempt(user=request.user, purpose="receipt", action="change")
+        address = recipient.parse_address(raw=_body_value(request=request, name="email"))
+        if address is None:
+            return _recipient_response(code="invalid_email", http_status=status.HTTP_400_BAD_REQUEST)
+        if not recipient.password_accepted(
+            user=request.user,
+            purpose="receipt",
+            raw=_body_value(request=request, name="current_password"),
+        ):
+            return _recipient_response(code="invalid_password", http_status=status.HTTP_400_BAD_REQUEST)
+        recipient.ensure_receipt_email_cached(subscription=subscription)
+        try:
+            pending = recipient.start_change(user=request.user, purpose="receipt", address=address)
+        except recipient.SameAsCurrentError:
+            return _recipient_response(code="same_as_current", http_status=status.HTTP_400_BAD_REQUEST)
+        except recipient.ResendTooSoonError as exc:
+            return _recipient_response(
+                code="resend_too_soon",
+                http_status=status.HTTP_429_TOO_MANY_REQUESTS,
+                retry_after=exc.retry_after,
+            )
+        if not recipient.queue_confirmation_email(pending=pending):
+            return _recipient_response(
+                code="send_unavailable", http_status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+        return _receipt_response(
+            user=request.user,
+            subscription=subscription,
+            http_status=status.HTTP_202_ACCEPTED,
+            status="pending",
+        )
+
+
+class ReceiptEmailPendingView(APIView):
+    """DELETE cancels the pending receipt change. Idempotent, and never gated (confirmation is hygiene)."""
+
+    def delete(self, request: Request) -> Response:
+        recipient.cancel(user=request.user, purpose="receipt")
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ReceiptEmailResendView(RateLimitedBodyMixin, APIView):
+    """Re-mails the pending receipt link (same nonce, fresh signature and expiry); 60 s gap, 5/hour."""
+
+    throttle_classes = [FailOpenScopedRateThrottle]
+    throttle_scope = "receipt-resend"
+
+    def post(self, request: Request) -> Response:
+        gated = _receipt_gate_response(user=request.user)
+        if gated is not None:
+            return gated
+        try:
+            subscription = recipient.require_stripe_customer(
+                subscription=Subscription.objects.filter(user=request.user).first()  # ty: ignore[unresolved-attribute]
+            )
+        except recipient.NoStripeCustomerError:
+            return _recipient_response(code="no_stripe_customer", http_status=status.HTTP_409_CONFLICT)
+        try:
+            pending = recipient.resend(user=request.user, purpose="receipt")
+        except recipient.RateLimitedError as exc:
+            raise RateLimited(wait=exc.retry_after) from exc
+        except recipient.NoPendingChangeError:
+            return _recipient_response(code="no_pending", http_status=status.HTTP_409_CONFLICT)
+        except recipient.ResendTooSoonError as exc:
+            return _recipient_response(
+                code="resend_too_soon",
+                http_status=status.HTTP_429_TOO_MANY_REQUESTS,
+                retry_after=exc.retry_after,
+            )
+        if not recipient.queue_confirmation_email(pending=pending):
+            return _recipient_response(
+                code="send_unavailable", http_status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+        return _receipt_response(
+            user=request.user,
+            subscription=subscription,
+            http_status=status.HTTP_202_ACCEPTED,
+            status="pending",
+        )
+
+
+def _delivery_response(*, user: User) -> Response:
+    body = recipient.delivery_fields(user=user)
+    for key in ("pending_expires_at", "resend_available_at"):
+        if body[key] is not None:
+            body[key] = _iso(value=body[key])
+    return Response({"status": "pending", **body}, status=status.HTTP_202_ACCEPTED)
+
+
+class RecipientChangeView(RateLimitedBodyMixin, APIView):
+    """
+    POST {"email", "current_password"}: request a new delivery address. The
+    verified address is untouched until the mailed link is confirmed;
+    a pending change is replaced. Gated by the lapsed-subscription rule.
+    """
+
+    permission_classes = [HasActiveSubscription]
+    throttle_classes = [FailOpenScopedRateThrottle]
+    throttle_scope = "recipient-change"
+
+    def post(self, request: Request) -> Response:
+        _spend_attempt(user=request.user, purpose="delivery", action="change")
+        address = recipient.parse_address(raw=_body_value(request=request, name="email"))
+        if address is None:
+            return _recipient_response(code="invalid_email", http_status=status.HTTP_400_BAD_REQUEST)
+        if not recipient.password_accepted(
+            user=request.user,
+            purpose="delivery",
+            raw=_body_value(request=request, name="current_password"),
+        ):
+            return _recipient_response(code="invalid_password", http_status=status.HTTP_400_BAD_REQUEST)
+        try:
+            pending = recipient.start_change(user=request.user, purpose="delivery", address=address)
+        except recipient.SameAsCurrentError:
+            return _recipient_response(code="same_as_current", http_status=status.HTTP_400_BAD_REQUEST)
+        except recipient.ResendTooSoonError as exc:
+            return _recipient_response(
+                code="resend_too_soon",
+                http_status=status.HTTP_429_TOO_MANY_REQUESTS,
+                retry_after=exc.retry_after,
+            )
+        if not recipient.queue_confirmation_email(pending=pending):
+            return _recipient_response(
+                code="send_unavailable", http_status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+        return _delivery_response(user=request.user)
+
+
+class RecipientPendingView(APIView):
+    """DELETE cancels the pending delivery change. Idempotent, and never gated by the subscription."""
+
+    def delete(self, request: Request) -> Response:
+        recipient.cancel(user=request.user, purpose="delivery")
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class RecipientResendView(RateLimitedBodyMixin, APIView):
+    """Re-mails the pending delivery link (same nonce, fresh signature and expiry); 60 s gap, 5/hour."""
+
+    permission_classes = [HasActiveSubscription]
+    throttle_classes = [FailOpenScopedRateThrottle]
+    throttle_scope = "recipient-resend"
+
+    def post(self, request: Request) -> Response:
+        try:
+            pending = recipient.resend(user=request.user, purpose="delivery")
+        except recipient.RateLimitedError as exc:
+            raise RateLimited(wait=exc.retry_after) from exc
+        except recipient.NoPendingChangeError:
+            return _recipient_response(code="no_pending", http_status=status.HTTP_409_CONFLICT)
+        except recipient.ResendTooSoonError as exc:
+            return _recipient_response(
+                code="resend_too_soon",
+                http_status=status.HTTP_429_TOO_MANY_REQUESTS,
+                retry_after=exc.retry_after,
+            )
+        if not recipient.queue_confirmation_email(pending=pending):
+            return _recipient_response(
+                code="send_unavailable", http_status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+        return _delivery_response(user=request.user)
 
 
 class RecommendationConfirmView(APIView):

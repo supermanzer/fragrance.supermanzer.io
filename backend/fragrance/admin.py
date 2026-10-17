@@ -21,6 +21,7 @@ from .models import (
     BetaSignup,
     Fragrance,
     FragranceConfig,
+    PendingEmailChange,
     Plan,
     PreferenceProfile,
     PriceChangeNotice,
@@ -382,6 +383,12 @@ class FragranceConfigAdmin(admin.ModelAdmin):
                 obj.run_day_of_month = day
             if "run_hour" not in form.changed_data:
                 obj.run_hour = hour
+        if change and "recipient_email" in form.changed_data:
+            # An operator edit is accepted as verified; a user's older,
+            # still-unconfirmed request must not later overwrite it. Deleted
+            # before the config UPDATE so the lock order (pending, then config)
+            # matches recipient._confirm_delivery and cannot deadlock with it.
+            PendingEmailChange.objects.filter(user_id=obj.user_id, purpose="delivery").delete()
         super().save_model(request, obj, form, change)
 
 
