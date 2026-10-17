@@ -47,19 +47,17 @@ export function isAccountLocked(err: unknown): boolean {
   return e?.status === 409 && e.data?.code === 'account_locked'
 }
 
-// Used only if a locked response ever arrives without its detail; the server's own wording
-// is always preferred.
-const ACCOUNT_LOCKED_FALLBACK =
-  "This account can no longer be managed here. You're welcome to sign up again with a new account."
-
-// The server's `detail` for an account_locked 409 (each endpoint words it for itself).
-export function accountLockedMessage(err: unknown): string {
+// The server's `detail` for an account_locked 409 (each endpoint words it for itself). The
+// static sentence is used only if a locked response ever arrives without its detail; the
+// server's own wording is always preferred.
+export function accountLockedMessage(err: unknown, supportEmail: string): string {
   const detail = (err as { data?: { detail?: unknown } } | null)?.data?.detail
-  return typeof detail === 'string' && detail.trim() ? detail : ACCOUNT_LOCKED_FALLBACK
+  return typeof detail === 'string' && detail.trim() ? detail : lockedRestartSentence(supportEmail)
 }
 
 export function useBilling() {
   const { api } = useApi()
+  const supportEmail = useSupportEmail()
   const plans = ref<Plan[]>([])
   const plansLoading = ref(false)
   const plansError = ref<string | null>(null)
@@ -116,7 +114,7 @@ export function useBilling() {
       if (isAuthError(err)) return
       if (isAccountLocked(err)) {
         planChange.value = null
-        planChangeLocked.value = accountLockedMessage(err)
+        planChangeLocked.value = accountLockedMessage(err, supportEmail)
         return
       }
       const e = err as { status?: number; data?: { code?: string } }

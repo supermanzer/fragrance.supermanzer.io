@@ -35,7 +35,7 @@
         <v-alert type="warning" variant="tonal" class="mb-6 text-left">
           <p class="text-h6 font-weight-regular mb-2">Access on this account is paused</p>
           <p class="text-body-2">
-            A payment dispute was opened on this account. Your billing page has the details, or you can write to support@supermanzer.io.
+            A payment dispute was opened on this account. Your billing page has the details. {{ lockedSentence }}
           </p>
         </v-alert>
         <v-btn color="primary" variant="flat" rounded="lg" to="/billing">Go to billing</v-btn>
@@ -85,6 +85,8 @@ const MAX_POLLS = 18
 const STILL_PROCESSING_THRESHOLD = 4
 
 const route = useRoute()
+const supportEmail = useSupportEmail()
+const lockedSentence = lockedRestartSentence(supportEmail)
 const { fetchSession } = useBilling()
 const { refreshSubscription } = useSubscription()
 
@@ -159,7 +161,7 @@ async function poll(): Promise<void> {
   } catch (err: any) {
     if (isAccountLocked(err)) {
       // Terminal, not transient and not a missing session: stop polling and say so.
-      lockedMessage.value = accountLockedMessage(err)
+      lockedMessage.value = accountLockedMessage(err, supportEmail)
       void refreshSubscription()
       return
     }

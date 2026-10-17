@@ -21,7 +21,7 @@
             rounded="lg"
             prepend-icon="mdi-email-outline"
             class="flex-shrink-0 align-self-start align-self-sm-center mt-3 mt-sm-0"
-            href="mailto:support@supermanzer.io?subject=This%20month's%20run"
+            :href="`mailto:${supportEmail}?subject=This%20month's%20run`"
           >
             Email support
           </VBtn>
@@ -32,6 +32,8 @@
 </template>
 
 <script setup lang="ts">
+const supportEmail = useSupportEmail()
+
 defineProps<{
   readonly kind: 'retrying' | 'running-again' | 'exhausted' | 'stopped' | null
   readonly title: string

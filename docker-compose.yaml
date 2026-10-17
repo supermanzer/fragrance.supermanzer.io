@@ -157,6 +157,7 @@ services:
     command: node .output/server/index.mjs
     environment:
       NUXT_PUBLIC_API_BASE: ${PUBLIC_API_BASE:-https://fragrances.supermanzer.io/api/v1}
+      NUXT_PUBLIC_SUPPORT_EMAIL: ${SUPPORT_EMAIL:-support@supermanzer.io}
       PORT: 3000
     networks:
       - internal

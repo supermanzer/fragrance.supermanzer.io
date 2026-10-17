@@ -112,7 +112,7 @@ const sections: readonly LegalSection[] = [
       `We keep your account, collection, and recommendation history for as long as your account exists, including after a subscription lapses (in read-only mode), so that you can come back without starting over.`,
       `Stripe event records: the detailed notification content is removed after 90 days; a summary record (event type and time) is kept. Payment records needed for accounting are kept for 7 years.`,
       `Waitlist entries: kept while pending or approved; rejected entries are removed after 6 months.`,
-      `Server and network logs: 30 days.`,
+      `Server logs containing IP address information are only ever used for application troubleshooting.`,
       `Backups: deleted data may remain in backups for up to 30 days before being overwritten.`,
       `Emails you send us: kept for up to 2 years.`,
     ],
@@ -123,7 +123,7 @@ const sections: readonly LegalSection[] = [
     blocks: [
       `You can view and edit your collection in the app, and export it as a CSV file at any time, including after a subscription lapses. You can change your delivery email and schedule in Settings.`,
       `You can ask us to give you a copy of your information, correct it, or delete your account and the data linked to it, by emailing support@supermanzer.io. We'll respond within 30 days. We may need to keep limited records (for example, payment records) where the law requires.`,
-      `Depending on where you live, you may also have rights to object to or restrict certain processing, to data portability, and to complain to your local data protection authority. [JURISDICTION-SPECIFIC RIGHTS SECTION, e.g. GDPR / UK GDPR / CCPA, per counsel.]`,
+      `Depending on where you live, you may also have rights to object to or restrict certain processing, to data portability, and to complain to your local data protection authority. CCPA`,
       `We can't currently delete your account from within the app; deletion is handled by request.`,
     ],
   },

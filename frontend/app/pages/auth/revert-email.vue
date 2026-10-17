@@ -54,7 +54,8 @@
             This link is invalid or has expired.
           </h1>
           <p class="text-body-2 text-medium-emphasis mb-6">
-            If you still need help, contact support.
+            If you still need help, write to
+            <a :href="`mailto:${supportEmail}`" class="text-primary">{{ supportEmail }}</a>.
           </p>
           <NuxtLink to="/" class="text-body-2 text-primary">Back to home</NuxtLink>
         </div>
@@ -87,6 +88,7 @@ useSeoMeta({ title: 'Restore your previous email', robots: 'noindex' })
 type PageState = 'confirm' | 'success' | 'invalid' | 'error'
 
 const config = useRuntimeConfig()
+const supportEmail = useSupportEmail()
 const route = useRoute()
 const resetSessionState = useSessionReset()
 const { authStatus } = useAuthStatus()

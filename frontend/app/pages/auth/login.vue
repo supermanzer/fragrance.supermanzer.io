@@ -6,6 +6,10 @@
   <v-card v-else class="pa-6 w-100" elevation="1" rounded="lg">
     <p class="text-h6 font-weight-regular mb-6">Sign in to your account</p>
 
+    <v-alert v-if="passwordWasReset" type="success" variant="tonal" class="mb-4">
+      Your password has been reset. Sign in with your new password.
+    </v-alert>
+
     <v-form @submit.prevent="submit">
       <v-text-field
         v-model="form.username"
@@ -53,6 +57,16 @@ import { setTokens } from '~/composables/useApi'
 definePageMeta({ layout: 'auth', auth: false })
 
 const config = useRuntimeConfig()
+const route = useRoute()
+
+const passwordWasReset = route.query.reset === '1'
+
+// Optional ?redirect=/some/path set by pages that send signed-out visitors here (the
+// recipient-confirmation landing page). Same-origin absolute paths only: anything else
+// (full URLs, protocol-relative //host, backslash and control-character tricks) falls back
+// to the default. See utils/safeRedirect.ts.
+const DEFAULT_DESTINATION = '/fragrance'
+const destination = safeRedirectPath(route.query.redirect, DEFAULT_DESTINATION)
 
 const form = reactive({ username: '', password: '' })
 const errors = reactive<Record<string, string>>({})
@@ -72,7 +86,7 @@ onMounted(async () => {
   try {
     await checkAuth()
     if (authStatus.value === 'authenticated') {
-      await navigateTo('/fragrance', { replace: true })
+      await navigateTo(destination, { replace: true })
       return
     }
   } finally {
@@ -90,7 +104,7 @@ async function submit() {
       body: { username: form.username, password: form.password },
     })
     setTokens(data.access, data.refresh)
-    await navigateTo('/fragrance')
+    await navigateTo(destination)
   } catch (err: any) {
     const detail = err?.data?.detail
     errors.general = detail ?? 'Login failed. Please check your credentials.'

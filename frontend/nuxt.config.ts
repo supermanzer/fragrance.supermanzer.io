@@ -32,7 +32,12 @@ export default defineNuxtConfig({
   runtimeConfig: {
     public: {
       apiBase: process.env.NUXT_PUBLIC_API_BASE ?? 'http://localhost:8000/api/v1',
+      supportEmail: process.env.NUXT_PUBLIC_SUPPORT_EMAIL ?? 'support@supermanzer.io',
     },
+  },
+  routeRules: {
+    // The SSR payload embeds the one-time token URL, so keep it out of any shared cache.
+    '/auth/confirm-recipient': { headers: { 'cache-control': 'no-store' } },
   },
   vite: {
     optimizeDeps: {

@@ -43,13 +43,14 @@
 const route = useRoute()
 const { subscription, isLapsed, lapsedKind, canManageBilling } = useSubscription()
 const { portalRedirecting, portalError, manageBilling } = usePortal()
+const supportEmail = useSupportEmail()
 
 const visible = computed(() => isLapsed.value && !route.path.startsWith('/billing'))
 
 const message = computed(() => {
   switch (lapsedKind.value) {
     case 'revoked':
-      return 'Access was paused when a payment dispute was opened on this account. Your collection and past recommendations are still here to read and export. Write to support@supermanzer.io to sort it out.'
+      return `Access was paused when a payment dispute was opened on this account. Your collection and past recommendations are still here to read and export. ${lockedRestartSentence(supportEmail)}`
     case 'lapsed': {
       const expires = subscription.value?.access_expires_at
       const ended = expires ? `Your subscription ended on ${formatExpiryDate(expires)}.` : 'Your subscription has ended.'

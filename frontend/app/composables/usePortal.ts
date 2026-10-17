@@ -10,6 +10,7 @@ export const FIX_PAYMENT_SEEN_FAILED_KEY = 'fix-payment-seen-failed-at'
 // signal and the staleness guard for payment_recovery.attempted_at.
 export function usePortal() {
   const { openBillingPortal } = useBilling()
+  const supportEmail = useSupportEmail()
   const { refreshSubscription } = useSubscription()
   const portalRedirecting = ref(false)
   const portalError = ref<string | null>(null)
@@ -37,7 +38,7 @@ export function usePortal() {
       const e = err as { status?: number }
       if (isAccountLocked(err)) {
         portalLocked.value = true
-        portalError.value = accountLockedMessage(err)
+        portalError.value = accountLockedMessage(err, supportEmail)
         await refreshSubscription()
       } else if (e?.status === 409) {
         portalError.value = "Billing management isn't available for this account."

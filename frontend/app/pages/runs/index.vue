@@ -578,6 +578,8 @@ const emptyLine = computed(() =>
     : "Your first five picks will arrive by email on your monthly schedule. They'll appear here too.",
 )
 
+const supportEmail = useSupportEmail()
+
 const noticeTitle = computed(() => {
   switch (noticeKind.value) {
     case 'retrying': return "This month's run didn't finish. We're on it."
@@ -596,9 +598,9 @@ const noticeBody = computed(() => {
     case 'running-again':
       return "We're trying again now. Your picks will arrive by email as soon as they're ready."
     case 'exhausted':
-      return `We couldn't complete this run. We've been alerted and are looking into it. If you'd like to hear from us directly, write to ${SUPPORT_EMAIL}.`
+      return `We couldn't complete this run. We've been alerted and are looking into it. If you'd like to hear from us directly, write to ${supportEmail}.`
     case 'stopped':
-      return `We won't try again while your account is read-only. Once your subscription is active again, write to ${SUPPORT_EMAIL} and we'll look at it.`
+      return `We won't try again while your account is read-only. Once your subscription is active again, write to ${supportEmail} and we'll look at it.`
     default:
       return ''
   }
@@ -616,7 +618,7 @@ function failedSentence(run: RecommendationRun): string {
     case 'scheduled':
       return "This run ran into a problem on our side. We'll try again automatically."
     case 'exhausted':
-      return `We couldn't complete this run. If you'd like to hear from us, write to ${SUPPORT_EMAIL}.`
+      return `We couldn't complete this run. If you'd like to hear from us, write to ${supportEmail}.`
     default:
       return "This run didn't finish."
   }

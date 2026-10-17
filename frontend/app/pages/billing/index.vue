@@ -37,7 +37,7 @@
         <VIcon icon="mdi-lock-outline" size="48" class="text-medium-emphasis mb-4" aria-hidden="true" />
         <p id="locked-title" tabindex="-1" class="text-h6 font-weight-regular mb-2">Your account is on hold</p>
         <p class="text-body-2 text-medium-emphasis mb-6 mx-auto" style="max-width: 480px">
-          A payment dispute was opened on this account, so new subscriptions are switched off for now. Your collection and past recommendations are still here to read and export. To sort this out, write to us at support@supermanzer.io and we'll help.
+          A payment dispute was opened on this account, so new subscriptions are switched off for now. Your collection and past recommendations are still here to read and export. {{ lockedSentence }}
         </p>
         <VAlert
           v-if="lockedDetail ?? portalError"
@@ -56,7 +56,7 @@
             rounded="lg"
             height="44"
             prepend-icon="mdi-email-outline"
-            href="mailto:support@supermanzer.io?subject=Account%20on%20hold"
+            :href="`mailto:${supportEmail}?subject=Account%20on%20hold`"
           >
             Email support
           </VBtn>
@@ -341,6 +341,8 @@
           <p v-if="manageCaption" class="text-caption text-medium-emphasis mt-2">{{ manageCaption }}</p>
         </div>
 
+        <ReceiptEmailSection v-if="showManageBilling" />
+
         <VBtn variant="text" color="primary" rounded="lg" to="/fragrance">Go to your collection</VBtn>
       </div>
 
@@ -365,6 +367,8 @@
           :error="portalError"
           @fix="manageBilling"
         />
+
+        <ReceiptEmailSection v-if="showFixPayment" />
 
         <v-alert v-if="checkoutError" type="error" variant="tonal" rounded="lg" class="mb-4">
           {{ checkoutError }}
@@ -423,6 +427,10 @@
           Subscriptions renew automatically until cancelled, and payments are non-refundable.
           Payments are handled by Stripe. By subscribing you agree to the
           <NuxtLink to="/terms" target="_blank" rel="noopener" class="text-primary text-decoration-underline">Terms of Service<span class="d-sr-only"> (opens in a new tab)</span></NuxtLink>.
+        </p>
+
+        <p v-if="!showFixPayment" class="text-caption text-medium-emphasis mt-2">
+          Receipts are sent to your account email. You can choose a different receipt address after you subscribe.
         </p>
 
         <FixPaymentBlock
@@ -515,6 +523,8 @@ const lockedDetail = ref<string | null>(null)
 const route = useRoute()
 const router = useRouter()
 const { portalRedirecting, portalError, portalLocked, manageBilling } = usePortal()
+const supportEmail = useSupportEmail()
+const lockedSentence = lockedRestartSentence(supportEmail)
 
 const locked = computed(() => lapsedKind.value === 'revoked' || accountLocked.value)
 const lapseReason = computed(() => subscription.value?.lapse_reason ?? null)
@@ -698,7 +708,7 @@ async function confirmSwitch(): Promise<void> {
   } catch (err: unknown) {
     if (isAuthError(err)) return
     if (isAccountLocked(err)) {
-      enterLocked(accountLockedMessage(err))
+      enterLocked(accountLockedMessage(err, supportEmail))
       return
     }
     const e = err as { status?: number; data?: { code?: string } }
@@ -741,7 +751,7 @@ async function keepCurrentPlan(): Promise<void> {
   } catch (err: unknown) {
     if (isAuthError(err)) return
     if (isAccountLocked(err)) {
-      enterLocked(accountLockedMessage(err))
+      enterLocked(accountLockedMessage(err, supportEmail))
       return
     }
     const e = err as { status?: number; data?: { code?: string } }
@@ -806,7 +816,7 @@ const recoveryCopy = computed(() => {
     case 'timed-out':
       return {
         title: "We couldn't confirm your payment yet",
-        body: "If you added a card, we'll still retry the payment, and your access switches back on once it succeeds. Check back in a few minutes. If nothing has changed, write to support@supermanzer.io.",
+        body: `If you added a card, we'll still retry the payment, and your access switches back on once it succeeds. Check back in a few minutes. If nothing has changed, write to ${supportEmail}.`,
       }
     default:
       return {
@@ -1053,7 +1063,7 @@ async function subscribe(slug: string): Promise<void> {
     checkoutSubmitting.value = false
     selectedSlug.value = null
     if (isAccountLocked(err)) {
-      enterLocked(accountLockedMessage(err))
+      enterLocked(accountLockedMessage(err, supportEmail))
       return
     }
     if (isPaymentPending(err)) {
@@ -1063,6 +1073,15 @@ async function subscribe(slug: string): Promise<void> {
           ? detail
           : 'Your payment is still being confirmed. Please check back in a minute; you will not be charged twice.'
       startPendingPoll()
+      return
+    }
+    if (err?.status === 409 && err?.data?.code === 'subscription_still_active') {
+      // The server's own explanation, in the checkout alert: no generic notify, no payment poll.
+      const detail = err?.data?.detail
+      checkoutError.value =
+        typeof detail === 'string' && detail.trim()
+          ? detail
+          : 'You already have an active subscription.'
       return
     }
     if (err?.status === 409) {

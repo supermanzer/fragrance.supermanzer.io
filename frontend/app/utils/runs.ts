@@ -2,8 +2,6 @@ import type { RecommendationRun } from '~/composables/useRuns'
 
 export type RunNoticeKind = 'none' | 'running-again' | 'retrying' | 'exhausted' | 'stopped'
 
-export const SUPPORT_EMAIL = 'support@supermanzer.io'
-
 // "shortly" when unknown or already due, "tomorrow" for the next local calendar day,
 // otherwise "on October 3". Read as: "We'll try again {when}."
 export function retryWhen(iso: string | null): string {

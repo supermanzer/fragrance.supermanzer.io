@@ -7,7 +7,7 @@
       <NuxtLink to="/auth/forgot-password" class="text-primary">request a new one</NuxtLink>.
     </v-alert>
 
-    <v-form v-else-if="!done" @submit.prevent="submit">
+    <v-form v-else @submit.prevent="submit">
       <v-text-field
         v-model="form.new_password"
         label="New password"
@@ -41,19 +41,12 @@
         Set Password
       </v-btn>
     </v-form>
-
-    <div v-else>
-      <v-alert type="success" variant="tonal" class="mb-4">
-        Your password has been reset. You can now sign in with your new password.
-      </v-alert>
-      <v-btn color="primary" variant="flat" rounded="lg" block @click="navigateTo('/auth/login')">
-        Sign In
-      </v-btn>
-    </div>
   </v-card>
 </template>
 
 <script setup lang="ts">
+import { clearTokens } from '~/composables/useApi'
+
 definePageMeta({ layout: 'auth', auth: false })
 
 const config = useRuntimeConfig()
@@ -66,7 +59,10 @@ const linkInvalid = !uid || !token
 const form = reactive({ new_password: '', new_password_confirm: '' })
 const errors = reactive<Record<string, string | string[]>>({})
 const loading = ref(false)
-const done = ref(false)
+
+// A reset blacklists every refresh token server-side, so nothing stored locally is usable.
+const resetSessionState = useSessionReset()
+const { authStatus } = useAuthStatus()
 
 async function submit() {
   Object.keys(errors).forEach(k => delete errors[k])
@@ -77,10 +73,18 @@ async function submit() {
       method: 'POST',
       body: { uid, token, ...form },
     })
-    done.value = true
+    clearTokens()
+    resetSessionState()
+    authStatus.value = 'unauthenticated'
+    await navigateTo({ path: '/auth/login', query: { reset: '1' } })
   } catch (err: any) {
     const data = err?.data
-    if (data?.new_password) errors.new_password = data.new_password
+    if (err?.status === 503) {
+      // Nothing was changed; the reset link is still valid, so the form stays usable for a retry.
+      errors.general = typeof data?.detail === 'string' && data.detail.trim()
+        ? data.detail
+        : 'We could not update your password right now. Nothing was changed, please try again shortly.'
+    } else if (data?.new_password) errors.new_password = data.new_password
     else if (data?.new_password_confirm) errors.new_password_confirm = data.new_password_confirm
     else errors.general = data?.detail ?? data?.non_field_errors?.[0] ?? 'Something went wrong. Please try again.'
   } finally {

@@ -6,9 +6,11 @@
     <AppAlert v-model="readOnlyNotice" type="info" class="mb-4" />
     <AppAlert v-model="saved" type="success" class="mb-4" />
 
-    <v-skeleton-loader v-if="loading" type="card" max-width="560" />
+    <RecipientPanel purpose="delivery" :snapshot="config" :settled="configSettled" />
 
-    <v-card v-else max-width="560" elevation="1" rounded="lg">
+    <v-skeleton-loader v-if="loading" type="card" max-width="560" class="mt-6" />
+
+    <v-card v-else class="mt-6" max-width="560" elevation="1" rounded="lg">
       <v-card-title class="pt-6 px-6 pb-2">Schedule</v-card-title>
       <v-card-text class="px-6 pb-2">
         <p v-if="isLapsed" class="text-caption text-medium-emphasis mb-4">
@@ -22,16 +24,6 @@
           </div>
         </VExpandTransition>
         <p class="text-body-2 mb-4">Your picks are made once a month.</p>
-        <v-text-field
-          v-model="form.recipient_email"
-          label="Recipient email"
-          type="email"
-          variant="outlined"
-          rounded="lg"
-          hide-details="auto"
-          :readonly="isLapsed"
-          class="mb-4"
-        />
         <v-text-field
           v-model.number="form.run_day_of_month"
           label="Day of month"
@@ -222,7 +214,7 @@
 import { useSettings } from '~/composables/useSettings'
 import { useImport } from '~/composables/useImport'
 import { useExport } from '~/composables/useExport'
-import { useApi, clearTokens, isSubscriptionRequired } from '~/composables/useApi'
+import { useApi, clearTokens, setTokens, isSubscriptionRequired } from '~/composables/useApi'
 
 const { config, loading, error, fetchConfig, updateConfig } = useSettings()
 const { api } = useApi()
@@ -251,11 +243,9 @@ async function runImport(): Promise<void> {
 }
 
 const form = reactive<{
-  recipient_email: string
   run_hour: number
   run_day_of_month: number
 }>({
-  recipient_email: '',
   run_hour: 9,
   run_day_of_month: 1,
 })
@@ -265,12 +255,15 @@ const legacyFrequency = computed(() => {
   return f === 'weekly' || f === 'yearly' ? f : null
 })
 
+// Lets the delivery panel reuse this page's GET /config/ instead of issuing its own.
+const configSettled = ref(false)
+
 onMounted(async () => {
   await fetchConfig()
+  configSettled.value = true
   if (config.value) {
     const day = config.value.run_day_of_month
     Object.assign(form, {
-      recipient_email: config.value.recipient_email,
       run_hour: config.value.run_hour,
       run_day_of_month: Number.isInteger(day) && day >= 1 && day <= 28 ? day : 1,
     })
@@ -284,7 +277,6 @@ async function submit() {
   readOnlyNotice.value = null
   try {
     await updateConfig({
-      recipient_email: form.recipient_email,
       frequency: 'monthly',
       run_hour: form.run_hour,
       run_day_of_month: form.run_day_of_month,
@@ -321,18 +313,31 @@ async function changePassword() {
   passwordSaving.value = true
   try {
     const refresh = localStorage.getItem('auth_refresh') ?? ''
-    await api('/auth/password/change/', {
+    const data = await api<{ access?: string; refresh?: string }>('/auth/password/change/', {
       method: 'POST',
       body: { ...passwordForm, refresh },
     })
-    passwordSaved.value = 'Password updated. Please sign in again.'
     Object.keys(passwordForm).forEach(k => (passwordForm as any)[k] = '')
-    clearTokens()
-    resetSessionState()
-    setTimeout(() => navigateTo('/auth/login'), 1500)
+    if (data?.access && data?.refresh) {
+      // The server blacklists every other refresh token on a change and returns a fresh pair
+      // for this device; storing it keeps this session signed in.
+      setTokens(data.access, data.refresh)
+      passwordSaved.value = 'Password updated.'
+    } else {
+      // No pair in the response: the old refresh token is dead, so sign out cleanly.
+      passwordSaved.value = 'Password updated. Please sign in again.'
+      clearTokens()
+      resetSessionState()
+      setTimeout(() => navigateTo('/auth/login'), 1500)
+    }
   } catch (err: any) {
     const data = err?.data
-    if (data?.current_password) passwordErrors.current_password = data.current_password
+    if (err?.status === 503) {
+      // Nothing was changed server-side and the session is intact: show the reason, keep the form.
+      passwordError.value = typeof data?.detail === 'string' && data.detail.trim()
+        ? data.detail
+        : 'We could not update your password right now. Nothing was changed, please try again shortly.'
+    } else if (data?.current_password) passwordErrors.current_password = data.current_password
     else if (data?.new_password) passwordErrors.new_password = data.new_password
     else if (data?.new_password_confirm) passwordErrors.new_password_confirm = data.new_password_confirm
     else passwordError.value = data?.detail ?? 'Something went wrong. Please try again.'

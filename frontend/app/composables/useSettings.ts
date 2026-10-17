@@ -2,7 +2,12 @@ import { useApi, isAuthError } from '~/composables/useApi'
 
 export interface FragranceConfig {
   id: number
+  // Read-only: always the verified delivery address. Changes go through useRecipient('delivery').
   recipient_email: string
+  pending_recipient_email: string | null
+  pending_state: 'none' | 'pending' | 'expired'
+  pending_expires_at: string | null
+  resend_available_at: string | null
   gmail_user: string
   frequency: 'weekly' | 'monthly' | 'yearly'
   run_hour: number
@@ -12,7 +17,16 @@ export interface FragranceConfig {
 }
 
 // Reads may still return legacy 'weekly' / 'yearly'; writes accept only 'monthly'.
-export type FragranceConfigInput = Omit<FragranceConfig, 'id' | 'frequency'> & {
+export type FragranceConfigInput = Omit<
+  FragranceConfig,
+  | 'id'
+  | 'frequency'
+  | 'recipient_email'
+  | 'pending_recipient_email'
+  | 'pending_state'
+  | 'pending_expires_at'
+  | 'resend_available_at'
+> & {
   frequency: 'monthly'
   gmail_app_password_enc?: string
 }
