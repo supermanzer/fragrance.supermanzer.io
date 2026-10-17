@@ -73,10 +73,20 @@ DUMMY_COLLECTION = (
     "Sauvage by Dior [dislike] - too generic"
 )
 DUMMY_PAST_RECOMMENDATIONS = "Silver Mountain Water"
+# Must offer more than EXPECTED_CANDIDATE_COUNT distinct houses: the candidates
+# prompt asks for exactly 5 picks, one per house, from these results, so a
+# fixture with fewer would fail any model that declines to invent fragrances
+# (claude-haiku-5-5 returned 2 of 2 real ones against a 2-entry fixture).
 DUMMY_SEARCH_RESULTS = (
     "Search 1: niche oud fragrances:\n"
     "- Oud Wood by Tom Ford: A smoky, creamy oud blend. (https://example.com/oud-wood)\n"
-    "- Black Afgano by Nasomatto: A dense, resinous oud. (https://example.com/black-afgano)"
+    "- Black Afgano by Nasomatto: A dense, resinous oud. (https://example.com/black-afgano)\n"
+    "- Oud for Greatness by Initio: A bold oud with saffron and musk. (https://example.com/oud-for-greatness)\n"
+    "Search 2: amber and warm woody fragrances:\n"
+    "- Layton by Parfums de Marly: Apple, vanilla and warm woods. (https://example.com/layton)\n"
+    "- Hacivat by Nishane: Fruity pineapple over moss and woods. (https://example.com/hacivat)\n"
+    "- Grand Soir by Maison Francis Kurkdjian: A rich amber with benzoin. (https://example.com/grand-soir)\n"
+    "- Santal 33 by Le Labo: Sandalwood, leather and cedar. (https://example.com/santal-33)"
 )
 DUMMY_CONFIRMED_NAMES = ["Aventus", "Bleu de Chanel"]
 DUMMY_PICKS_TEXT = "- Aventus by Creed\n- Bleu de Chanel by Chanel"
